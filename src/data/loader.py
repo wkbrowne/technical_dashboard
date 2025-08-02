@@ -93,8 +93,13 @@ def get_stock_data(symbol, interval="1d"):
         "diffandsplits": "false"
     }
 
+    rapidapi_key = os.getenv("RAPIDAPI_KEY")
+    if not rapidapi_key:
+        print(f"⚠️ Error: RAPIDAPI_KEY environment variable not set. Cannot fetch data for {symbol}")
+        return None
+        
     headers = {
-        "x-rapidapi-key": "2d530e3f25msh7e3021c97724690p18f0dajsn148cba8ab131",
+        "x-rapidapi-key": rapidapi_key,
         "x-rapidapi-host": "yahoo-finance15.p.rapidapi.com"
     }
 
