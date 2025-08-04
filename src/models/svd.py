@@ -52,22 +52,36 @@ def rolling_svd_factors(X, dates, assets, window_size=180, n_components=10):
         # SVD: time x asset (so transpose)
         U, s, Vt = np.linalg.svd(valid_data.T, full_matrices=False)
 
+        # Ensure we don't request more components than available
+        actual_components = min(n_components, U.shape[1], Vt.shape[0])
+
         # Sign correction
-        if prev_U is not None:
-            for i in range(n_components):
-                sign = np.sign(np.dot(U[:, i], prev_U[:, i]))
-                if sign == -1:
-                    U[:, i] *= -1
-                    Vt[i, :] *= -1
-        prev_U = U.copy()
+        if prev_U is not None and prev_U.shape[1] >= actual_components:
+            for i in range(actual_components):
+                if i < prev_U.shape[1]:
+                    sign = np.sign(np.dot(U[:, i], prev_U[:, i]))
+                    if sign == -1:
+                        U[:, i] *= -1
+                        Vt[i, :] *= -1
+        prev_U = U[:, :actual_components].copy()
 
         u_full = np.full((len(assets), n_components), np.nan)
-        u_full[valid_mask] = U[:, :n_components]
+        u_full[valid_mask, :actual_components] = U[:, :actual_components]
 
         loadings.append(pd.DataFrame(u_full, index=assets, columns=[f'PC{i+1}' for i in range(n_components)])
                         .assign(date=dates[t]))
 
-        V = Vt[:n_components, -1]
+        # Fix the component time series extraction - use the last time point for each component
+        if Vt.shape[1] > 0:
+            V = Vt[:actual_components, -1]  # Last time point for each component
+            # Pad with NaN if we have fewer actual components than requested
+            if actual_components < n_components:
+                V_padded = np.full(n_components, np.nan)
+                V_padded[:actual_components] = V
+                V = V_padded
+        else:
+            V = np.full(n_components, np.nan)
+            
         component_ts.append(pd.Series(V, index=[f'PC{i+1}' for i in range(n_components)], name=dates[t]))
 
         var = (s**2) / np.sum(s**2)

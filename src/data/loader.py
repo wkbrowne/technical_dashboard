@@ -115,7 +115,8 @@ def get_stock_data(symbol, interval="1d"):
                 records.append(record)
 
             df = pd.DataFrame(records)
-            df['date'] = pd.to_datetime(df['date'], dayfirst=True)
+            # Fix: Use format='mixed' to handle various date formats automatically
+            df['date'] = pd.to_datetime(df['date'], format='mixed')
             df.set_index('date', inplace=True)
             df['symbol'] = symbol
 
