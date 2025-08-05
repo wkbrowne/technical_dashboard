@@ -4,8 +4,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, Tuple, List, Optional
 from scipy import stats
+from scipy.stats import gaussian_kde
 from datetime import datetime, timedelta
 from .markov_bb import TrendAwareBBMarkovWrapper
+from .open_price_kde import IntelligentOpenForecaster
+from .high_low_copula import IntelligentHighLowForecaster
 
 class OHLCForecaster:
     """
@@ -18,6 +21,10 @@ class OHLCForecaster:
         self.bb_std = bb_std
         self.fitted = False
         self.markov_model = TrendAwareBBMarkovWrapper()
+        self.kde_models = {}  # Store KDE models for different regimes
+        self.open_forecaster = None  # Will hold IntelligentOpenForecaster
+        self.high_low_forecaster = None  # Will hold IntelligentHighLowForecaster
+        self.symbol = None  # Current symbol being forecasted
         
         
     def fit(self, ohlc_data: pd.DataFrame) -> 'OHLCForecaster':
@@ -50,6 +57,10 @@ class OHLCForecaster:
         markov_data = self.ohlc_data[['BB_Position', 'BB_MA']].copy()
         markov_data.rename(columns={'BB_MA': 'MA'}, inplace=True)
         self.markov_model.fit(markov_data)
+        
+        # Fit KDE models for close price estimation
+        self._fit_kde_models()
+        
         self.fitted = True
         return self
     
@@ -177,6 +188,139 @@ class OHLCForecaster:
         }
         
         return stats_dict
+    
+    def _fit_kde_models(self) -> None:
+        """
+        Fit Gaussian KDE models for close price estimation using Silverman's rule.
+        Creates separate KDE models for different market regimes (trend + volatility).
+        """
+        data = self.ohlc_data.dropna().copy()
+        
+        # Calculate normalized close returns for KDE
+        data['Close_Return'] = data['Close'].pct_change()
+        data = data.dropna()
+        
+        # Define regimes: Trend x Volatility
+        trends = data['Trend'].unique()
+        vol_median = data['BB_Width'].median()
+        
+        for trend in trends:
+            # High volatility regime
+            high_vol_mask = (data['Trend'] == trend) & (data['BB_Width'] > vol_median)
+            high_vol_returns = data[high_vol_mask]['Close_Return'].values
+            
+            if len(high_vol_returns) > 10:  # Minimum samples for reliable KDE
+                try:
+                    kde_high = gaussian_kde(high_vol_returns)
+                    # Apply Silverman's rule for bandwidth
+                    kde_high.set_bandwidth(bw_method='silverman')
+                    self.kde_models[f'{trend}_High_Vol'] = kde_high
+                except (np.linalg.LinAlgError, ValueError):
+                    # Fallback to normal distribution if KDE fails
+                    self.kde_models[f'{trend}_High_Vol'] = {
+                        'mean': np.mean(high_vol_returns),
+                        'std': np.std(high_vol_returns),
+                        'type': 'normal'
+                    }
+            
+            # Low volatility regime
+            low_vol_mask = (data['Trend'] == trend) & (data['BB_Width'] <= vol_median)
+            low_vol_returns = data[low_vol_mask]['Close_Return'].values
+            
+            if len(low_vol_returns) > 10:
+                try:
+                    kde_low = gaussian_kde(low_vol_returns)
+                    kde_low.set_bandwidth(bw_method='silverman')
+                    self.kde_models[f'{trend}_Low_Vol'] = kde_low
+                except (np.linalg.LinAlgError, ValueError):
+                    # Fallback to normal distribution if KDE fails
+                    self.kde_models[f'{trend}_Low_Vol'] = {
+                        'mean': np.mean(low_vol_returns),
+                        'std': np.std(low_vol_returns),
+                        'type': 'normal'
+                    }
+    
+    def _silverman_bandwidth(self, data: np.ndarray) -> float:
+        """
+        Calculate Silverman's rule of thumb for bandwidth selection.
+        
+        Parameters:
+        -----------
+        data : np.ndarray
+            The data for which to calculate bandwidth
+            
+        Returns:
+        --------
+        float
+            Optimal bandwidth using Silverman's rule
+        """
+        n = len(data)
+        std = np.std(data, ddof=1)
+        iqr = np.percentile(data, 75) - np.percentile(data, 25)
+        
+        # Silverman's rule: h = 0.9 * min(std, iqr/1.34) * n^(-1/5)
+        scale = min(std, iqr / 1.34)
+        bandwidth = 0.9 * scale * (n ** (-1/5))
+        
+        return max(bandwidth, 1e-6)  # Avoid zero bandwidth
+    
+    def _sample_from_kde(self, regime_key: str, n_samples: int = 1) -> np.ndarray:
+        """
+        Sample from the KDE model for a specific regime.
+        
+        Parameters:
+        -----------
+        regime_key : str
+            The regime identifier (e.g., 'Up_High_Vol')
+        n_samples : int
+            Number of samples to generate
+            
+        Returns:
+        --------
+        np.ndarray
+            Sampled values from the KDE
+        """
+        if regime_key in self.kde_models:
+            kde_model = self.kde_models[regime_key]
+            
+            if isinstance(kde_model, dict) and kde_model.get('type') == 'normal':
+                # Fallback normal distribution
+                return np.random.normal(kde_model['mean'], kde_model['std'], n_samples)
+            else:
+                # Use KDE sampling
+                return kde_model.resample(n_samples)[0]
+        else:
+            # Default fallback: normal distribution with small variance
+            return np.random.normal(0.0, 0.01, n_samples)
+    
+    def _estimate_kde_uncertainty(self, regime_key: str) -> float:
+        """
+        Estimate uncertainty from KDE model for a specific regime.
+        
+        Parameters:
+        -----------
+        regime_key : str
+            The regime identifier
+            
+        Returns:
+        --------
+        float
+            Estimated standard deviation from KDE
+        """
+        if regime_key in self.kde_models:
+            kde_model = self.kde_models[regime_key]
+            
+            if isinstance(kde_model, dict) and kde_model.get('type') == 'normal':
+                return kde_model['std']
+            else:
+                # Estimate uncertainty by sampling from KDE
+                try:
+                    samples = kde_model.resample(1000)[0]
+                    return np.std(samples)
+                except:
+                    return 0.015  # Default fallback
+        else:
+            return 0.015  # Default uncertainty
         
     def _calculate_volatility_patterns(self) -> None:
         """Calculate volatility-related patterns."""
@@ -252,8 +396,8 @@ class OHLCForecaster:
             # Forecast Close first (using MA and volatility)
             close_forecast = self._forecast_close(prev_close, forecasted_ma, forecasted_vol, regime_stats, bb_state)
             
-            # Forecast Open (considering gaps)
-            open_forecast = self._forecast_open(prev_close, close_forecast['mean'], regime_stats)
+            # Forecast Open (considering gaps) - pass volatility for intelligent forecasting
+            open_forecast = self._forecast_open(prev_close, close_forecast['mean'], regime_stats, forecasted_vol)
             
             # Forecast High and Low (considering range patterns)
             high_low_forecast = self._forecast_high_low(open_forecast['mean'], close_forecast['mean'], 
@@ -338,40 +482,104 @@ class OHLCForecaster:
 
     def _forecast_close(self, prev_close: float, ma_forecast: float, vol_forecast: float, regime_stats: Dict, bb_state: int) -> Dict:
         trend = self.ohlc_data['Trend'].iloc[-1]
-        # Use the state-specific BB position statistics to sample a position
-        if bb_state in self.bb_position_stats:
-            bb_pos_mean = self.bb_position_stats[bb_state]['mean']
-            bb_pos_std = self.bb_position_stats[bb_state]['std']
-            bb_position = np.random.normal(bb_pos_mean, bb_pos_std)
-        else:
-            # Fallback to state boundaries
-            if self.markov_model.fitted and self.markov_model.global_model.state_boundaries:
-                if bb_state == 0:
-                    bb_position = self.markov_model.global_model.state_boundaries[0] - 0.1
-                elif bb_state == self.markov_model.global_model.n_states - 1:
-                    bb_position = self.markov_model.global_model.state_boundaries[-1] + 0.1
-                else:
-                    lower = self.markov_model.global_model.state_boundaries[bb_state-1]
-                    upper = self.markov_model.global_model.state_boundaries[bb_state]
-                    bb_position = (lower + upper) / 2
-            else:
-                bb_position = 0.0  # Default neutral position
         
-        close_mean = ma_forecast + bb_position * vol_forecast * ma_forecast
-        body_std = regime_stats.get('body_pct_std', 0.015)
-        total_std = np.sqrt(vol_forecast**2 + body_std**2)
-        close_std = prev_close * total_std
+        # Determine volatility regime
+        vol_median = self.ohlc_data['BB_Width'].median()
+        vol_regime = 'High_Vol' if vol_forecast > vol_median else 'Low_Vol'
+        regime_key = f'{trend}_{vol_regime}'
+        
+        # Enhanced KDE-based close price estimation
+        if regime_key in self.kde_models:
+            # Sample return from KDE model using Silverman's bandwidth
+            kde_return = self._sample_from_kde(regime_key, n_samples=1)[0]
+            
+            # Apply the KDE-sampled return to previous close
+            kde_close = prev_close * (1 + kde_return)
+            
+            # Use the state-specific BB position statistics to adjust
+            if bb_state in self.bb_position_stats:
+                bb_pos_mean = self.bb_position_stats[bb_state]['mean']
+                bb_pos_std = self.bb_position_stats[bb_state]['std']
+                bb_position = np.random.normal(bb_pos_mean, bb_pos_std)
+            else:
+                # Fallback to state boundaries
+                if self.markov_model.fitted and self.markov_model.global_model.state_boundaries:
+                    if bb_state == 0:
+                        bb_position = self.markov_model.global_model.state_boundaries[0] - 0.1
+                    elif bb_state == self.markov_model.global_model.n_states - 1:
+                        bb_position = self.markov_model.global_model.state_boundaries[-1] + 0.1
+                    else:
+                        lower = self.markov_model.global_model.state_boundaries[bb_state-1]
+                        upper = self.markov_model.global_model.state_boundaries[bb_state]
+                        bb_position = (lower + upper) / 2
+                else:
+                    bb_position = 0.0  # Default neutral position
+            
+            # Combine KDE-based estimate with BB position adjustment
+            bb_adjustment = bb_position * vol_forecast * ma_forecast
+            
+            # Weighted combination: 70% KDE, 30% BB adjustment
+            close_mean = 0.7 * kde_close + 0.3 * (ma_forecast + bb_adjustment)
+            
+            # Enhanced uncertainty estimation using KDE
+            kde_std = self._estimate_kde_uncertainty(regime_key)
+            body_std = regime_stats.get('body_pct_std', 0.015)
+            total_std = np.sqrt(kde_std**2 + body_std**2)
+            close_std = prev_close * total_std
+            
+        else:
+            # Fallback to original method if KDE not available
+            if bb_state in self.bb_position_stats:
+                bb_pos_mean = self.bb_position_stats[bb_state]['mean']
+                bb_pos_std = self.bb_position_stats[bb_state]['std']
+                bb_position = np.random.normal(bb_pos_mean, bb_pos_std)
+            else:
+                bb_position = 0.0
+            
+            close_mean = ma_forecast + bb_position * vol_forecast * ma_forecast
+            body_std = regime_stats.get('body_pct_std', 0.015)
+            total_std = np.sqrt(vol_forecast**2 + body_std**2)
+            close_std = prev_close * total_std
+        
         return {
             'mean': close_mean,
             'lower': close_mean - 1.96 * close_std,
             'upper': close_mean + 1.96 * close_std
         }
     
-    def _forecast_open(self, prev_close: float, close_forecast: float, regime_stats: Dict) -> Dict:
-        """Forecast opening price."""
-        # Gap statistics
-        gap_mean = regime_stats['gap_pct_mean']
-        gap_std = regime_stats['gap_pct_std']
+    def _forecast_open(self, prev_close: float, close_forecast: float, regime_stats: Dict, 
+                      vol_forecast: float = None) -> Dict:
+        """
+        Forecast opening price using intelligent KDE models if available,
+        otherwise fall back to traditional gap statistics.
+        """
+        if self.open_forecaster and self.symbol and vol_forecast is not None:
+            # Use intelligent open forecaster
+            try:
+                trend_regime, vol_regime = self._classify_current_regime(vol_forecast)
+                
+                forecast_result = self.open_forecaster.forecast_open(
+                    symbol=self.symbol,
+                    prev_close=prev_close,
+                    trend_regime=trend_regime,
+                    vol_regime=vol_regime
+                )
+                
+                return {
+                    'mean': forecast_result['forecasted_open'],
+                    'lower': forecast_result['confidence_interval'][0],
+                    'upper': forecast_result['confidence_interval'][1],
+                    'gap_return': forecast_result['gap_return'],
+                    'regime': forecast_result['regime'],
+                    'model_used': forecast_result['model_used']
+                }
+                
+            except Exception as e:
+                print(f"⚠️ Intelligent open forecaster failed: {e}, falling back to traditional method")
+        
+        # Traditional gap forecasting (fallback)
+        gap_mean = regime_stats.get('gap_pct_mean', 0.0)
+        gap_std = regime_stats.get('gap_pct_std', 0.005)
         
         # Expected gap
         expected_gap = prev_close * gap_mean
@@ -383,24 +591,57 @@ class OHLCForecaster:
         return {
             'mean': open_mean,
             'lower': open_mean - 1.96 * gap_uncertainty,
-            'upper': open_mean + 1.96 * gap_uncertainty
+            'upper': open_mean + 1.96 * gap_uncertainty,
+            'model_used': 'traditional'
         }
     
     def _forecast_high_low(self, open_forecast: float, close_forecast: float, vol_forecast: float, regime_stats: Dict) -> Dict:
-        """Forecast high and low prices."""
+        """
+        Forecast high and low prices using intelligent copula models if available,
+        otherwise fall back to traditional range statistics.
+        """
         # Reference price (average of open and close)
         ref_price = (open_forecast + close_forecast) / 2
         
-        # Expected range
-        range_pct_mean = regime_stats['range_pct_mean']
-        range_pct_std = regime_stats['range_pct_std']
+        if self.high_low_forecaster and self.symbol and vol_forecast is not None:
+            # Use intelligent copula-based forecasting
+            try:
+                trend_regime, vol_regime = self._classify_current_regime(vol_forecast)
+                
+                # Sample multiple high-low pairs for confidence intervals
+                forecast_result = self.high_low_forecaster.forecast_high_low(
+                    symbol=self.symbol,
+                    reference_price=ref_price,
+                    trend_regime=trend_regime,
+                    vol_regime=vol_regime,
+                    n_samples=100  # Multiple samples for CI
+                )
+                
+                return {
+                    'high_mean': forecast_result['high_mean'],
+                    'high_lower': forecast_result['high_ci'][0],
+                    'high_upper': forecast_result['high_ci'][1],
+                    'low_mean': forecast_result['low_mean'],
+                    'low_lower': forecast_result['low_ci'][0],
+                    'low_upper': forecast_result['low_ci'][1],
+                    'correlation': forecast_result['correlation'],
+                    'model_used': forecast_result['model_used'],
+                    'regime': forecast_result['regime']
+                }
+                
+            except Exception as e:
+                print(f"⚠️ Intelligent high-low forecaster failed: {e}, falling back to traditional method")
+        
+        # Traditional range forecasting (fallback)
+        range_pct_mean = regime_stats.get('range_pct_mean', 0.02)
+        range_pct_std = regime_stats.get('range_pct_std', 0.01)
         
         expected_range = ref_price * range_pct_mean
         range_std = ref_price * range_pct_std
         
         # Shadow statistics
-        upper_shadow_pct = regime_stats['upper_shadow_pct_mean']
-        lower_shadow_pct = regime_stats['lower_shadow_pct_mean']
+        upper_shadow_pct = regime_stats.get('upper_shadow_pct_mean', 0.005)
+        lower_shadow_pct = regime_stats.get('lower_shadow_pct_mean', 0.005)
         
         # Calculate high and low relative to open/close envelope
         body_high = max(open_forecast, close_forecast)
@@ -426,7 +667,8 @@ class OHLCForecaster:
             'high_upper': high_mean + range_uncertainty,
             'low_mean': low_mean,
             'low_lower': low_mean - range_uncertainty,
-            'low_upper': low_mean + range_uncertainty
+            'low_upper': low_mean + range_uncertainty,
+            'model_used': 'traditional'
         }
     
     def plot_ohlc_forecast(self, forecast_results: Dict, n_historical: int = 60) -> None:
@@ -509,3 +751,122 @@ class OHLCForecaster:
             summary_data.append(row)
         
         return pd.DataFrame(summary_data)
+    
+    def get_kde_model_info(self) -> Dict:
+        """
+        Get information about fitted KDE models.
+        
+        Returns:
+        --------
+        dict
+            Information about KDE models for each regime
+        """
+        info = {}
+        for regime_key, model in self.kde_models.items():
+            if isinstance(model, dict) and model.get('type') == 'normal':
+                info[regime_key] = {
+                    'model_type': 'normal_fallback',
+                    'mean': model['mean'],
+                    'std': model['std'],
+                    'bandwidth': 'N/A'
+                }
+            else:
+                try:
+                    # Get bandwidth from KDE model
+                    bandwidth = model.factor if hasattr(model, 'factor') else 'silverman'
+                    info[regime_key] = {
+                        'model_type': 'gaussian_kde',
+                        'n_samples': len(model.dataset[0]) if hasattr(model, 'dataset') else 'unknown',
+                        'bandwidth': bandwidth,
+                        'estimated_std': self._estimate_kde_uncertainty(regime_key)
+                    }
+                except:
+                    info[regime_key] = {
+                        'model_type': 'gaussian_kde',
+                        'status': 'error_accessing_info'
+                    }
+        
+        return info
+    
+    def set_intelligent_open_forecaster(self, open_forecaster: IntelligentOpenForecaster, 
+                                      symbol: str) -> 'OHLCForecaster':
+        """
+        Set the intelligent open price forecaster for enhanced gap modeling.
+        
+        Parameters:
+        -----------
+        open_forecaster : IntelligentOpenForecaster
+            The trained global + stock-specific open forecaster
+        symbol : str
+            The stock symbol this forecaster will be used for
+        """
+        self.open_forecaster = open_forecaster
+        self.symbol = symbol
+        print(f"✅ Intelligent open forecaster set for {symbol}")
+        return self
+    
+    def _classify_current_regime(self, vol_forecast: float) -> Tuple[str, str]:
+        """
+        Classify current trend and volatility regime for open price forecasting.
+        
+        Returns:
+        --------
+        tuple
+            (trend_regime, vol_regime)
+        """
+        # Get recent trend from MA slope
+        if len(self.ohlc_data) > 10:
+            recent_ma = self.ohlc_data['BB_MA'].tail(10)
+            ma_slope = recent_ma.pct_change(periods=5).iloc[-1]
+            
+            # Map to trend regime using intelligent forecaster thresholds
+            if self.open_forecaster:
+                thresholds = self.open_forecaster.global_model.trend_thresholds
+                if ma_slope > thresholds['strong_bull']:
+                    trend_regime = 'Strong_Bull'
+                elif ma_slope > thresholds['bull']:
+                    trend_regime = 'Bull'
+                elif ma_slope > thresholds['neutral']:
+                    trend_regime = 'Neutral'
+                elif ma_slope > thresholds['bear']:
+                    trend_regime = 'Bear'
+                else:
+                    trend_regime = 'Strong_Bear'
+            else:
+                # Fallback classification
+                if ma_slope > 0.002:
+                    trend_regime = 'Strong_Bull'
+                elif ma_slope > 0.0005:
+                    trend_regime = 'Bull'
+                elif ma_slope > -0.0005:
+                    trend_regime = 'Neutral'
+                elif ma_slope > -0.002:
+                    trend_regime = 'Bear'
+                else:
+                    trend_regime = 'Strong_Bear'
+        else:
+            trend_regime = 'Neutral'  # Default
+        
+        # Classify volatility regime
+        vol_median = self.ohlc_data['BB_Width'].median()
+        vol_regime = 'High_Vol' if vol_forecast > vol_median else 'Low_Vol'
+        
+        return trend_regime, vol_regime
+    
+    def set_intelligent_high_low_forecaster(self, high_low_forecaster: IntelligentHighLowForecaster, 
+                                          symbol: str) -> 'OHLCForecaster':
+        """
+        Set the intelligent high-low forecaster for enhanced range modeling.
+        
+        Parameters:
+        -----------
+        high_low_forecaster : IntelligentHighLowForecaster
+            The trained global + stock-specific high-low forecaster
+        symbol : str
+            The stock symbol this forecaster will be used for
+        """
+        self.high_low_forecaster = high_low_forecaster
+        if self.symbol is None:
+            self.symbol = symbol
+        print(f"✅ Intelligent high-low forecaster set for {symbol}")
+        return self
