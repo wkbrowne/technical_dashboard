@@ -595,124 +595,13 @@ class GlobalHighLowCopulaModel:
         
         return info
 
-class StockSpecificHighLowCopula:
-    """Stock-specific copula fine-tuning using global priors."""
-    
-    def __init__(self, global_model: GlobalHighLowCopulaModel, 
-                 adaptation_weight: float = 0.3,
-                 min_stock_samples: int = 30):
-        self.global_model = global_model
-        self.adaptation_weight = adaptation_weight
-        self.min_stock_samples = min_stock_samples
-        self.stock_regime_models = {}
-        self.fitted_stocks = set()
-    
-    def fit_stock_model(self, symbol: str, stock_data: pd.DataFrame) -> 'StockSpecificHighLowCopula':
-        """Fit stock-specific copula models using global priors."""
-        print(f"🏢 Fitting stock-specific high-low copula for {symbol}")
-        
-        # Extract stock-specific features
-        stock_features = self.global_model._extract_regime_features(stock_data, symbol)
-        
-        if len(stock_features) < self.min_stock_samples:
-            print(f"  ⚠️ Insufficient data ({len(stock_features)} < {self.min_stock_samples})")
-            print(f"  🌍 Using global model only for {symbol}")
-            self.fitted_stocks.add(symbol)
-            return self
-        
-        print(f"  📊 Stock data: {len(stock_features)} high-low observations")
-        
-        # Group by regime and fit hybrid models
-        regime_groups = stock_features.groupby('Combined_Regime')
-        adapted_models = 0
-        
-        for regime, regime_data in regime_groups:
-            if len(regime_data) >= 10:  # Minimum for stock-specific adaptation
-                high_data = regime_data['High_Return'].values
-                low_data = regime_data['Low_Return'].values
-                
-                # Check if global model exists for this regime
-                if regime in self.global_model.regime_models:
-                    try:
-                        # Create hybrid dataset by augmenting stock data with global samples
-                        global_high, global_low = self.global_model.sample_high_low(regime, 
-                                                                                   n_samples=max(30, len(high_data)))
-                        
-                        # Weighted combination
-                        stock_weight = min(len(high_data) / 100.0, 0.8)  # Cap at 80% stock-specific
-                        global_weight = 1 - stock_weight
-                        
-                        n_global = int(global_weight * len(high_data))
-                        
-                        # Combine data
-                        combined_high = np.concatenate([high_data, global_high[:n_global]])
-                        combined_low = np.concatenate([low_data, global_low[:n_global]])
-                        
-                        # Fit hybrid model
-                        hybrid_model = RegimeCopulaModel(f"{symbol}_{regime}", min_samples=10)
-                        hybrid_model.fit(combined_high, combined_low)
-                        
-                        self.stock_regime_models[f"{symbol}_{regime}"] = {
-                            'model': hybrid_model,
-                            'stock_samples': len(high_data),
-                            'global_samples': n_global,
-                            'stock_weight': stock_weight
-                        }
-                        
-                        adapted_models += 1
-                        
-                    except Exception as e:
-                        print(f"    ❌ Failed to adapt {regime}: {e}")
-        
-        print(f"  ✅ Adapted {adapted_models} regime models for {symbol}")
-        self.fitted_stocks.add(symbol)
-        return self
-    
-    def sample_high_low(self, symbol: str, regime: str, n_samples: int = 1) -> Tuple[np.ndarray, np.ndarray]:
-        """Sample high-low pairs using stock-specific model if available."""
-        stock_regime_key = f"{symbol}_{regime}"
-        
-        if stock_regime_key in self.stock_regime_models:
-            # Use stock-specific adapted model
-            return self.stock_regime_models[stock_regime_key]['model'].sample(n_samples)
-        else:
-            # Fall back to global model
-            return self.global_model.sample_high_low(regime, n_samples)
-    
-    def get_model_info(self, symbol: str) -> Dict:
-        """Get information about stock-specific adaptations."""
-        info = {
-            'symbol': symbol,
-            'is_fitted': symbol in self.fitted_stocks,
-            'adapted_regimes': {},
-            'global_fallback_regimes': []
-        }
-        
-        if symbol in self.fitted_stocks:
-            # Find adapted regimes
-            for key, model_data in self.stock_regime_models.items():
-                if key.startswith(f"{symbol}_"):
-                    regime = key.replace(f"{symbol}_", "")
-                    info['adapted_regimes'][regime] = {
-                        'stock_samples': model_data['stock_samples'],
-                        'global_samples': model_data['global_samples'],
-                        'stock_weight': model_data['stock_weight'],
-                        'best_copula': model_data['model'].get_model_info()['best_copula']
-                    }
-            
-            # Find global fallback regimes
-            for regime in self.global_model.regime_models:
-                if f"{symbol}_{regime}" not in self.stock_regime_models:
-                    info['global_fallback_regimes'].append(regime)
-        
-        return info
+# StockSpecificHighLowCopula class removed - using global-only modeling architecture
 
 class IntelligentHighLowForecaster:
-    """Main interface for intelligent high-low forecasting using copulas."""
+    """Main interface for intelligent high-low forecasting using global-only copulas."""
     
     def __init__(self, global_model_path: Optional[str] = None):
         self.global_model = GlobalHighLowCopulaModel()
-        self.stock_models = {}  # {symbol: StockSpecificHighLowCopula}
         self.global_model_path = global_model_path
         
         # Load global model if available
@@ -730,27 +619,16 @@ class IntelligentHighLowForecaster:
         
         return self
     
-    def add_stock_model(self, symbol: str, stock_data: pd.DataFrame) -> 'IntelligentHighLowForecaster':
-        """Add stock-specific fine-tuning for a particular symbol."""
-        if not self.global_model.fitted:
-            raise ValueError("Global model must be trained first")
-        
-        stock_model = StockSpecificHighLowCopula(self.global_model)
-        stock_model.fit_stock_model(symbol, stock_data)
-        self.stock_models[symbol] = stock_model
-        
-        return self
-    
     def forecast_high_low(self, symbol: str, reference_price: float,
                          trend_regime: str, vol_regime: str,
                          n_samples: int = 1) -> Dict:
         """
-        Forecast high and low prices using intelligent copula models.
+        Forecast high and low prices using global-only copula models.
         
         Parameters:
         -----------
         symbol : str
-            Stock symbol
+            Stock symbol (used for logging/tracking only)
         reference_price : float
             Reference price (e.g., average of open/close)
         trend_regime : str
@@ -767,15 +645,10 @@ class IntelligentHighLowForecaster:
         """
         combined_regime = f"{trend_regime}_{vol_regime}"
         
-        # Sample high-low returns
-        if symbol in self.stock_models:
-            high_returns, low_returns = self.stock_models[symbol].sample_high_low(
-                symbol, combined_regime, n_samples)
-            model_used = 'stock_specific'
-        else:
-            high_returns, low_returns = self.global_model.sample_high_low(
-                combined_regime, n_samples)
-            model_used = 'global_only'
+        # Sample high-low returns using global model only
+        high_returns, low_returns = self.global_model.sample_high_low(
+            combined_regime, n_samples)
+        model_used = 'global_only'
         
         # Convert returns to prices
         high_prices = reference_price * (1 + high_returns)
@@ -823,17 +696,14 @@ class IntelligentHighLowForecaster:
         print(f"📁 Model loading functionality ready (full implementation needed)")
     
     def get_system_info(self) -> Dict:
-        """Get comprehensive information about the forecasting system."""
+        """Get comprehensive information about the global-only forecasting system."""
         info = {
             'global_model': {
                 'fitted': self.global_model.fitted,
                 'regimes': len(self.global_model.regime_models),
             },
-            'stock_models': {}
+            'architecture': 'global_only'
         }
-        
-        for symbol, stock_model in self.stock_models.items():
-            info['stock_models'][symbol] = stock_model.get_model_info(symbol)
         
         return info
     

@@ -358,10 +358,49 @@ def classify_stock_regimes(stock_data: pd.DataFrame,
     return df
 
 
+def classify_hurst_regime(hurst_series: pd.Series, 
+                         thresholds: Tuple[float, float] = (0.4, 0.6)) -> pd.Series:
+    """
+    Classify regime based on Hurst exponent values with flexible cutoff specification.
+    
+    Parameters
+    ----------
+    hurst_series : pd.Series
+        Series of Hurst exponent values
+    thresholds : tuple of float, default=(0.4, 0.6)
+        Tuple of (mean_reverting_threshold, trending_threshold)
+        
+    Returns
+    -------
+    pd.Series
+        Series of regime labels per point ('mean-reverting', 'neutral', 'trending', 'unknown')
+    """
+    mean_reverting_threshold, trending_threshold = thresholds
+    
+    # Validate thresholds
+    if not (0 < mean_reverting_threshold < trending_threshold < 1):
+        raise ValueError("Thresholds must satisfy: 0 < mean_reverting < trending < 1")
+    
+    def classify_single_value(hurst_value):
+        if pd.isna(hurst_value):
+            return 'unknown'
+        elif hurst_value < mean_reverting_threshold:
+            return 'mean-reverting'
+        elif hurst_value > trending_threshold:
+            return 'trending'
+        else:
+            return 'neutral'
+    
+    regime_series = hurst_series.apply(classify_single_value)
+    regime_series.name = 'hurst_regime'
+    return regime_series
+
+
 # Export key components
 __all__ = [
     'UnifiedRegimeClassifier',
     'REGIME_CLASSIFIER', 
     'get_regime_classifier',
-    'classify_stock_regimes'
+    'classify_stock_regimes',
+    'classify_hurst_regime'
 ]

@@ -263,144 +263,17 @@ class GlobalOpenPriceKDE:
         return self
 
 
-class StockSpecificOpenKDE:
-    """
-    Stock-specific KDE fine-tuning using global priors.
-    Combines global market patterns with individual stock characteristics.
-    """
-    
-    def __init__(self, global_model: GlobalOpenPriceKDE, 
-                 adaptation_weight: float = 0.3,
-                 min_stock_samples: int = 20):
-        self.global_model = global_model
-        self.adaptation_weight = adaptation_weight  # How much to adapt from global
-        self.min_stock_samples = min_stock_samples
-        self.stock_kde_models = {}
-        self.stock_regime_stats = {}
-        self.fitted_stocks = set()
-        
-    def fit_stock_model(self, symbol: str, stock_data: pd.DataFrame) -> 'StockSpecificOpenKDE':
-        """
-        Fit stock-specific model using global priors + stock-specific data.
-        
-        Parameters:
-        -----------
-        symbol : str
-            Stock symbol
-        stock_data : pd.DataFrame
-            Stock OHLC data
-        """
-        print(f"🏢 Fitting stock-specific model for {symbol}")
-        
-        # Extract stock-specific gap features
-        stock_gap_data = self.global_model._extract_gap_features(stock_data, symbol)
-        
-        if len(stock_gap_data) < self.min_stock_samples:
-            print(f"  ⚠️ Insufficient data ({len(stock_gap_data)} < {self.min_stock_samples})")
-            print(f"  🌍 Using global model only for {symbol}")
-            self.fitted_stocks.add(symbol)
-            return self
-        
-        print(f"  📊 Stock data: {len(stock_gap_data)} gap observations")
-        
-        # Fit regime-specific models
-        stock_regimes = stock_gap_data['Combined_Regime'].value_counts()
-        adapted_models = 0
-        
-        for regime, count in stock_regimes.items():
-            if count >= 10:  # Minimum for stock-specific adaptation
-                stock_regime_data = stock_gap_data[
-                    stock_gap_data['Combined_Regime'] == regime
-                ]['Gap_Return'].values
-                
-                # Combine with global data for better estimation
-                if regime in self.global_model.global_kde_models:
-                    # Sample from global model for augmentation
-                    global_samples = self.global_model.sample_gap_return(regime, 
-                                                                       n_samples=max(50, count))
-                    
-                    # Weighted combination: more stock data = less global influence
-                    stock_weight = min(count / 100.0, 0.8)  # Cap at 80% stock-specific
-                    global_weight = 1 - stock_weight
-                    
-                    # Create hybrid dataset
-                    n_global = int(global_weight * len(stock_regime_data))
-                    combined_data = np.concatenate([
-                        stock_regime_data,
-                        global_samples[:n_global]
-                    ])
-                    
-                    try:
-                        # Fit hybrid KDE
-                        hybrid_kde = gaussian_kde(combined_data)
-                        hybrid_kde.set_bandwidth(bw_method='silverman')
-                        
-                        regime_key = f"{symbol}_{regime}"
-                        self.stock_kde_models[regime_key] = hybrid_kde
-                        self.stock_regime_stats[regime_key] = {
-                            'stock_samples': count,
-                            'global_samples': n_global,
-                            'mean': np.mean(combined_data),
-                            'std': np.std(combined_data),
-                            'stock_weight': stock_weight
-                        }
-                        
-                        adapted_models += 1
-                        
-                    except Exception as e:
-                        print(f"    ❌ Failed to fit {regime}: {e}")
-        
-        print(f"  ✅ Adapted {adapted_models} regime models for {symbol}")
-        self.fitted_stocks.add(symbol)
-        return self
-    
-    def sample_gap_return(self, symbol: str, regime: str, n_samples: int = 1) -> np.ndarray:
-        """
-        Sample gap returns using stock-specific model if available, 
-        otherwise fall back to global model.
-        """
-        stock_regime_key = f"{symbol}_{regime}"
-        
-        if stock_regime_key in self.stock_kde_models:
-            # Use stock-specific adapted model
-            return self.stock_kde_models[stock_regime_key].resample(n_samples)[0]
-        else:
-            # Fall back to global model
-            return self.global_model.sample_gap_return(regime, n_samples)
-    
-    def get_model_info(self, symbol: str) -> Dict:
-        """Get information about stock-specific adaptations."""
-        info = {
-            'symbol': symbol,
-            'is_fitted': symbol in self.fitted_stocks,
-            'adapted_regimes': {},
-            'global_fallback_regimes': []
-        }
-        
-        if symbol in self.fitted_stocks:
-            # Find adapted regimes
-            for key, stats in self.stock_regime_stats.items():
-                if key.startswith(f"{symbol}_"):
-                    regime = key.replace(f"{symbol}_", "")
-                    info['adapted_regimes'][regime] = stats
-            
-            # Find global fallback regimes
-            for regime in self.global_model.global_regime_stats:
-                if f"{symbol}_{regime}" not in self.stock_kde_models:
-                    info['global_fallback_regimes'].append(regime)
-        
-        return info
+# StockSpecificOpenKDE class removed - using global-only modeling architecture
 
 
 class IntelligentOpenForecaster:
     """
     Main interface for intelligent open price forecasting using 
-    global + stock-specific KDE models.
+    global-only KDE models.
     """
     
     def __init__(self, global_model_path: Optional[str] = None):
         self.global_model = GlobalOpenPriceKDE()
-        self.stock_models = {}  # {symbol: StockSpecificOpenKDE}
         self.global_model_path = global_model_path
         
         # Load global model if path provided and exists
@@ -418,27 +291,16 @@ class IntelligentOpenForecaster:
         
         return self
     
-    def add_stock_model(self, symbol: str, stock_data: pd.DataFrame) -> 'IntelligentOpenForecaster':
-        """Add stock-specific fine-tuning for a particular symbol."""
-        if not self.global_model.fitted:
-            raise ValueError("Global model must be trained first")
-        
-        stock_model = StockSpecificOpenKDE(self.global_model)
-        stock_model.fit_stock_model(symbol, stock_data)
-        self.stock_models[symbol] = stock_model
-        
-        return self
-    
     def forecast_open(self, symbol: str, prev_close: float, 
                      trend_regime: str, vol_regime: str,
                      additional_features: Optional[Dict] = None) -> Dict:
         """
-        Forecast opening price using intelligent KDE models.
+        Forecast opening price using global-only KDE models.
         
         Parameters:
         -----------
         symbol : str
-            Stock symbol
+            Stock symbol (used for logging/tracking only)
         prev_close : float
             Previous day's closing price
         trend_regime : str
@@ -455,27 +317,18 @@ class IntelligentOpenForecaster:
         """
         combined_regime = f"{trend_regime}_{vol_regime}"
         
-        # Sample gap return
-        if symbol in self.stock_models:
-            gap_return = self.stock_models[symbol].sample_gap_return(
-                symbol, combined_regime, n_samples=1)[0]
-            model_used = 'stock_specific'
-        else:
-            gap_return = self.global_model.sample_gap_return(
-                combined_regime, n_samples=1)[0]
-            model_used = 'global_only'
+        # Sample gap return using global model only
+        gap_return = self.global_model.sample_gap_return(
+            combined_regime, n_samples=1)[0]
+        model_used = 'global_only'
         
         # Calculate forecasted open
         forecasted_open = prev_close * (1 + gap_return)
         
         # Estimate uncertainty by sampling multiple times
         n_uncertainty_samples = 100
-        if symbol in self.stock_models:
-            gap_samples = self.stock_models[symbol].sample_gap_return(
-                symbol, combined_regime, n_samples=n_uncertainty_samples)
-        else:
-            gap_samples = self.global_model.sample_gap_return(
-                combined_regime, n_samples=n_uncertainty_samples)
+        gap_samples = self.global_model.sample_gap_return(
+            combined_regime, n_samples=n_uncertainty_samples)
         
         open_samples = prev_close * (1 + gap_samples)
         
@@ -493,17 +346,14 @@ class IntelligentOpenForecaster:
         }
     
     def get_system_info(self) -> Dict:
-        """Get comprehensive information about the forecasting system."""
+        """Get comprehensive information about the global-only forecasting system."""
         info = {
             'global_model': {
                 'fitted': self.global_model.fitted,
                 'regimes': len(self.global_model.global_regime_stats),
                 'kde_models': len(self.global_model.global_kde_models)
             },
-            'stock_models': {}
+            'architecture': 'global_only'
         }
-        
-        for symbol, stock_model in self.stock_models.items():
-            info['stock_models'][symbol] = stock_model.get_model_info(symbol)
         
         return info
