@@ -127,7 +127,9 @@ def test_training_pipeline_api():
         else:
             print("❌ Step 7: ARIMA-GARCH models - FAILED: Model not fitted")
     except Exception as e:
-        print(f"❌ Step 7: ARIMA-GARCH models - FAILED: {str(e)[:60]}")
+        print(f"❌ Step 7: ARIMA-GARCH models - FAILED: {e}")
+    
+    total_tests += 1
     
     # Step 8: Integration test
     try:

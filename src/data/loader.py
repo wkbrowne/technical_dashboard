@@ -19,14 +19,15 @@ except ImportError:
     from config import CACHE_FILE
 
 
-def get_multiple_stocks(symbols, interval="1d", update=False, cache_file=CACHE_FILE, rate_limit=1.0):
+def get_multiple_stocks(symbols, interval="1d", update=False, cache_file=CACHE_FILE, rate_limit=1.0, 
+                       universe_file=None, max_symbols=None):
     """
     Fetch data for multiple stocks or load from cache.
 
     Parameters
     ----------
-    symbols : list
-        List of stock symbols to fetch
+    symbols : list or str
+        List of stock symbols to fetch, or 'universe' to load from universe_file
     interval : str
         Time interval for the data (e.g., "1d")
     update : bool
@@ -35,12 +36,60 @@ def get_multiple_stocks(symbols, interval="1d", update=False, cache_file=CACHE_F
         Path to the pickle file for saving/loading data
     rate_limit : float
         Maximum number of API requests per second
+    universe_file : str, optional
+        Path to CSV file containing universe of stocks (used when symbols='universe')
+    max_symbols : int, optional
+        Maximum number of symbols to load from universe file
 
     Returns
     -------
     dict
         Dictionary with keys 'Open', 'High', 'Low', 'Close', 'AdjClose', 'Volume' mapping to DataFrames
     """
+    # Handle universe file loading
+    if symbols == 'universe' or isinstance(symbols, str) and symbols.lower() == 'universe':
+        if universe_file is None:
+            # Auto-detect US universe file in cache directory
+            cache_dir = os.path.dirname(cache_file)
+            universe_files = [f for f in os.listdir(cache_dir) if f.startswith('US universe_2025-08-05') and f.endswith('.csv')]
+            if universe_files:
+                universe_file = os.path.join(cache_dir, universe_files[0])
+                print(f"🌍 Auto-detected universe file: {universe_file}")
+            else:
+                raise ValueError("No universe file found. Please specify universe_file parameter.")
+        
+        if not os.path.exists(universe_file):
+            raise ValueError(f"Universe file not found: {universe_file}")
+        
+        print(f"📊 Loading symbols from universe file: {universe_file}")
+        universe_df = pd.read_csv(universe_file)
+        
+        # Extract symbols from the Symbol column
+        if 'Symbol' in universe_df.columns:
+            symbols = universe_df['Symbol'].dropna().tolist()
+        else:
+            # Try to find symbol column with different names
+            symbol_cols = [col for col in universe_df.columns if 'symbol' in col.lower()]
+            if symbol_cols:
+                symbols = universe_df[symbol_cols[0]].dropna().tolist()
+            else:
+                raise ValueError(f"No 'Symbol' column found in universe file. Available columns: {list(universe_df.columns)}")
+        
+        # Apply max_symbols limit if specified
+        if max_symbols and max_symbols > 0:
+            symbols = symbols[:max_symbols]
+            print(f"🎯 Limited to first {len(symbols)} symbols from universe")
+        
+        print(f"✅ Loaded {len(symbols)} symbols from universe file")
+        
+        # Update cache file name to include universe info
+        if hasattr(cache_file, 'with_suffix'):
+            # Path object
+            cache_file = cache_file.with_name(cache_file.stem + '_universe.pkl')
+        else:
+            # String
+            cache_file = str(cache_file).replace('.pkl', '_universe.pkl')
+
     if not update and os.path.exists(cache_file):
         print(f"Loading cached data from {cache_file}")
         with open(cache_file, "rb") as f:
@@ -51,7 +100,9 @@ def get_multiple_stocks(symbols, interval="1d", update=False, cache_file=CACHE_F
 
     for idx, symbol in enumerate(symbols):
         print(f"Fetching data for {symbol}...")
-        df = get_stock_data(symbol, interval)
+        # Replace "." and "/" with "-" for API lookup
+        api_symbol = symbol.replace(".", "-").replace("/", "-")
+        df = get_stock_data(api_symbol, interval, original_symbol=symbol)
         if df is not None:
             all_data.append(df)
 
@@ -139,16 +190,18 @@ def get_etf_data(etf_symbols, interval="1d", update=False, cache_file=None, rate
     
     return etf_data
 
-def get_stock_data(symbol, interval="1d"):
+def get_stock_data(symbol, interval="1d", original_symbol=None):
     """
     Fetch historical stock data from Yahoo Finance via RapidAPI.
 
     Parameters
     ----------
     symbol : str
-        Stock ticker symbol
+        Stock ticker symbol (transformed for API lookup)
     interval : str
         Data interval (e.g., "1d")
+    original_symbol : str, optional
+        Original symbol to preserve in the returned DataFrame
 
     Returns
     -------
@@ -188,7 +241,7 @@ def get_stock_data(symbol, interval="1d"):
             # Fix: Use format='mixed' to handle various date formats automatically
             df['date'] = pd.to_datetime(df['date'], format='mixed')
             df.set_index('date', inplace=True)
-            df['symbol'] = symbol
+            df['symbol'] = original_symbol if original_symbol is not None else symbol
 
             column_mapping = {
                 'open': 'Open',
@@ -218,4 +271,34 @@ def get_stock_data(symbol, interval="1d"):
     except Exception as e:
         print(f"Error fetching data for {symbol}: {str(e)}")
         return None
+
+
+def load_universe_data(max_symbols=None, update=False, rate_limit=1.0):
+    """
+    Convenience function to load data from the US universe file.
+    
+    Parameters
+    ----------
+    max_symbols : int, optional
+        Maximum number of symbols to load from universe
+    update : bool
+        If True, fetches fresh data. If False, loads from cache.
+    rate_limit : float
+        Maximum number of API requests per second
+        
+    Returns
+    -------
+    dict
+        Dictionary with OHLC data for universe stocks
+    """
+    print(f"🌍 Loading US universe data...")
+    print(f"   Max symbols: {max_symbols or 'All'}")
+    print(f"   Update: {'Fresh data' if update else 'Cache if available'}")
+    
+    return get_multiple_stocks(
+        symbols='universe',
+        update=update,
+        rate_limit=rate_limit,
+        max_symbols=max_symbols
+    )
 

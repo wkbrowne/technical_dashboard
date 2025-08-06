@@ -648,6 +648,28 @@ class MultiStockBBMarkovModel:
                 self.global_trend_priors[trend] = uniform_prior
                 trend_obs_summary[trend] = "0 (uniform prior)"
         
+        # Add sparse bucket logging - find 5 sparsest BB-position + trend buckets
+        print(f"\n📊 Analyzing BB-position + trend bucket sparsity...")
+        bucket_counts = []
+        for trend in self.trend_names:
+            if trend_data_combined[trend]:
+                combined_bb_positions = pd.concat(trend_data_combined[trend], ignore_index=True)
+                # Count positions for each BB state within this trend
+                bb_counts = combined_bb_positions.value_counts()
+                for bb_pos, count in bb_counts.items():
+                    bucket_counts.append((f"{trend}_BB{bb_pos}", count))
+            else:
+                # Add empty trend buckets
+                for bb_pos in range(1, self.n_states + 1):
+                    bucket_counts.append((f"{trend}_BB{bb_pos}", 0))
+        
+        # Sort by count and show 5 sparsest buckets
+        bucket_counts.sort(key=lambda x: x[1])
+        sparse_buckets = bucket_counts[:5]
+        print(f"🔍 5 sparsest BB-position + trend buckets:")
+        for bucket, count in sparse_buckets:
+            print(f"  📉 {bucket}: {count} samples")
+        
         # Also fit unified global model (for fallback)
         all_bb_positions = []
         for trend_data_list in trend_data_combined.values():

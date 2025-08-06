@@ -1,9 +1,9 @@
 """
-Model Manager for Monte Carlo Options Analysis
-==============================================
+Model Manager for OHLC Forecasting Pipeline
+===========================================
 
 This module abstracts away the complex model training and provides a clean 
-interface for the Monte Carlo notebook. It handles:
+interface for the forecasting pipeline. It handles:
 
 1. Loading stock data
 2. Training OHLC forecaster with GARCH/ARIMA/KDE models
@@ -14,7 +14,7 @@ interface for the Monte Carlo notebook. It handles:
 
 Key Features:
 - Automatic model training and caching
-- Clean interface for Monte Carlo simulation
+- Clean interface for OHLC forecasting pipeline
 - Support for multiple stocks
 - Configurable model parameters
 - Performance monitoring
@@ -52,7 +52,7 @@ except ImportError:
 class ModelManager:
     """
     Manages training and caching of sophisticated forecasting models.
-    Abstracts complexity away from Monte Carlo notebook.
+    Abstracts complexity away from forecasting pipeline.
     """
     
     def __init__(self, cache_dir: str = "model_cache"):
@@ -446,7 +446,7 @@ class ModelManager:
         dict
             Setup results and model information
         """
-        print(f"🚀 Quick setup for Monte Carlo demo with {symbol}")
+        print(f"🚀 Quick setup for forecasting demo with {symbol}")
         print("=" * 60)
         
         try:
@@ -469,7 +469,7 @@ class ModelManager:
             print("🎉 Quick setup complete!")
             print(f"   Primary symbol: {symbol}")
             print(f"   Global models trained on: {len(demo_stocks)} stocks")
-            print("   Ready for Monte Carlo analysis!")
+            print("   Ready for forecasting analysis!")
             
             return setup_results
             

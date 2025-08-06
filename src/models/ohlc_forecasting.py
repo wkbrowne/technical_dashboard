@@ -340,9 +340,10 @@ class OHLCForecaster:
                      vol_forecast: np.ndarray,
                      bb_states: np.ndarray,
                      current_close: float,
-                     n_days: int = 1) -> Dict:
+                     n_days: int = 1,
+                     arima_close_forecast: Optional[np.ndarray] = None) -> Dict:
         """
-        Forecast OHLC values using MA, volatility, and BB state forecasts.
+        Forecast OHLC values using MA, volatility, BB state forecasts, and optional ARIMA close forecasts.
         
         Parameters
         ----------
@@ -356,6 +357,9 @@ class OHLCForecaster:
             Current closing price
         n_days : int
             Number of days to forecast
+        arima_close_forecast : np.ndarray, optional
+            ARIMA-based close price forecasts (in log prices). If provided, 
+            these will be used directly for close prices instead of MA-based estimation.
             
         Returns
         -------
@@ -393,8 +397,18 @@ class OHLCForecaster:
 
             regime_stats = self._get_regime_stats(bb_state, forecasted_vol, trend_today)
             
-            # Forecast Close first (using MA and volatility)
-            close_forecast = self._forecast_close(prev_close, forecasted_ma, forecasted_vol, regime_stats, bb_state)
+            # Forecast Close - use ARIMA if available, otherwise use MA and volatility
+            if arima_close_forecast is not None and day < len(arima_close_forecast):
+                # Use ARIMA forecast (convert from log prices)
+                arima_close_price = np.exp(arima_close_forecast[day])
+                close_forecast = {
+                    'mean': arima_close_price,
+                    'lower': arima_close_price * 0.95,  # Simple confidence interval
+                    'upper': arima_close_price * 1.05
+                }
+            else:
+                # Use traditional MA-based forecasting
+                close_forecast = self._forecast_close(prev_close, forecasted_ma, forecasted_vol, regime_stats, bb_state)
             
             # Forecast Open (considering gaps) - pass volatility for intelligent forecasting
             open_forecast = self._forecast_open(prev_close, close_forecast['mean'], regime_stats, forecasted_vol)

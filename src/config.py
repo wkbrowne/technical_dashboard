@@ -1,13 +1,22 @@
+"""
+Basic configuration settings for the technical dashboard
+"""
+
 import os
 from pathlib import Path
-from dotenv import load_dotenv
 
-# Base directory (project root)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Get the project root directory
+PROJECT_ROOT = Path(__file__).parent.parent
 
-# Load environment variables from project root
-load_dotenv(PROJECT_ROOT / '.env')
+# Cache file location
+CACHE_FILE = PROJECT_ROOT / "cache" / "stock_data.pkl"
 
-# Cache directory + default cache file
-DATA_CACHE_DIR = PROJECT_ROOT / 'cache'
-CACHE_FILE = DATA_CACHE_DIR / 'stock_data.pkl'
+# Make sure cache directory exists
+CACHE_FILE.parent.mkdir(exist_ok=True)
+
+# Environment variables and API settings
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+
+# Other configuration settings
+DEFAULT_RATE_LIMIT = 1.0
+DEFAULT_INTERVAL = "1d"
