@@ -1,304 +1,297 @@
-# Data loading and caching
+# -------------------- src/data/loader.py (lean + sectors) --------------------
+import os
+import sys
+from time import monotonic, sleep
+from typing import Dict, Optional, List, Tuple, Union
 
-# -------------------- data/loader.py --------------------
-# Module to load and cache price data from Yahoo Finance API via RapidAPI
-
-import os, sys
-import time
-import pickle
 import requests
 import pandas as pd
-from datetime import datetime
 
-# Import config which loads .env variables
+# Import config (for CACHE_FILE path)
 try:
     from ..config import CACHE_FILE
 except ImportError:
-    # Fallback for direct execution
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
     from config import CACHE_FILE
 
 
-def get_multiple_stocks(symbols, interval="1d", update=False, cache_file=CACHE_FILE, rate_limit=1.0, 
-                       universe_file=None, max_symbols=None):
-    """
-    Fetch data for multiple stocks or load from cache.
+# ---------- Parquet I/O (long-format) ----------
+def _save_long_parquet(data_dict: Dict[str, pd.DataFrame], parquet_path: str) -> None:
+    if not data_dict:
+        return
+    pieces = []
+    for metric, df in data_dict.items():
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        stacked = df.stack(dropna=False).reset_index()
+        stacked.columns = ['date', 'symbol', 'value']
+        stacked['metric'] = metric
+        pieces.append(stacked)
+    if not pieces:
+        return
+    long_df = pd.concat(pieces, ignore_index=True)
+    long_df['symbol'] = long_df['symbol'].astype('string')
+    long_df['metric'] = long_df['metric'].astype('string')
+    long_df['date'] = pd.to_datetime(long_df['date'])
+    long_df.to_parquet(parquet_path, engine='pyarrow', compression='snappy', index=False)
 
-    Parameters
-    ----------
-    symbols : list or str
-        List of stock symbols to fetch, or 'universe' to load from universe_file
-    interval : str
-        Time interval for the data (e.g., "1d")
-    update : bool
-        If False, loads from cache file. If True, fetches fresh data.
-    cache_file : str
-        Path to the pickle file for saving/loading data
-    rate_limit : float
-        Maximum number of API requests per second
-    universe_file : str, optional
-        Path to CSV file containing universe of stocks (used when symbols='universe')
-    max_symbols : int, optional
-        Maximum number of symbols to load from universe file
 
-    Returns
-    -------
-    dict
-        Dictionary with keys 'Open', 'High', 'Low', 'Close', 'AdjClose', 'Volume' mapping to DataFrames
-    """
-    # Handle universe file loading
-    if symbols == 'universe' or isinstance(symbols, str) and symbols.lower() == 'universe':
-        if universe_file is None:
-            # Auto-detect US universe file in cache directory
-            cache_dir = os.path.dirname(cache_file)
-            universe_files = [f for f in os.listdir(cache_dir) if f.startswith('US universe_2025-08-05') and f.endswith('.csv')]
-            if universe_files:
-                universe_file = os.path.join(cache_dir, universe_files[0])
-                print(f"🌍 Auto-detected universe file: {universe_file}")
-            else:
-                raise ValueError("No universe file found. Please specify universe_file parameter.")
-        
-        if not os.path.exists(universe_file):
-            raise ValueError(f"Universe file not found: {universe_file}")
-        
-        print(f"📊 Loading symbols from universe file: {universe_file}")
-        universe_df = pd.read_csv(universe_file)
-        
-        # Extract symbols from the Symbol column
-        if 'Symbol' in universe_df.columns:
-            symbols = universe_df['Symbol'].dropna().tolist()
-        else:
-            # Try to find symbol column with different names
-            symbol_cols = [col for col in universe_df.columns if 'symbol' in col.lower()]
-            if symbol_cols:
-                symbols = universe_df[symbol_cols[0]].dropna().tolist()
-            else:
-                raise ValueError(f"No 'Symbol' column found in universe file. Available columns: {list(universe_df.columns)}")
-        
-        # Apply max_symbols limit if specified
-        if max_symbols and max_symbols > 0:
-            symbols = symbols[:max_symbols]
-            print(f"🎯 Limited to first {len(symbols)} symbols from universe")
-        
-        print(f"✅ Loaded {len(symbols)} symbols from universe file")
-        
-        # Update cache file name to include universe info
-        if hasattr(cache_file, 'with_suffix'):
-            # Path object
-            cache_file = cache_file.with_name(cache_file.stem + '_universe.pkl')
-        else:
-            # String
-            cache_file = str(cache_file).replace('.pkl', '_universe.pkl')
-
-    if not update and os.path.exists(cache_file):
-        print(f"Loading cached data from {cache_file}")
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
-
-    all_data = []
-    delay = 1.0 / rate_limit if rate_limit > 0 else 0
-
-    for idx, symbol in enumerate(symbols):
-        print(f"Fetching data for {symbol}...")
-        # Replace "." and "/" with "-" for API lookup
-        api_symbol = symbol.replace(".", "-").replace("/", "-")
-        df = get_stock_data(api_symbol, interval, original_symbol=symbol)
-        if df is not None:
-            all_data.append(df)
-
-        if idx < len(symbols) - 1:
-            time.sleep(delay)
-
-    if not all_data:
-        print("No data was successfully fetched for any of the symbols")
+def _load_long_parquet(parquet_path: str) -> Optional[Dict[str, pd.DataFrame]]:
+    if not os.path.exists(parquet_path):
         return None
+    df = pd.read_parquet(parquet_path)
+    if df.empty or not {'date', 'symbol', 'metric', 'value'}.issubset(df.columns):
+        return None
+    out: Dict[str, pd.DataFrame] = {}
+    for metric, chunk in df.groupby('metric'):
+        out[str(metric)] = chunk.pivot(index='date', columns='symbol', values='value').sort_index()
+    return out
 
-    combined_df = pd.concat(all_data)
-    result = {}
-    metrics = ['Open', 'High', 'Low', 'Close', 'AdjClose', 'Volume']
 
-    for metric in metrics:
-        metric_df = combined_df.pivot(columns='symbol', values=metric)
-        result[metric] = metric_df
+# ---------- Robust GET w/ retries ----------
+def _request_with_retries(url: str, headers: dict, params: dict,
+                          max_retries: int = 4, base_sleep: float = 2.0) -> requests.Response:
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=(10, 30))
+            if 200 <= resp.status_code < 300:
+                return resp
+            if resp.status_code == 429:
+                ra = resp.headers.get("Retry-After")
+                wait = float(ra) if (ra and str(ra).isdigit()) else base_sleep * (2 ** attempt)
+                print(f"   ⏳ 429 throttled. Sleeping {wait:.1f}s...")
+                sleep(wait); continue
+            if 500 <= resp.status_code < 600:
+                wait = base_sleep * (2 ** attempt)
+                print(f"   ⏳ {resp.status_code} server error. Retry in {wait:.1f}s...")
+                sleep(wait); continue
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_err = e
+            wait = base_sleep * (2 ** attempt)
+            print(f"   ⏳ Network error ({type(e).__name__}): {e}. Retry in {wait:.1f}s...")
+            sleep(wait)
+    raise last_err
 
-    with open(cache_file, "wb") as f:
-        pickle.dump(result, f)
-        print(f"Saved fresh data to {cache_file}")
 
-    return result
-
-def get_etf_data(etf_symbols, interval="1d", update=False, cache_file=None, rate_limit=1.0):
+# ---------- Yahoo (RapidAPI) fetch ----------
+def get_stock_data(symbol: str, interval: str = "1d", original_symbol: Optional[str] = None) -> Optional[pd.DataFrame]:
     """
-    Fetch data for multiple ETFs or load from cache.
-    
-    Parameters
-    ----------
-    etf_symbols : list
-        List of ETF symbols to fetch (e.g., ['SPY', 'QQQ', 'IWM'])
-    interval : str
-        Time interval for the data (e.g., "1d")
-    update : bool
-        If False, loads from cache file. If True, fetches fresh data.
-    cache_file : str
-        Path to the pickle file for saving/loading ETF data
-    rate_limit : float
-        Maximum number of API requests per second
-        
-    Returns
-    -------
-    dict
-        Dictionary with ETF symbols as keys mapping to DataFrames with OHLC data
-    """
-    if cache_file is None:
-        # Handle Path object properly
-        if hasattr(CACHE_FILE, 'with_suffix'):
-            # Path object - use with_stem to change name
-            cache_file = CACHE_FILE.with_name(CACHE_FILE.stem + '_etf.pkl')
-        else:
-            # String - use replace
-            cache_file = str(CACHE_FILE).replace('.pkl', '_etf.pkl')
-    
-    if not update and os.path.exists(cache_file):
-        print(f"Loading cached ETF data from {cache_file}")
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
-    
-    print(f"🏦 Fetching ETF data for: {etf_symbols}")
-    etf_data = {}
-    delay = 1.0 / rate_limit if rate_limit > 0 else 0
-    
-    for idx, symbol in enumerate(etf_symbols):
-        print(f"Fetching ETF data for {symbol}...")
-        df = get_stock_data(symbol, interval)
-        if df is not None:
-            # Remove the 'symbol' column and clean up for ETF-specific processing
-            etf_df = df.drop('symbol', axis=1) if 'symbol' in df.columns else df
-            etf_data[symbol] = etf_df
-            print(f"✅ {symbol}: {len(etf_df)} observations")
-        else:
-            print(f"❌ Failed to fetch data for {symbol}")
-        
-        if idx < len(etf_symbols) - 1:
-            time.sleep(delay)
-    
-    if etf_data:
-        with open(cache_file, "wb") as f:
-            pickle.dump(etf_data, f)
-            print(f"💾 Saved ETF data to {cache_file}")
-    else:
-        print("⚠️ No ETF data was successfully fetched")
-    
-    return etf_data
-
-def get_stock_data(symbol, interval="1d", original_symbol=None):
-    """
-    Fetch historical stock data from Yahoo Finance via RapidAPI.
-
-    Parameters
-    ----------
-    symbol : str
-        Stock ticker symbol (transformed for API lookup)
-    interval : str
-        Data interval (e.g., "1d")
-    original_symbol : str, optional
-        Original symbol to preserve in the returned DataFrame
-
-    Returns
-    -------
-    pd.DataFrame or None
-        Cleaned DataFrame with historical data
+    Fetch historical OHLCV from Yahoo Finance (via RapidAPI yahoo-finance15).
+    Returns DataFrame indexed by date with columns: Open/High/Low/Close/AdjClose/Volume + symbol
     """
     url = "https://yahoo-finance15.p.rapidapi.com/api/v1/markets/stock/history"
-
-    querystring = {
-        "symbol": symbol,
-        "interval": interval,
-        "diffandsplits": "false"
-    }
-
     rapidapi_key = os.getenv("RAPIDAPI_KEY")
     if not rapidapi_key:
-        print(f"⚠️ Error: RAPIDAPI_KEY environment variable not set. Cannot fetch data for {symbol}")
+        print(f"⚠️  RAPIDAPI_KEY not set. Skipping {symbol}")
         return None
-        
-    headers = {
-        "x-rapidapi-key": rapidapi_key,
-        "x-rapidapi-host": "yahoo-finance15.p.rapidapi.com"
-    }
 
+    params = {"symbol": symbol, "interval": interval, "diffandsplits": "false"}
+    headers = {"x-rapidapi-key": rapidapi_key, "x-rapidapi-host": "yahoo-finance15.p.rapidapi.com"}
+
+    print(f"↪ {original_symbol or symbol} …", end="", flush=True)
     try:
-        response = requests.get(url, headers=headers, params=querystring)
-        data = response.json()
-
-        if 'body' in data and data['body']:
-            records = []
-            for timestamp, values in data['body'].items():
-                record = values.copy()
-                record['date'] = values.get('date')
-                records.append(record)
-
-            df = pd.DataFrame(records)
-            # Fix: Use format='mixed' to handle various date formats automatically
-            df['date'] = pd.to_datetime(df['date'], format='mixed')
-            df.set_index('date', inplace=True)
-            df['symbol'] = original_symbol if original_symbol is not None else symbol
-
-            column_mapping = {
-                'open': 'Open',
-                'high': 'High',
-                'low': 'Low',
-                'close': 'Close',
-                'adjclose': 'AdjClose',
-                'volume': 'Volume'
-            }
-
-            df = df.rename(columns={k: v for k, v in column_mapping.items() if k in df.columns})
-
-            required_fields = ['Open', 'High', 'Low', 'Close', 'AdjClose', 'Volume']
-            missing_fields = [field for field in required_fields if field not in df.columns]
-
-            if missing_fields:
-                print(f"⚠️ Warning: Missing data for {symbol} — missing fields: {missing_fields}")
-
-            desired_columns = required_fields + ['symbol']
-            df = df[[col for col in desired_columns if col in df.columns]]
-
-            return df
-        else:
-            print(f"No data found for {symbol}")
-            return None
-
+        resp = _request_with_retries(url, headers, params, max_retries=4, base_sleep=2.0)
+        data = resp.json()
     except Exception as e:
-        print(f"Error fetching data for {symbol}: {str(e)}")
+        print(f" fail ({type(e).__name__})")
+        return None
+    print(" ok")
+
+    if not isinstance(data, dict) or not data.get("body"):
+        print(f"   ⚠️  no body for {symbol}")
         return None
 
+    records = []
+    for _, v in data["body"].items():
+        rec = v.copy()
+        rec["date"] = v.get("date")
+        records.append(rec)
+    if not records:
+        print(f"   ⚠️  empty records for {symbol}")
+        return None
 
-def load_universe_data(max_symbols=None, update=False, rate_limit=1.0):
-    """
-    Convenience function to load data from the US universe file.
-    
-    Parameters
-    ----------
-    max_symbols : int, optional
-        Maximum number of symbols to load from universe
-    update : bool
-        If True, fetches fresh data. If False, loads from cache.
-    rate_limit : float
-        Maximum number of API requests per second
-        
-    Returns
-    -------
-    dict
-        Dictionary with OHLC data for universe stocks
-    """
-    print(f"🌍 Loading US universe data...")
-    print(f"   Max symbols: {max_symbols or 'All'}")
-    print(f"   Update: {'Fresh data' if update else 'Cache if available'}")
-    
-    return get_multiple_stocks(
-        symbols='universe',
-        update=update,
-        rate_limit=rate_limit,
-        max_symbols=max_symbols
-    )
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).set_index("date")
 
+    colmap = {"open": "Open", "high": "High", "low": "Low", "close": "Close",
+              "adjclose": "AdjClose", "volume": "Volume"}
+    df = df.rename(columns={k: v for k, v in colmap.items() if k in df.columns})
+    keep = [c for c in ["Open","High","Low","Close","AdjClose","Volume"] if c in df.columns]
+    if not keep:
+        print(f"   ⚠️  missing OHLCV for {symbol}")
+        return None
+
+    df = df[keep]
+    df["symbol"] = original_symbol or symbol
+    return df
+
+
+# ---------- Symbol sources ----------
+def _discover_universe_csv(cache_file: str) -> str:
+    cache_dir = os.path.dirname(cache_file)
+    cands = [f for f in os.listdir(cache_dir) if f.startswith("US universe_") and f.endswith(".csv")]
+    if not cands:
+        raise FileNotFoundError("No universe CSV found in cache directory.")
+    return os.path.join(cache_dir, sorted(cands)[0])
+
+def _symbols_from_csv(path: str, max_symbols: Optional[int] = None) -> List[str]:
+    df = pd.read_csv(path)
+    col = "Symbol" if "Symbol" in df.columns else next((c for c in df.columns if "symbol" in c.lower()), None)
+    if not col:
+        raise ValueError(f"No symbol column in {path}. Columns: {list(df.columns)}")
+    syms = df[col].dropna().astype(str).tolist()
+    if max_symbols and max_symbols > 0:
+        syms = syms[:max_symbols]
+    return syms
+
+def _sectors_from_universe(path: str, max_symbols: Optional[int] = None) -> Dict[str, str]:
+    """
+    Returns a dict: {symbol -> sector} from the universe CSV.
+    Keeps the sector text as-is (strip/normalize whitespace & capitalization lightly).
+    """
+    df = pd.read_csv(path)
+    # Detect columns (robust to case/spacing)
+    sym_col = "Symbol" if "Symbol" in df.columns else next((c for c in df.columns if "symbol" in c.lower()), None)
+    sec_col = "Sector" if "Sector" in df.columns else next((c for c in df.columns if "sector" in c.lower()), None)
+    if not sym_col or not sec_col:
+        raise ValueError(f"No Symbol/Sector columns in {path}. Columns: {list(df.columns)}")
+
+    out = (df[[sym_col, sec_col]]
+           .dropna(subset=[sym_col])
+           .assign(**{sym_col: df[sym_col].astype(str).str.strip(),
+                      sec_col: df[sec_col].astype(str).str.strip()}))
+    if max_symbols and max_symbols > 0:
+        out = out.iloc[:max_symbols]
+
+    # Keep original sector names (e.g., "Electronic technology")
+    return dict(zip(out[sym_col], out[sec_col]))
+
+DEFAULT_ETFS = [
+    "SPY","QQQ","IWM","DIA","TLT","IEF","HYG","LQD",
+    "XLF","XLK","XLE","XLY","XLI","XLP","XLV","XLU","XLB","XLC",
+    "EFA","EEM","GLD","SLV","USO","UNG"
+]
+
+
+# ---------- Core fetcher (shared) ----------
+def _fetch_symbols(symbols: List[str], interval: str = "1d", rate_limit: float = 1.0) -> Optional[Dict[str, pd.DataFrame]]:
+    if not symbols:
+        return None
+    delay = 1.0 / rate_limit if rate_limit > 0 else 0.0
+    frames = []
+    for i, sym in enumerate(symbols):
+        api_sym = sym.replace(".", "-").replace("/", "-")
+        df = get_stock_data(api_sym, interval=interval, original_symbol=sym)
+        if df is not None:
+            frames.append(df)
+        if i < len(symbols) - 1 and delay > 0:
+            sleep(delay)
+
+    if not frames:
+        return None
+
+    combined = pd.concat(frames, axis=0, ignore_index=False).reset_index().rename(columns={'index': 'date'})
+    combined['date'] = pd.to_datetime(combined['date'])
+    combined['symbol'] = combined['symbol'].astype('string')
+
+    result: Dict[str, pd.DataFrame] = {}
+    for metric in ["Open", "High", "Low", "Close", "AdjClose", "Volume"]:
+        if metric in combined.columns:
+            result[metric] = combined.pivot(index='date', columns='symbol', values=metric).sort_index()
+    return result
+
+
+# ---------- Public API ----------
+def load_stock_universe(max_symbols: Optional[int] = None,
+                        update: bool = False,
+                        rate_limit: float = 1.0,
+                        interval: str = "1d",
+                        include_sectors: bool = False
+                        ) -> Union[Dict[str, pd.DataFrame], Tuple[Dict[str, pd.DataFrame], Dict[str, str]]]:
+    """
+    Load stock OHLCV into dict of wide DataFrames. Caches to *_universe.parquet.
+    If include_sectors=True, returns a tuple: (data, sectors_map)
+    where sectors_map is {symbol -> sector} from the universe CSV.
+    """
+    # Cache path
+    cache_parquet = (CACHE_FILE.with_name(CACHE_FILE.stem + "_universe.parquet")
+                     if hasattr(CACHE_FILE, "with_name") else str(CACHE_FILE).replace(".pkl", "_universe.parquet"))
+
+    # Try cache (OHLCV only; sectors always re-read from CSV for freshness)
+    if not update and os.path.exists(cache_parquet):
+        print(f"💾 stocks: loading cache {cache_parquet}")
+        cached = _load_long_parquet(cache_parquet)
+        if cached:
+            if include_sectors:
+                universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
+                sectors = _sectors_from_universe(universe_csv, max_symbols=max_symbols)
+                return cached, sectors
+            return cached
+        print("⚠️  cache empty/corrupt — fetching")
+
+    # Discover symbols & sectors from stock universe CSV
+    universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
+    print(f"📊 stocks CSV: {universe_csv}")
+    symbols = _symbols_from_csv(universe_csv, max_symbols=max_symbols)
+    sectors = _sectors_from_universe(universe_csv, max_symbols=max_symbols)
+    print(f"✅ stocks queued: {len(symbols)}")
+
+    # Fetch & cache
+    data = _fetch_symbols(symbols, interval=interval, rate_limit=rate_limit)
+    if not data:
+        print("❌ no stock data fetched"); 
+        return (None, sectors) if include_sectors else None
+
+    print(f"💾 stocks: writing {cache_parquet}")
+    _save_long_parquet(data, cache_parquet)
+    return (data, sectors) if include_sectors else data
+
+
+def load_etf_universe(etf_symbols: Optional[List[str]] = None,
+                      etf_csv_path: Optional[str] = None,
+                      update: bool = False,
+                      rate_limit: float = 1.0,
+                      interval: str = "1d") -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    Load ETF OHLCV into dict of wide DataFrames. Caches to *_etf.parquet.
+    Choose one of:
+      - etf_symbols (list)
+      - etf_csv_path (CSV with Symbol column)
+      - default curated list (if both are None)
+    """
+    # Cache path
+    cache_parquet = (CACHE_FILE.with_name(CACHE_FILE.stem + "_etf.parquet")
+                     if hasattr(CACHE_FILE, "with_name") else str(CACHE_FILE).replace(".pkl", "_etf.parquet"))
+
+    # Try cache
+    if not update and os.path.exists(cache_parquet):
+        print(f"💾 ETFs: loading cache {cache_parquet}")
+        cached = _load_long_parquet(cache_parquet)
+        if cached: return cached
+        print("⚠️  ETF cache empty/corrupt — fetching")
+
+    # Resolve ETF symbols
+    if etf_csv_path and os.path.exists(etf_csv_path):
+        print(f"📈 ETF CSV: {etf_csv_path}")
+        symbols = _symbols_from_csv(etf_csv_path, max_symbols=None)
+    elif etf_symbols:
+        symbols = list(dict.fromkeys(etf_symbols))  # dedupe, keep order
+        print(f"📈 ETF list provided ({len(symbols)})")
+    else:
+        symbols = DEFAULT_ETFS
+        print(f"📈 ETF default set ({len(symbols)})")
+
+    print(f"✅ ETFs queued: {len(symbols)}")
+
+    # Fetch & cache
+    data = _fetch_symbols(symbols, interval=interval, rate_limit=rate_limit)
+    if not data:
+        print("❌ no ETF data fetched"); return None
+
+    print(f"💾 ETFs: writing {cache_parquet}")
+    _save_long_parquet(data, cache_parquet)
+    return data
