@@ -103,8 +103,10 @@ def add_range_breakout_features(
         df[f"breakout_dn_{w}d"] = (close < lo.shift(1)).astype('float32')
         
         # Range expansion (handle zero previous range to avoid infinities)
-        prev_rng = rng.shift(1).replace(0, np.nan)
-        df[f"range_expansion_{w}d"] = _handle_infinities(rng / prev_rng - 1.0)
+        prev_rng = rng.shift(1)
+        # Avoid division by zero - replace with 0 when previous range is 0 or NaN
+        range_expansion = rng / prev_rng.replace(0, np.nan) - 1.0
+        df[f"range_expansion_{w}d"] = _handle_infinities(range_expansion)
         
         # Range z-score vs 60-day history
         mu = rng.rolling(60, min_periods=20).mean()
@@ -120,6 +122,16 @@ def add_range_breakout_features(
         range_pct = _handle_infinities(hl_range / close.replace(0, np.nan))
         rvol = _handle_infinities(vol / vol_ma20.replace(0, np.nan))
         df["range_x_rvol20"] = _handle_infinities(range_pct / rvol.replace(0, np.nan))
+    
+    # Final cleanup: ensure no infinities remain in any columns
+    range_columns = [col for col in df.columns if any(pattern in col for pattern in [
+        'range_expansion_', 'range_x_rvol', 'range_pct_close', 'tr_pct_close', 
+        'atr_percent', 'gap_', 'pos_in_', 'range_z_'
+    ])]
+    
+    for col in range_columns:
+        if col in df.columns:
+            df[col] = _handle_infinities(df[col])
     
     logger.debug("Range/breakout features computation completed")
     return df
