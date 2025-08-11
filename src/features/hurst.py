@@ -12,11 +12,18 @@ import pandas as pd
 
 try:
     import nolds
-    # Suppress RankWarning from nolds polyfit operations - apply multiple filters
+    # Monkey-patch numpy.polyfit to suppress RankWarning at the source
+    _original_polyfit = np.polyfit
+    def _silent_polyfit(*args, **kwargs):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", np.RankWarning)
+            warnings.simplefilter("ignore", UserWarning)
+            return _original_polyfit(*args, **kwargs)
+    np.polyfit = _silent_polyfit
+    
+    # Also apply standard warning filters as backup
     warnings.filterwarnings('ignore', category=np.RankWarning)
     warnings.filterwarnings('ignore', message='Polyfit may be poorly conditioned')
-    warnings.filterwarnings('ignore', category=np.RankWarning, module='nolds')
-    warnings.filterwarnings('ignore', category=np.RankWarning, module='nolds.measures')
 except ImportError:
     raise ImportError("nolds is required for Hurst features. Please: pip install nolds")
 
