@@ -5,12 +5,15 @@ This module computes Hurst exponent features using the R/S method to identify
 trending vs mean-reverting behavior in price series.
 """
 import logging
+import warnings
 from typing import Tuple
 import numpy as np
 import pandas as pd
 
 try:
     import nolds
+    # Suppress RankWarning from nolds polyfit operations
+    warnings.filterwarnings('ignore', category=np.RankWarning, module='nolds')
 except ImportError:
     raise ImportError("nolds is required for Hurst features. Please: pip install nolds")
 
