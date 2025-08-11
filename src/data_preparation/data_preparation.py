@@ -918,7 +918,7 @@ def add_breadth_series(indicators_by_symbol: Dict[str, pd.DataFrame],
         px = pd.to_numeric(df[price_col], errors='coerce')
         if px.isna().all():
             continue
-        ret1 = px.pct_change()
+        ret1 = px.pct_change(fill_method=None)
         advdec[sym] = np.sign(ret1).fillna(0.0)
         above20[sym]  = _above_ma_series(px, 20)
         above50[sym]  = _above_ma_series(px, 50)

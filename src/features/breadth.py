@@ -82,7 +82,7 @@ def add_breadth_series(
             continue
         
         # Daily return direction for advance/decline
-        ret1 = px.pct_change()
+        ret1 = px.pct_change(fill_method=None)
         advdec[sym] = np.sign(ret1).fillna(0.0)
         
         # Above moving average indicators
