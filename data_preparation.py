@@ -21,6 +21,11 @@ if str(PROJECT_ROOT) not in sys.path:
 # Suppress specific warnings
 warnings.filterwarnings("ignore", message="RANSAC did not reach consensus, using numpy's polyfit")
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented")
+# Suppress nolds RankWarning at main entry point
+warnings.filterwarnings("ignore", category=UserWarning, module="nolds")
+warnings.filterwarnings("ignore", message="Polyfit may be poorly conditioned")
+import numpy as np
+warnings.filterwarnings("ignore", category=np.RankWarning)
 
 # Configure logging
 logging.basicConfig(

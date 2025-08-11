@@ -40,8 +40,12 @@ def _safe_hurst_rs(x: np.ndarray) -> float:
         
         if len(x_clean) < 10:  # Need minimum data for reliable calculation
             return np.nan
-            
-        result = float(nolds.hurst_rs(x_clean, fit="poly"))
+        
+        # Suppress warnings during the actual calculation
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", np.RankWarning)
+            warnings.simplefilter("ignore")  # Catch all warnings during calculation
+            result = float(nolds.hurst_rs(x_clean, fit="poly"))
         return result
     except Exception as e:
         logger.debug(f"Hurst calculation failed: {e}")
