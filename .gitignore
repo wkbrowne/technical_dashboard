@@ -147,8 +147,12 @@ Thumbs.db
 # Project specific
 cache/
 results/
+artifacts/
 *.pkl
 *.gif
 *.png
 *.jpg
 *.jpeg
+
+# Generated files from refactoring cleanup
+=*
