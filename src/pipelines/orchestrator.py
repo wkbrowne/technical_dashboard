@@ -14,9 +14,6 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 
-# Suppress warnings that occur during parallel processing
-warnings.filterwarnings('ignore', category=np.RankWarning)
-warnings.filterwarnings('ignore', message='Polyfit may be poorly conditioned')
 
 # Relative imports for feature modules
 from ..features.assemble import assemble_indicators_from_wide

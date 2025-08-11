@@ -12,18 +12,6 @@ import pandas as pd
 
 try:
     import nolds
-    # Monkey-patch numpy.polyfit to suppress RankWarning at the source
-    _original_polyfit = np.polyfit
-    def _silent_polyfit(*args, **kwargs):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", np.RankWarning)
-            warnings.simplefilter("ignore", UserWarning)
-            return _original_polyfit(*args, **kwargs)
-    np.polyfit = _silent_polyfit
-    
-    # Also apply standard warning filters as backup
-    warnings.filterwarnings('ignore', category=np.RankWarning)
-    warnings.filterwarnings('ignore', message='Polyfit may be poorly conditioned')
 except ImportError:
     raise ImportError("nolds is required for Hurst features. Please: pip install nolds")
 
@@ -48,11 +36,7 @@ def _safe_hurst_rs(x: np.ndarray) -> float:
         if len(x_clean) < 10:  # Need minimum data for reliable calculation
             return np.nan
         
-        # Suppress warnings during the actual calculation
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", np.RankWarning)
-            warnings.simplefilter("ignore")  # Catch all warnings during calculation
-            result = float(nolds.hurst_rs(x_clean, fit="poly"))
+        result = float(nolds.hurst_rs(x_clean, fit="poly"))
         return result
     except Exception as e:
         logger.debug(f"Hurst calculation failed: {e}")
