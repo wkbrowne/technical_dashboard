@@ -5,133 +5,116 @@ This module computes features related to price ranges, breakouts, gaps,
 and true range measurements across multiple timeframes.
 """
 import logging
-from typing import Tuple
+from typing import Tuple, Iterable
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+EPS = 1e-12  # small epsilon for safe divisions
 
-def _handle_infinities(series: pd.Series) -> pd.Series:
-    """Replace infinite values with 0 to prevent downstream issues."""
-    return series.replace([np.inf, -np.inf], 0.0)
+def _safe_div(num: pd.Series, den: pd.Series, eps: float = EPS) -> pd.Series:
+    """Elementwise safe division; returns NaN where |den| <= eps."""
+    den = pd.to_numeric(den, errors="coerce")
+    num = pd.to_numeric(num, errors="coerce")
+    mask = den.abs() > eps
+    out = pd.Series(np.nan, index=num.index, dtype="float64")
+    out[mask] = (num[mask] / den[mask])
+    return out
 
+def _rolling_max(s: pd.Series, w: int) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").rolling(w, min_periods=max(2, w // 3)).max()
+
+def _rolling_min(s: pd.Series, w: int) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").rolling(w, min_periods=max(2, w // 3)).min()
 
 def add_range_breakout_features(
     df: pd.DataFrame,
     win_list: Tuple[int, ...] = (5, 10, 20)
 ) -> pd.DataFrame:
     """
-    Add comprehensive range and breakout features.
-    
-    Features added:
-    - hl_range: High-low range
-    - hl_range_pct_close: HL range as percentage of close
-    - true_range: True range (max of HL, H-prevC, prevC-L)
-    - tr_pct_close: True range as percentage of close
-    - atr_percent: 14-period ATR as percentage of close
-    - gap_pct: Gap percentage from previous close
-    - gap_atr_ratio: Gap size relative to ATR
-    - {w}d_high/low/range: Rolling high/low/range over w days
-    - {w}d_range_pct_close: Range as percentage of close
-    - pos_in_{w}d_range: Position within the w-day range (0-1)
-    - breakout_up/dn_{w}d: Breakout above/below previous w-day high/low
-    - range_expansion_{w}d: Range expansion vs previous period
-    - range_z_{w}d: Z-score of range vs 60-day history
-    - range_x_rvol20: Range interaction with relative volume (if volume available)
-    
-    Args:
-        df: Input DataFrame with OHLCV data
-        win_list: Tuple of windows for range calculations
-        
-    Returns:
-        DataFrame with added range/breakout features (mutates input DataFrame)
+    Add comprehensive range and breakout features with safe math (no +/-inf).
+    Returns df (mutates in-place).
     """
-    required_cols = {"high", "low"}
-    if not required_cols.issubset(df.columns):
-        logger.warning(f"Required columns {required_cols} not found, skipping range features")
+    required = {"high", "low"}
+    if not required.issubset(df.columns):
+        logger.warning("Required columns %s not found; skipping range features", required)
         return df
 
-    logger.debug(f"Computing range/breakout features for windows: {win_list}")
-    
     # Use close if available, otherwise adjclose
-    close = pd.to_numeric(df["close"] if "close" in df.columns else df["adjclose"], errors='coerce')
-    high = pd.to_numeric(df["high"], errors='coerce')
-    low = pd.to_numeric(df["low"], errors='coerce')
+    close = pd.to_numeric(df["close"] if "close" in df.columns else df["adjclose"], errors="coerce")
+    high  = pd.to_numeric(df["high"], errors="coerce")
+    low   = pd.to_numeric(df["low"],  errors="coerce")
 
     prev_close = close.shift(1)
-    hl_range = (high - low)
-    
-    # Basic range features
-    df["hl_range"] = hl_range
-    df["hl_range_pct_close"] = _handle_infinities(hl_range / close.replace(0, np.nan))
+    hl_range   = (high - low)
 
-    # True Range calculation
+    # --- Basic ranges (safe ratios) ---
+    df["hl_range"] = hl_range
+    df["hl_range_pct_close"] = _safe_div(hl_range, close)
+
+    # --- True range & ATR ---
     tr = pd.concat([
         (high - low),
         (high - prev_close).abs(),
-        (low - prev_close).abs()
+        (low  - prev_close).abs()
     ], axis=1).max(axis=1)
-    
     df["true_range"] = tr
-    df["tr_pct_close"] = _handle_infinities(tr / close.replace(0, np.nan))
-    
-    # Average True Range (ATR)
+    df["tr_pct_close"] = _safe_div(tr, close)
+
     atr = tr.rolling(14, min_periods=5).mean()
-    df["atr_percent"] = _handle_infinities(atr / close.replace(0, np.nan)).astype('float32')
+    df["atr_percent"] = _safe_div(atr, close).astype("float32")  # ATR as % of close
 
-    # Gap features
-    df["gap_pct"] = _handle_infinities(close / prev_close - 1.0)
-    df["gap_atr_ratio"] = _handle_infinities(df["gap_pct"] / df["atr_percent"].replace(0, np.nan))
+    # --- Gaps ---
+    # gap = (close / prev_close - 1) but safe
+    df["gap_pct"] = _safe_div(close, prev_close) - 1.0
+    df["gap_atr_ratio"] = _safe_div(df["gap_pct"], df["atr_percent"])  # NaN if ATR% ~ 0
 
-    # Multi-timeframe range features
+    # --- Multi-timeframe features ---
     for w in win_list:
-        hi = high.rolling(w, min_periods=max(2, w//3)).max()
-        lo = low.rolling(w, min_periods=max(2, w//3)).min()
+        hi = _rolling_max(high, w)
+        lo = _rolling_min(low,  w)
         rng = hi - lo
-        
+
         df[f"{w}d_high"] = hi
-        df[f"{w}d_low"] = lo
+        df[f"{w}d_low"]  = lo
         df[f"{w}d_range"] = rng
-        df[f"{w}d_range_pct_close"] = _handle_infinities(rng / close.replace(0, np.nan))
-        
-        # Position within range (0 = at low, 1 = at high)
-        df[f"pos_in_{w}d_range"] = _handle_infinities((close - lo) / rng.replace(0, np.nan))
-        
-        # Breakout signals
-        df[f"breakout_up_{w}d"] = (close > hi.shift(1)).astype('float32')
-        df[f"breakout_dn_{w}d"] = (close < lo.shift(1)).astype('float32')
-        
-        # Range expansion (handle zero previous range to avoid infinities)
+        df[f"{w}d_range_pct_close"] = _safe_div(rng, close)
+
+        # pos in range ∈ [0,1] (NaN where rng ~ 0)
+        df[f"pos_in_{w}d_range"] = _safe_div(close - lo, rng)
+
+        # Breakouts vs prior window’s extreme
+        df[f"breakout_up_{w}d"] = (close > hi.shift(1)).astype("float32")
+        df[f"breakout_dn_{w}d"] = (close < lo.shift(1)).astype("float32")
+
+        # Range expansion: (rng / rng[-1]) - 1, but safe
         prev_rng = rng.shift(1)
-        # Avoid division by zero - replace with 0 when previous range is 0 or NaN
-        range_expansion = rng / prev_rng.replace(0, np.nan) - 1.0
-        df[f"range_expansion_{w}d"] = _handle_infinities(range_expansion)
-        
-        # Range z-score vs 60-day history
+        df[f"range_expansion_{w}d"] = _safe_div(rng, prev_rng) - 1.0
+
+        # Z-score of range over 60d history (safe std)
         mu = rng.rolling(60, min_periods=20).mean()
         sd = rng.rolling(60, min_periods=20).std(ddof=0)
-        df[f"range_z_{w}d"] = _handle_infinities((rng - mu) / sd.replace(0, np.nan))
+        df[f"range_z_{w}d"] = _safe_div(rng - mu, sd)
 
-    # Volume-range interaction (if volume available)
+    # --- Volume-range interaction ---
     if "volume" in df.columns:
-        vol = pd.to_numeric(df["volume"], errors='coerce')
+        vol = pd.to_numeric(df["volume"], errors="coerce")
         vol_ma20 = vol.rolling(20, min_periods=5).mean()
-        
-        # Range normalized by relative volume (handle zero rvol to avoid infinities)
-        range_pct = _handle_infinities(hl_range / close.replace(0, np.nan))
-        rvol = _handle_infinities(vol / vol_ma20.replace(0, np.nan))
-        df["range_x_rvol20"] = _handle_infinities(range_pct / rvol.replace(0, np.nan))
-    
-    # Final cleanup: ensure no infinities remain in any columns
-    range_columns = [col for col in df.columns if any(pattern in col for pattern in [
-        'range_expansion_', 'range_x_rvol', 'range_pct_close', 'tr_pct_close', 
-        'atr_percent', 'gap_', 'pos_in_', 'range_z_'
-    ])]
-    
-    for col in range_columns:
-        if col in df.columns:
-            df[col] = _handle_infinities(df[col])
-    
-    logger.debug("Range/breakout features computation completed")
+
+        # relative volume: vol / ma20 (NaN when ma20 ~ 0)
+        rvol = _safe_div(vol, vol_ma20)
+
+        # range% / rvol (NaN when rvol ~ 0)
+        range_pct = df["hl_range_pct_close"]  # already safe
+        df["range_x_rvol20"] = _safe_div(range_pct, rvol)
+
+    # --- Optional: clip extreme z-scores to reduce downstream leakage/instability ---
+    # (Keeps NaNs as NaNs; only caps finite outliers)
+    for col in list(df.columns):
+        if col.startswith("range_z_"):
+            s = pd.to_numeric(df[col], errors="coerce")
+            df[col] = s.clip(lower=-10, upper=10)
+
+    # We intentionally DO NOT replace NaNs here; your training code imputes per-fold (leak‑safe).
     return df
