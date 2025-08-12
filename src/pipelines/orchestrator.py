@@ -27,6 +27,7 @@ from ..features.relstrength import add_relative_strength
 from ..features.alpha import add_alpha_momentum_features
 from ..features.breadth import add_breadth_series
 from ..features.xsec import add_xsec_momentum_panel
+from ..data.postprocessing import interpolate_internal_gaps
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +252,9 @@ def build_feature_universe(
         price_col="adjclose",
         sector_map=sectors
     )
+
+    # 9) Interpolate internal gaps (NaNs between observed values only)
+    indicators_by_symbol = interpolate_internal_gaps(indicators_by_symbol)
 
     logger.info("Feature universe construction completed")
     return indicators_by_symbol
