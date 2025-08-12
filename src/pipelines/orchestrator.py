@@ -27,7 +27,7 @@ from ..features.relstrength import add_relative_strength
 from ..features.alpha import add_alpha_momentum_features
 from ..features.breadth import add_breadth_series
 from ..features.xsec import add_xsec_momentum_panel
-from ..data.postprocessing import interpolate_internal_gaps
+from ..features.postprocessing import interpolate_internal_gaps
 
 logger = logging.getLogger(__name__)
 
