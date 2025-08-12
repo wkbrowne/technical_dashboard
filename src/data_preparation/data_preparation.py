@@ -38,7 +38,7 @@ def main():
     
     try:
         # Import and run the orchestrator
-        from ..pipelines.orchestrator import main as run_orchestrator
+        from src.pipelines.orchestrator import main as run_orchestrator
         run_orchestrator(include_sectors=True)
         
     except ImportError as e:
