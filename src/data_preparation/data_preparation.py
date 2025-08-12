@@ -9,9 +9,15 @@ Usage:
     python data_preparation.py
 """
 import logging
+import os
 import sys
 import warnings
 from pathlib import Path
+
+# Set NumExpr to use all available cores instead of the conservative default
+if 'NUMEXPR_MAX_THREADS' not in os.environ:
+    import multiprocessing
+    os.environ['NUMEXPR_MAX_THREADS'] = str(multiprocessing.cpu_count())
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
