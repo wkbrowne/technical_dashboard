@@ -9,6 +9,11 @@ from typing import Tuple, Iterable
 import numpy as np
 import pandas as pd
 
+try:
+    import pandas_ta as ta
+except ImportError:
+    raise ImportError("pandas_ta is required for ATR calculation. Please: pip install pandas-ta")
+
 logger = logging.getLogger(__name__)
 
 EPS = 1e-12  # small epsilon for safe divisions
@@ -62,8 +67,10 @@ def add_range_breakout_features(
     df["true_range"] = tr
     df["tr_pct_close"] = _safe_div(tr, close)
 
-    atr = tr.rolling(14, min_periods=5).mean()
-    df["atr_percent"] = _safe_div(atr, close).astype("float32")  # ATR as % of close
+    # Use pandas_ta for clean ATR calculation
+    atr14 = ta.atr(high=high, low=low, close=close, length=14)
+    df["atr14"] = atr14.astype("float32")  # Raw ATR value
+    df["atr_percent"] = _safe_div(atr14, close).astype("float32")  # ATR as % of close
 
     # --- Gaps ---
     # gap = (close / prev_close - 1) but safe
