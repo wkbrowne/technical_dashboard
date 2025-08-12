@@ -265,7 +265,6 @@ def run_pipeline(
     sector_to_etf: Dict[str, str] = None,
     sp500_tickers: List[str] = None,
     output_dir: Path = Path("./artifacts"),
-    symbol_frames_dir: Optional[Path] = None,
     include_sectors: bool = True
 ) -> None:
     """
@@ -275,7 +274,7 @@ def run_pipeline(
     1. Load stock and ETF data
     2. Compute all features in parallel
     3. Add cross-sectional features
-    4. Save outputs to disk
+    4. Save single long-format parquet file
     
     Args:
         max_stocks: Maximum number of stocks to process (None for all)
@@ -286,18 +285,13 @@ def run_pipeline(
         sector_to_etf: Mapping of sector names to ETF symbols
         sp500_tickers: List of S&P 500 tickers for breadth calculation
         output_dir: Directory for output files
-        symbol_frames_dir: Directory for per-symbol parquet files (defaults to output_dir/symbol_frames)
         include_sectors: Whether to include sector information in processing
     """
     logger.info("Starting feature computation pipeline")
     
-    # Set up output directories
+    # Set up output directory
     output_dir = Path(output_dir)
-    if symbol_frames_dir is None:
-        symbol_frames_dir = output_dir / "symbol_frames"
-    
     output_dir.mkdir(parents=True, exist_ok=True)
-    symbol_frames_dir.mkdir(parents=True, exist_ok=True)
 
     # Build feature universe
     indicators_by_symbol = build_feature_universe(
@@ -312,13 +306,12 @@ def run_pipeline(
 
     # Save outputs (import saving functions)
     try:
-        from ..io.saving import save_symbol_frames, save_long_parquet
+        from ..io.saving import save_long_parquet
     except ImportError:
         # If relative import fails, try absolute import
-        from src.io.saving import save_symbol_frames, save_long_parquet
+        from src.io.saving import save_long_parquet
 
     logger.info("Saving output files...")
-    save_symbol_frames(indicators_by_symbol, out_dir=symbol_frames_dir)
     save_long_parquet(indicators_by_symbol, out_path=output_dir / "features_long.parquet")
     
     logger.info(f"Pipeline completed. Outputs saved to {output_dir}")
