@@ -114,6 +114,10 @@ class TestTargetGeneration:
                         'h_used', 'price_hit', 'ret_from_entry']
         assert all(col in targets.columns for col in expected_cols)
         
+        # Should have overlap count column with config suffix
+        overlap_col = f"n_overlapping_trajs__up{sample_config['up_mult']}_dn{sample_config['dn_mult']}_h{sample_config['max_horizon']}"
+        assert overlap_col in targets.columns
+        
         # Should have targets for both symbols
         assert set(targets['symbol'].unique()) == {'AAPL', 'MSFT'}
         
@@ -247,6 +251,147 @@ class TestTargetGeneration:
         # Should return empty DataFrame
         assert len(targets) == 0
         assert isinstance(targets, pd.DataFrame)
+    
+    def test_overlap_counting_basic(self, sample_config):
+        """Test that overlap counting works with controlled data."""
+        # Create data with known overlap patterns
+        dates = pd.date_range('2023-01-01', periods=20, freq='D')
+        
+        # Create data for single symbol to control overlap
+        data = []
+        for i, date in enumerate(dates):
+            data.append({
+                'symbol': 'TEST',
+                'date': date,
+                'close': 100 + i * 0.1,  # Slight upward trend
+                'high': 100 + i * 0.1 + 0.5,
+                'low': 100 + i * 0.1 - 0.5,
+                'atr': 1.0  # Constant ATR for predictability
+            })
+        
+        test_df = pd.DataFrame(data)
+        
+        # Use config that will create overlapping trajectories
+        config = {
+            'up_mult': 2.0,
+            'dn_mult': 2.0,
+            'max_horizon': 5,
+            'start_every': 2,  # Start every 2 days, but trajectories last 5 days = overlap
+        }
+        
+        targets = generate_triple_barrier_targets(test_df, config)
+        
+        # Should have overlap count column
+        overlap_col = f"n_overlapping_trajs__up{config['up_mult']}_dn{config['dn_mult']}_h{config['max_horizon']}"
+        assert overlap_col in targets.columns
+        
+        # All overlap counts should be positive integers
+        assert (targets[overlap_col] >= 1).all()  # At least the trajectory itself
+        assert targets[overlap_col].dtype == int
+    
+    def test_overlap_counting_no_overlap(self, sample_config):
+        """Test overlap counting when trajectories don't overlap."""
+        # Create data for single symbol
+        dates = pd.date_range('2023-01-01', periods=30, freq='D')
+        
+        data = []
+        for i, date in enumerate(dates):
+            data.append({
+                'symbol': 'TEST',
+                'date': date,
+                'close': 100 + i * 0.1,
+                'high': 100 + i * 0.1 + 0.5,
+                'low': 100 + i * 0.1 - 0.5,
+                'atr': 1.0
+            })
+        
+        test_df = pd.DataFrame(data)
+        
+        # Config with no overlap: start_every >= max_horizon
+        config = {
+            'up_mult': 2.0,
+            'dn_mult': 2.0,
+            'max_horizon': 5,
+            'start_every': 10,  # Start every 10 days, trajectories last 5 days = no overlap
+        }
+        
+        targets = generate_triple_barrier_targets(test_df, config)
+        
+        if not targets.empty:
+            overlap_col = f"n_overlapping_trajs__up{config['up_mult']}_dn{config['dn_mult']}_h{config['max_horizon']}"
+            # With no overlap, all counts should be 1 (just the trajectory itself)
+            assert (targets[overlap_col] == 1).all()
+    
+    def test_overlap_counting_multiple_symbols(self, sample_config):
+        """Test that overlap counting is done per symbol."""
+        # Create data for two symbols
+        symbols = ['SYM1', 'SYM2']
+        dates = pd.date_range('2023-01-01', periods=15, freq='D')
+        
+        data = []
+        for symbol in symbols:
+            for i, date in enumerate(dates):
+                data.append({
+                    'symbol': symbol,
+                    'date': date,
+                    'close': 100 + i * 0.1,
+                    'high': 100 + i * 0.1 + 0.5,
+                    'low': 100 + i * 0.1 - 0.5,
+                    'atr': 1.0
+                })
+        
+        test_df = pd.DataFrame(data)
+        
+        config = {
+            'up_mult': 2.0,
+            'dn_mult': 2.0,
+            'max_horizon': 3,
+            'start_every': 2,
+        }
+        
+        targets = generate_triple_barrier_targets(test_df, config)
+        
+        if not targets.empty:
+            overlap_col = f"n_overlapping_trajs__up{config['up_mult']}_dn{config['dn_mult']}_h{config['max_horizon']}"
+            
+            # Should have targets for both symbols
+            assert set(targets['symbol'].unique()) == {'SYM1', 'SYM2'}
+            
+            # Overlap counts should be calculated per symbol
+            assert overlap_col in targets.columns
+            assert (targets[overlap_col] >= 1).all()
+    
+    def test_overlap_column_naming(self):
+        """Test that overlap column names include correct config parameters."""
+        dates = pd.date_range('2023-01-01', periods=10, freq='D')
+        
+        data = []
+        for i, date in enumerate(dates):
+            data.append({
+                'symbol': 'TEST',
+                'date': date,
+                'close': 100 + i * 0.1,
+                'high': 100 + i * 0.1 + 0.5,
+                'low': 100 + i * 0.1 - 0.5,
+                'atr': 1.0
+            })
+        
+        test_df = pd.DataFrame(data)
+        
+        # Test different config parameters
+        config1 = {'up_mult': 1.5, 'dn_mult': 2.5, 'max_horizon': 10, 'start_every': 3}
+        config2 = {'up_mult': 3.0, 'dn_mult': 1.0, 'max_horizon': 7, 'start_every': 2}
+        
+        targets1 = generate_triple_barrier_targets(test_df, config1)
+        targets2 = generate_triple_barrier_targets(test_df, config2)
+        
+        expected_col1 = "n_overlapping_trajs__up1.5_dn2.5_h10"
+        expected_col2 = "n_overlapping_trajs__up3.0_dn1.0_h7"
+        
+        if not targets1.empty:
+            assert expected_col1 in targets1.columns
+        if not targets2.empty:
+            assert expected_col2 in targets2.columns
 
 
 class TestTargetSummary:

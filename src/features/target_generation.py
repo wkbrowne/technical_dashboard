@@ -69,6 +69,10 @@ def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict) -> pd.DataFr
         return pd.DataFrame()
     
     targets_df = pd.concat(results, ignore_index=True)
+    
+    # Add overlap counting
+    targets_df = _add_overlap_counts(targets_df, config)
+    
     logger.info(f"Generated {len(targets_df)} targets across {len(results)} symbols")
     
     return targets_df
@@ -202,3 +206,91 @@ def get_target_summary(targets_df: pd.DataFrame) -> Dict:
         'return_std': targets_df['ret_from_entry'].std(),
         'date_range': (targets_df['t0'].min(), targets_df['t0'].max())
     }
+
+
+def _add_overlap_counts(targets_df: pd.DataFrame, config: Dict) -> pd.DataFrame:
+    """
+    Add overlap counting to targets DataFrame.
+    
+    Counts how many trajectories overlap at each date per symbol and adds
+    this information back to the original targets DataFrame.
+    
+    Args:
+        targets_df: DataFrame with generated targets
+        config: Configuration dictionary for column naming
+        
+    Returns:
+        DataFrame with added overlap count column
+    """
+    if targets_df.empty:
+        return targets_df
+    
+    # Create column name with config suffix
+    overlap_col = f"n_overlapping_trajs__up{config['up_mult']}_dn{config['dn_mult']}_h{config['max_horizon']}"
+    
+    # Expand trajectories to create date range for each trajectory
+    expanded_parts = []
+    
+    for symbol in targets_df['symbol'].unique():
+        symbol_targets = targets_df[targets_df['symbol'] == symbol]
+        symbol_expanded = _expand_trajectories_for_symbol(symbol, symbol_targets)
+        expanded_parts.append(symbol_expanded)
+    
+    if not expanded_parts:
+        targets_df[overlap_col] = 0
+        return targets_df
+    
+    # Combine all expanded trajectories
+    overlap_df = pd.concat(expanded_parts, ignore_index=True)
+    
+    # Count overlapping trajectories per symbol and date
+    overlap_counts = (
+        overlap_df.groupby(['symbol', 'date'])['trajectory_id']
+        .count()
+        .reset_index(name='n_overlapping_trajs')
+    )
+    
+    # Merge back into targets_df using t0 as the date key
+    targets_with_overlap = targets_df.merge(
+        overlap_counts.rename(columns={'date': 't0'}),
+        on=['symbol', 't0'],
+        how='left'
+    )
+    
+    # Rename the overlap column to include config suffix and fill NAs
+    targets_with_overlap[overlap_col] = targets_with_overlap['n_overlapping_trajs'].fillna(0).astype(int)
+    targets_with_overlap = targets_with_overlap.drop('n_overlapping_trajs', axis=1)
+    
+    return targets_with_overlap
+
+
+def _expand_trajectories_for_symbol(symbol: str, symbol_targets: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expand trajectories for a single symbol to create date ranges.
+    
+    Creates a DataFrame with one row per date for each trajectory,
+    allowing overlap counting.
+    
+    Args:
+        symbol: Symbol identifier
+        symbol_targets: Targets DataFrame for single symbol
+        
+    Returns:
+        DataFrame with expanded date ranges per trajectory
+    """
+    expanded = []
+    
+    for _, row in symbol_targets.iterrows():
+        # Create business day range from t0 for h_used days
+        dates = pd.date_range(start=row['t0'], periods=row['h_used'], freq='B')
+        
+        expanded.append(pd.DataFrame({
+            'symbol': symbol,
+            'date': dates,
+            'trajectory_id': f"{symbol}_{row['t0'].date()}"
+        }))
+    
+    if expanded:
+        return pd.concat(expanded, ignore_index=True)
+    else:
+        return pd.DataFrame(columns=['symbol', 'date', 'trajectory_id'])
