@@ -117,35 +117,57 @@ def _feature_worker(sym: str, df: pd.DataFrame, cs_ratio_median: Optional[pd.Ser
         )
 
         # 8) Triple barrier targets (requires atr14 from range_breakout)
+        logger.info(f"Generating triple barrier targets for {sym}...")
         try:
             # Check if we have the required columns for target generation
             if all(col in out.columns for col in ['close', 'high', 'low', 'atr14']):
                 # Prepare data in the format expected by target generation
                 target_df = out.reset_index().copy()
                 target_df['symbol'] = sym
-                target_df['date'] = target_df.index if 'date' not in target_df.columns else target_df['date']
+                target_df['date'] = target_df.index
                 target_df['atr'] = target_df['atr14']  # Use atr14 as atr
                 
                 # Generate targets with default config
                 target_config = {
-                    'up_mult': 3.0,
-                    'dn_mult': 3.0,
+                    'up_mult': 4.0,
+                    'dn_mult': 2.0,
                     'max_horizon': 21,
                     'start_every': 5,
                 }
                 
+                logger.debug(f"Target config for {sym}: {target_config}")
                 targets = generate_triple_barrier_targets(target_df, target_config)
                 
                 if not targets.empty:
-                    logger.debug(f"Generated {len(targets)} triple barrier targets for {sym}")
-                    # Note: Targets are computed but not merged back to main DataFrame
-                    # They could be saved separately or merged based on requirements
+                    logger.info(f"✅ Generated {len(targets)} triple barrier targets for {sym}")
+                    
+                    # Join targets back to main DataFrame
+                    # Create target columns in the main DataFrame, initialized with NaN
+                    target_cols = [col for col in targets.columns if col not in ['symbol', 't0']]
+                    for col in target_cols:
+                        out[col] = np.nan
+                    
+                    # Merge targets into main DataFrame using date index and t0
+                    targets_indexed = targets.set_index('t0')[target_cols]
+                    
+                    # Update rows where we have targets
+                    for date, target_row in targets_indexed.iterrows():
+                        if date in out.index:
+                            for col in target_cols:
+                                out.loc[date, col] = target_row[col]
+                    
+                    n_merged = out[target_cols].notna().any(axis=1).sum()
+                    logger.info(f"✅ Merged targets into {n_merged} rows for {sym}")
+                    
                 else:
-                    logger.debug(f"No targets generated for {sym} (insufficient data)")
+                    logger.warning(f"❌ No targets generated for {sym} (insufficient data)")
             else:
-                logger.debug(f"Skipping targets for {sym}: missing required columns")
+                missing_cols = [col for col in ['close', 'high', 'low', 'atr14'] if col not in out.columns]
+                logger.warning(f"❌ Skipping targets for {sym}: missing columns {missing_cols}")
         except Exception as e:
-            logger.warning(f"Target generation failed for {sym}: {e}")
+            logger.error(f"❌ Target generation failed for {sym}: {e}")
+            import traceback
+            logger.debug(f"Target generation traceback for {sym}: {traceback.format_exc()}")
 
         logger.debug(f"Completed feature processing for {sym}")
         return sym, out
