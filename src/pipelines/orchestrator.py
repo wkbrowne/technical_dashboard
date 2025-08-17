@@ -28,6 +28,7 @@ from ..features.alpha import add_alpha_momentum_features
 from ..features.breadth import add_breadth_series
 from ..features.xsec import add_xsec_momentum_panel
 from ..features.postprocessing import interpolate_internal_gaps
+from ..features.target_generation import generate_triple_barrier_targets
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +42,9 @@ def _feature_worker(sym: str, df: pd.DataFrame, cs_ratio_median: Optional[pd.Ser
     - Multi-scale volatility regime features
     - Hurst exponent features
     - Distance-to-MA features
-    - Range/breakout features
+    - Range/breakout features (including ATR14)
     - Volume features and shocks
+    - Triple barrier targets
     
     Args:
         sym: Symbol ticker
@@ -113,6 +115,37 @@ def _feature_worker(sym: str, df: pd.DataFrame, cs_ratio_median: Optional[pd.Ser
             ema_span=10,
             prefix="volshock"
         )
+
+        # 8) Triple barrier targets (requires atr14 from range_breakout)
+        try:
+            # Check if we have the required columns for target generation
+            if all(col in out.columns for col in ['close', 'high', 'low', 'atr14']):
+                # Prepare data in the format expected by target generation
+                target_df = out.reset_index().copy()
+                target_df['symbol'] = sym
+                target_df['date'] = target_df.index if 'date' not in target_df.columns else target_df['date']
+                target_df['atr'] = target_df['atr14']  # Use atr14 as atr
+                
+                # Generate targets with default config
+                target_config = {
+                    'up_mult': 3.0,
+                    'dn_mult': 3.0,
+                    'max_horizon': 21,
+                    'start_every': 5,
+                }
+                
+                targets = generate_triple_barrier_targets(target_df, target_config)
+                
+                if not targets.empty:
+                    logger.debug(f"Generated {len(targets)} triple barrier targets for {sym}")
+                    # Note: Targets are computed but not merged back to main DataFrame
+                    # They could be saved separately or merged based on requirements
+                else:
+                    logger.debug(f"No targets generated for {sym} (insufficient data)")
+            else:
+                logger.debug(f"Skipping targets for {sym}: missing required columns")
+        except Exception as e:
+            logger.warning(f"Target generation failed for {sym}: {e}")
 
         logger.debug(f"Completed feature processing for {sym}")
         return sym, out
