@@ -50,28 +50,87 @@ def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict) -> pd.DataFr
     
     logger.debug(f"Generating targets with config: {config}")
     
+    # Early data cleaning and validation
+    logger.debug(f"Input DataFrame shape: {df.shape}")
+    
+    # Convert date column to datetime64[ns] early in pipeline
+    if not pd.api.types.is_datetime64_any_dtype(df['date']):
+        logger.debug("Converting date column to datetime64[ns]")
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    
+    # Drop rows with missing values in required columns
+    initial_rows = len(df)
+    df_clean = df.dropna(subset=list(required_cols))
+    dropped_rows = initial_rows - len(df_clean)
+    if dropped_rows > 0:
+        logger.debug(f"Dropped {dropped_rows} rows with missing values in required columns")
+    
+    # Additional validation for numeric columns
+    numeric_cols = ['close', 'high', 'low', 'atr']
+    for col in numeric_cols:
+        if not pd.api.types.is_numeric_dtype(df_clean[col]):
+            logger.debug(f"Converting {col} to numeric")
+            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+    
+    # Drop rows where numeric conversion failed
+    df_clean = df_clean.dropna(subset=numeric_cols)
+    total_dropped = initial_rows - len(df_clean)
+    if total_dropped > 0:
+        logger.info(f"Cleaned data: dropped {total_dropped} rows with invalid data, {len(df_clean)} rows remaining")
+    
+    if df_clean.empty:
+        logger.warning("No valid data remaining after cleaning")
+        return pd.DataFrame()
+    
     # Process each symbol independently
     results = []
-    symbols = df['symbol'].unique()
+    symbols = df_clean['symbol'].unique()
+    logger.debug(f"Processing {len(symbols)} symbols after data cleaning")
     
     for symbol in symbols:
-        symbol_df = df[df['symbol'] == symbol].copy()
+        symbol_df = df_clean[df_clean['symbol'] == symbol].copy()
+        
+        # Enhanced logging for symbol processing
         if len(symbol_df) < config['max_horizon'] + 2:
-            logger.debug(f"Skipping {symbol}: insufficient data ({len(symbol_df)} rows)")
+            logger.debug(f"Skipping {symbol}: insufficient data ({len(symbol_df)} rows, need {config['max_horizon'] + 2})")
             continue
-            
+        
+        # Additional validation for date sorting
+        if not symbol_df['date'].is_monotonic_increasing:
+            logger.debug(f"Sorting data by date for {symbol}")
+            symbol_df = symbol_df.sort_values('date').reset_index(drop=True)
+        
+        logger.debug(f"Processing {symbol} with {len(symbol_df)} rows from {symbol_df['date'].min()} to {symbol_df['date'].max()}")
+        
         symbol_targets = _compute_triple_barriers_numpy(symbol, symbol_df, config)
         if not symbol_targets.empty:
             results.append(symbol_targets)
+            logger.debug(f"Generated {len(symbol_targets)} targets for {symbol}")
+        else:
+            logger.debug(f"No targets generated for {symbol}")
     
     if not results:
-        logger.warning("No targets generated for any symbols")
+        logger.warning("No targets generated for any symbols after processing")
         return pd.DataFrame()
     
     targets_df = pd.concat(results, ignore_index=True)
     
     # Add overlap counting
     targets_df = _add_overlap_counts(targets_df, config)
+    
+    # Top-level validation to ensure no NaNs in t0 column
+    if 't0' in targets_df.columns:
+        nan_t0_count = targets_df['t0'].isna().sum()
+        if nan_t0_count > 0:
+            logger.error(f"Found {nan_t0_count} NaN values in t0 column - this should not happen")
+            # Remove rows with NaN t0 values
+            targets_df = targets_df.dropna(subset=['t0'])
+            logger.warning(f"Removed {nan_t0_count} rows with NaN t0 values, {len(targets_df)} rows remaining")
+        
+        if targets_df.empty:
+            logger.error("All targets have invalid t0 values after validation")
+            return pd.DataFrame()
     
     logger.info(f"Generated {len(targets_df)} targets across {len(results)} symbols")
     
@@ -93,16 +152,43 @@ def _compute_triple_barriers_numpy(symbol: str, df: pd.DataFrame, config: Dict) 
     # Sort and reset index to ensure consistent positioning
     df = df.sort_values('date').reset_index(drop=True)
     
-    # Convert to NumPy arrays for speed
-    dates = df['date'].to_numpy('datetime64[ns]')
-    close = df['close'].to_numpy(dtype=float)
-    atr = df['atr'].to_numpy(dtype=float)
-    high = df['high'].to_numpy(dtype=float)
-    low = df['low'].to_numpy(dtype=float)
+    # Input validation for the DataFrame
+    if df.empty:
+        logger.debug(f"Empty DataFrame for {symbol}")
+        return pd.DataFrame()
+    
+    # Validate that required columns exist and have valid data
+    required_cols = ['date', 'close', 'high', 'low', 'atr']
+    for col in required_cols:
+        if col not in df.columns:
+            logger.warning(f"Missing column {col} for {symbol}")
+            return pd.DataFrame()
+    
+    # Convert to NumPy arrays for speed with robust error handling
+    try:
+        dates = df['date'].to_numpy('datetime64[ns]')
+        close = df['close'].to_numpy(dtype=float)
+        atr = df['atr'].to_numpy(dtype=float)
+        high = df['high'].to_numpy(dtype=float)
+        low = df['low'].to_numpy(dtype=float)
+    except Exception as e:
+        logger.warning(f"Failed to convert data to numpy arrays for {symbol}: {e}")
+        return pd.DataFrame()
+    
+    # Validate array shapes match
+    if not all(len(arr) == len(dates) for arr in [close, atr, high, low]):
+        logger.warning(f"Mismatched array lengths for {symbol}")
+        return pd.DataFrame()
+    
+    # Check for invalid dates (NaT values)
+    if np.any(np.isnat(dates)):
+        logger.warning(f"Found NaT (invalid) dates for {symbol}")
+        return pd.DataFrame()
     
     n = len(df)
     pos = 0
     targets = []
+    skipped_invalid = 0
     
     up_mult = config['up_mult']
     dn_mult = config['dn_mult']
@@ -110,10 +196,11 @@ def _compute_triple_barriers_numpy(symbol: str, df: pd.DataFrame, config: Dict) 
     start_every = config['start_every']
     
     while pos < n - max_horizon - 1:
-        c0, a0 = close[pos], atr[pos]
+        c0, a0, date0 = close[pos], atr[pos], dates[pos]
         
         # Skip if entry price or ATR is invalid
-        if not (np.isfinite(c0) and np.isfinite(a0) and a0 > 0):
+        if not (np.isfinite(c0) and np.isfinite(a0) and a0 > 0 and not np.isnat(date0)):
+            skipped_invalid += 1
             pos += 1
             continue
         
@@ -155,12 +242,19 @@ def _compute_triple_barriers_numpy(symbol: str, df: pd.DataFrame, config: Dict) 
         
         # Calculate metrics
         horizon_used = hit_idx + 1
-        t_hit = dates[start_idx + hit_idx]
+        t_hit_idx = start_idx + hit_idx
+        
+        # Validate t_hit index and calculate return
+        if t_hit_idx >= len(dates):
+            pos += 1
+            continue
+            
+        t_hit = dates[t_hit_idx]
         ret_from_entry = np.log(price_hit / c0) if price_hit > 0 and c0 > 0 else np.nan
         
         targets.append({
             'symbol': symbol,
-            't0': dates[pos],
+            't0': date0,
             't_hit': t_hit,
             'hit': hit_type,
             'entry_px': c0,
@@ -176,6 +270,15 @@ def _compute_triple_barriers_numpy(symbol: str, df: pd.DataFrame, config: Dict) 
             pos += horizon_used
         else:
             pos += start_every
+    
+    # Log processing summary for this symbol
+    if skipped_invalid > 0:
+        logger.debug(f"Skipped {skipped_invalid} invalid rows for {symbol}")
+    
+    if targets:
+        logger.debug(f"Successfully created {len(targets)} targets for {symbol}")
+    else:
+        logger.debug(f"No valid targets created for {symbol}")
     
     return pd.DataFrame(targets)
 
@@ -226,7 +329,9 @@ def _add_overlap_counts(targets_df: pd.DataFrame, config: Dict) -> pd.DataFrame:
         return targets_df
     
     # Create column name with config suffix
-    overlap_col = f"n_overlapping_trajs__up{config['up_mult']}_dn{config['dn_mult']}_h{config['max_horizon']}"
+    overlap_col = "n_overlapping_trajs"
+    t0_col = 't0'
+    h_used_col = 'h_used'
     
     # Expand trajectories to create date range for each trajectory
     expanded_parts = []
@@ -252,8 +357,8 @@ def _add_overlap_counts(targets_df: pd.DataFrame, config: Dict) -> pd.DataFrame:
     
     # Merge back into targets_df using t0 as the date key
     targets_with_overlap = targets_df.merge(
-        overlap_counts.rename(columns={'date': 't0'}),
-        on=['symbol', 't0'],
+        overlap_counts.rename(columns={'date': t0_col}),
+        on=['symbol', t0_col],
         how='left'
     )
     

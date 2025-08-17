@@ -28,7 +28,7 @@ from ..features.alpha import add_alpha_momentum_features
 from ..features.breadth import add_breadth_series
 from ..features.xsec import add_xsec_momentum_panel
 from ..features.postprocessing import interpolate_internal_gaps
-from ..features.target_generation import generate_triple_barrier_targets
+from ..features.ohlc_adjustment import adjust_ohlc_to_adjclose
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,6 @@ def _feature_worker(sym: str, df: pd.DataFrame, cs_ratio_median: Optional[pd.Ser
     - Distance-to-MA features
     - Range/breakout features (including ATR14)
     - Volume features and shocks
-    - Triple barrier targets
     
     Args:
         sym: Symbol ticker
@@ -58,10 +57,12 @@ def _feature_worker(sym: str, df: pd.DataFrame, cs_ratio_median: Optional[pd.Ser
         logger.debug(f"Processing features for {sym}")
         out = df.copy()
 
+        # 0) First: Adjust OHLC to match adjusted close for consistent price data
+        out = adjust_ohlc_to_adjclose(out)
+
         # Ensure returns exist
         if "ret" not in out.columns:
             if "adjclose" in out.columns:
-                import numpy as np
                 out["ret"] = np.log(pd.to_numeric(out["adjclose"], errors="coerce")).diff()
             else:
                 logger.warning(f"{sym}: No adjclose column for returns calculation")
@@ -115,59 +116,6 @@ def _feature_worker(sym: str, df: pd.DataFrame, cs_ratio_median: Optional[pd.Ser
             ema_span=10,
             prefix="volshock"
         )
-
-        # 8) Triple barrier targets (requires atr14 from range_breakout)
-        logger.info(f"Generating triple barrier targets for {sym}...")
-        try:
-            # Check if we have the required columns for target generation
-            if all(col in out.columns for col in ['close', 'high', 'low', 'atr14']):
-                # Prepare data in the format expected by target generation
-                target_df = out.reset_index().copy()
-                target_df['symbol'] = sym
-                target_df['date'] = target_df.index
-                target_df['atr'] = target_df['atr14']  # Use atr14 as atr
-                
-                # Generate targets with default config
-                target_config = {
-                    'up_mult': 4.0,
-                    'dn_mult': 2.0,
-                    'max_horizon': 21,
-                    'start_every': 5,
-                }
-                
-                logger.debug(f"Target config for {sym}: {target_config}")
-                targets = generate_triple_barrier_targets(target_df, target_config)
-                
-                if not targets.empty:
-                    logger.info(f"✅ Generated {len(targets)} triple barrier targets for {sym}")
-                    
-                    # Join targets back to main DataFrame
-                    # Create target columns in the main DataFrame, initialized with NaN
-                    target_cols = [col for col in targets.columns if col not in ['symbol', 't0']]
-                    for col in target_cols:
-                        out[col] = np.nan
-                    
-                    # Merge targets into main DataFrame using date index and t0
-                    targets_indexed = targets.set_index('t0')[target_cols]
-                    
-                    # Update rows where we have targets
-                    for date, target_row in targets_indexed.iterrows():
-                        if date in out.index:
-                            for col in target_cols:
-                                out.loc[date, col] = target_row[col]
-                    
-                    n_merged = out[target_cols].notna().any(axis=1).sum()
-                    logger.info(f"✅ Merged targets into {n_merged} rows for {sym}")
-                    
-                else:
-                    logger.warning(f"❌ No targets generated for {sym} (insufficient data)")
-            else:
-                missing_cols = [col for col in ['close', 'high', 'low', 'atr14'] if col not in out.columns]
-                logger.warning(f"❌ Skipping targets for {sym}: missing columns {missing_cols}")
-        except Exception as e:
-            logger.error(f"❌ Target generation failed for {sym}: {e}")
-            import traceback
-            logger.debug(f"Target generation traceback for {sym}: {traceback.format_exc()}")
 
         logger.debug(f"Completed feature processing for {sym}")
         return sym, out
@@ -253,7 +201,7 @@ def build_feature_universe(
                       etfs.get(k, pd.DataFrame())], axis=1).sort_index()
         for k in (set(stocks) | set(etfs))
     }
-    indicators_by_symbol = assemble_indicators_from_wide(data, adjust_ohlc_with_factor=True)
+    indicators_by_symbol = assemble_indicators_from_wide(data, adjust_ohlc_with_factor=False)
 
     # 3) Core features (parallelized)
     logger.info(f"Processing {len(indicators_by_symbol)} symbols in parallel...")
