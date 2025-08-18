@@ -30,11 +30,13 @@ def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict) -> pd.DataFr
             
     Returns:
         DataFrame with columns: symbol, t0, t_hit, hit, entry_px, top, bot, 
-                               h_used, price_hit, ret_from_entry
+                               h_used, price_hit, ret_from_entry, n_overlapping_trajs, weight
         
     Notes:
         - hit: 1 = upper barrier hit, -1 = lower barrier hit, 0 = time expired
         - ret_from_entry: Log return from entry to exit price
+        - n_overlapping_trajs: Count of overlapping trajectories at t0 for this symbol
+        - weight: Inverse of overlap count, normalized to sum to 1.0 across dataset
         - Assumes df is sorted by symbol and date
     """
     required_cols = {'symbol', 'date', 'close', 'high', 'low', 'atr'}
@@ -118,6 +120,13 @@ def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict) -> pd.DataFr
     
     # Add overlap counting
     targets_df = _add_overlap_counts(targets_df, config)
+    
+    # Calculate weights as inverse of overlap counts with pseudocount
+    targets_df['weight'] = 1.0 / (targets_df['n_overlapping_trajs'] + 0.5)
+    targets_df['weight'] /= targets_df['weight'].sum()  # Optional normalization
+    
+    logger.debug(f"Added weight column with sum={targets_df['weight'].sum():.6f}, "
+                f"min={targets_df['weight'].min():.6f}, max={targets_df['weight'].max():.6f}")
     
     # Top-level validation to ensure no NaNs in t0 column
     if 't0' in targets_df.columns:
