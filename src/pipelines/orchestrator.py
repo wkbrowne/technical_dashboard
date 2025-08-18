@@ -60,13 +60,17 @@ def _feature_worker(sym: str, df: pd.DataFrame, cs_ratio_median: Optional[pd.Ser
         # 0) First: Adjust OHLC to match adjusted close for consistent price data
         out = adjust_ohlc_to_adjclose(out)
 
-        # Ensure returns exist
+        # Ensure returns exist (calculated from adjclose for consistency)
         if "ret" not in out.columns:
             if "adjclose" in out.columns:
                 out["ret"] = np.log(pd.to_numeric(out["adjclose"], errors="coerce")).diff()
             else:
                 logger.warning(f"{sym}: No adjclose column for returns calculation")
                 return sym, out
+        else:
+            # Recalculate returns from adjclose to ensure consistency after OHLC adjustment
+            if "adjclose" in out.columns:
+                out["ret"] = np.log(pd.to_numeric(out["adjclose"], errors="coerce")).diff()
 
         # 1) Trend features (MA slopes, agreement, etc.)
         out = add_trend_features(

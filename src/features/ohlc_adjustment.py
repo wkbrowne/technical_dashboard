@@ -14,20 +14,20 @@ logger = logging.getLogger(__name__)
 
 def adjust_ohlc_to_adjclose(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Adjust OHLC prices to match adjusted close for splits and dividends.
+    Forward-adjust OHLC prices to show real recent prices while maintaining ratio consistency.
     
-    This ensures all price-based technical indicators use consistent,
-    split/dividend-adjusted values for accurate calculations.
+    Uses a simple approach: scale OHLC prices so that recent close ≈ recent adjclose,
+    while preserving the relative price movements shown in adjclose throughout history.
     
     Args:
-        df: DataFrame with OHLC and adjclose columns
+        df: DataFrame with OHLC and adjclose columns, sorted by date
         
     Returns:
-        DataFrame with adjusted OHLC prices
+        DataFrame with forward-adjusted OHLC prices
         
     Notes:
         - Requires 'adjclose' and 'close' columns
-        - Adjusts 'open', 'high', 'low', 'close' to match 'adjclose'
+        - Scales all OHLC to match adjclose price levels and movements
         - Preserves volume (not adjusted)
         - Returns original DataFrame if required columns missing
     """
@@ -38,38 +38,43 @@ def adjust_ohlc_to_adjclose(df: pd.DataFrame) -> pd.DataFrame:
         return df
     
     # Check for OHLC columns to adjust
-    ohlc_cols = ['open', 'high', 'low']
+    ohlc_cols = ['open', 'high', 'low', 'close']
     available_ohlc = [col for col in ohlc_cols if col in df.columns]
     
     if not available_ohlc:
         logger.debug("No OHLC columns found to adjust")
         return df
     
-    # Calculate adjustment factor
-    # Handle division by zero and invalid values
+    df_adjusted = df.copy()
+    
+    # Convert to numeric and handle invalid values
     close_values = pd.to_numeric(df['close'], errors='coerce')
     adjclose_values = pd.to_numeric(df['adjclose'], errors='coerce')
     
-    # Avoid division by zero
+    # Find valid data points
     valid_mask = (close_values != 0) & pd.notna(close_values) & pd.notna(adjclose_values)
-    adjustment_factor = pd.Series(1.0, index=df.index)
-    adjustment_factor[valid_mask] = adjclose_values[valid_mask] / close_values[valid_mask]
+    if not valid_mask.any():
+        logger.debug("No valid price data found for adjustment")
+        return df
     
-    # Apply adjustments
-    df_adjusted = df.copy()
+    # Simple approach: calculate adjustment factor for each row
+    # This makes OHLC track the adjusted price movements exactly
+    adjustment_factors = pd.Series(1.0, index=df.index)
+    adjustment_factors[valid_mask] = adjclose_values[valid_mask] / close_values[valid_mask]
     
+    # Apply adjustments to each OHLC column
+    adjustment_applied = False
     for col in available_ohlc:
         if col in df.columns:
             original_values = pd.to_numeric(df[col], errors='coerce')
-            df_adjusted[col] = original_values * adjustment_factor
-    
-    # Set close to adjusted close
-    df_adjusted['close'] = df_adjusted['adjclose']
+            df_adjusted[col] = original_values * adjustment_factors
+            adjustment_applied = True
     
     # Log adjustment summary
-    avg_factor = adjustment_factor[valid_mask].mean() if valid_mask.any() else 1.0
-    if abs(avg_factor - 1.0) > 0.001:  # Only log if meaningful adjustment
+    if adjustment_applied and adjustment_factors[valid_mask].std() > 0.001:
+        avg_factor = adjustment_factors[valid_mask].mean()
+        factor_range = (adjustment_factors[valid_mask].min(), adjustment_factors[valid_mask].max())
         logger.debug(f"Applied OHLC adjustment: avg factor = {avg_factor:.4f}, "
-                    f"adjusted {len(available_ohlc)} price columns")
+                    f"range = {factor_range[0]:.4f} to {factor_range[1]:.4f}")
     
     return df_adjusted
