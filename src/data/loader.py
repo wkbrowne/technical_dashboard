@@ -171,9 +171,18 @@ def _sectors_from_universe(path: str, max_symbols: Optional[int] = None) -> Dict
     return dict(zip(out[sym_col], out[sec_col]))
 
 DEFAULT_ETFS = [
-    "SPY","QQQ","IWM","DIA","TLT","IEF","HYG","LQD",
-    "XLF","XLK","XLE","XLY","XLI","XLP","XLV","XLU","XLB","XLC",
-    "EFA","EEM","GLD","SLV","USO","UNG"
+    # Core market ETFs
+    "SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "HYG", "LQD",
+    # Sector ETFs (cap-weighted)
+    "XLF", "XLK", "XLE", "XLY", "XLI", "XLP", "XLV", "XLU", "XLB", "XLC", "XLRE",
+    # Equal-weighted sector ETFs
+    "RSP", "RYT", "RYF", "RYE", "RYH", "RYU", "RHS", "RTM", "EWRE",
+    # International and commodities
+    "EFA", "EEM", "GLD", "SLV", "USO", "UNG",
+    # Subsector ETFs (user-specified list)
+    "SMH", "KBE", "IBB", "ITA", "XRT", "XOP", "SKYY", "HACK", "KRE", "IHE", 
+    "IGV", "XTN", "XBI", "PJP", "XAR", "TAN", "ICLN", "URA", "LIT", "COPX", 
+    "XHB", "ITB"
 ]
 
 
@@ -229,7 +238,30 @@ def load_stock_universe(max_symbols: Optional[int] = None,
             if include_sectors:
                 universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
                 sectors = _sectors_from_universe(universe_csv, max_symbols=max_symbols)
+                
+                # Apply max_symbols limit to cached data to match sector mappings
+                if max_symbols:
+                    limited_symbols = list(sectors.keys())  # These are already limited by max_symbols
+                    cached_limited = {}
+                    for metric, df in cached.items():
+                        # Only keep columns (symbols) that are in the limited sectors list
+                        available_symbols = [sym for sym in limited_symbols if sym in df.columns]
+                        cached_limited[metric] = df[available_symbols] if available_symbols else df.iloc[:, :0]
+                    cached = cached_limited
+                    print(f"📊 Applied max_symbols limit: reduced to {len(limited_symbols)} symbols")
+                
                 return cached, sectors
+            
+            # Apply max_symbols limit even when not including sectors
+            if max_symbols:
+                universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
+                limited_symbols = _symbols_from_csv(universe_csv, max_symbols=max_symbols)
+                cached_limited = {}
+                for metric, df in cached.items():
+                    available_symbols = [sym for sym in limited_symbols if sym in df.columns]
+                    cached_limited[metric] = df[available_symbols] if available_symbols else df.iloc[:, :0]
+                cached = cached_limited
+                
             return cached
         print("⚠️  cache empty/corrupt — fetching")
 

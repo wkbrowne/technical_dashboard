@@ -6,9 +6,10 @@ barriers based on ATR (Average True Range). Each target represents a potential t
 with upper/lower barriers and time horizon constraints.
 """
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 
 logger = logging.getLogger(__name__)
 
@@ -401,5 +402,110 @@ def _count_overlaps_efficient(symbol_targets: pd.DataFrame) -> Dict:
         overlap_counts[i] = (t0_start, overlap_count)
     
     return overlap_counts
+
+
+def _process_symbol_group(df: pd.DataFrame, config: Dict, symbols: List[str]) -> pd.DataFrame:
+    """
+    Process a group of symbols by filtering and running triple barrier target generation.
+    
+    Args:
+        df: Long-format DataFrame with all symbol data
+        config: Triple barrier configuration dictionary
+        symbols: List of symbols to process in this chunk
+        
+    Returns:
+        DataFrame with triple barrier targets for the specified symbols
+    """
+    if not symbols:
+        return pd.DataFrame()
+    
+    # Filter to only the symbols in this chunk
+    chunk_df = df[df['symbol'].isin(symbols)]
+    
+    if chunk_df.empty:
+        logger.debug(f"No data found for symbols: {symbols}")
+        return pd.DataFrame()
+    
+    logger.debug(f"Processing {len(symbols)} symbols: {symbols}")
+    
+    # Generate targets for this chunk
+    return generate_triple_barrier_targets(chunk_df, config)
+
+
+def generate_targets_parallel(
+    df: pd.DataFrame,
+    config: Dict,
+    n_jobs: int = -1,
+    chunk_size: int = 25
+) -> pd.DataFrame:
+    """
+    Chunk long-format data by symbol and run target generation in parallel.
+
+    Args:
+        df: Long-format DataFrame with columns ['symbol', 'date', 'close', 'high', 'low', 'atr']
+        config: Triple barrier config dictionary with keys:
+                - up_mult: Upper barrier multiplier
+                - dn_mult: Lower barrier multiplier  
+                - max_horizon: Maximum days to track each target
+                - start_every: Minimum days between new targets
+        n_jobs: Number of parallel workers (-1 = all cores)
+        chunk_size: Number of symbols per parallel chunk
+
+    Returns:
+        Combined DataFrame with triple barrier targets for all symbols
+    """
+    if df.empty:
+        logger.warning("Empty DataFrame provided to generate_targets_parallel")
+        return pd.DataFrame()
+    
+    # Validate required columns
+    required_cols = {'symbol', 'date', 'close', 'high', 'low', 'atr'}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"Missing required columns for parallel target generation: {missing_cols}")
+    
+    # Get unique symbols and create chunks
+    unique_symbols = df['symbol'].dropna().unique()
+    if len(unique_symbols) == 0:
+        logger.warning("No valid symbols found in DataFrame")
+        return pd.DataFrame()
+    
+    # Create symbol chunks
+    symbol_chunks = [
+        unique_symbols[i:i + chunk_size].tolist() 
+        for i in range(0, len(unique_symbols), chunk_size)
+    ]
+    
+    logger.info(f"Processing {len(unique_symbols)} symbols in {len(symbol_chunks)} chunks of size {chunk_size}")
+    
+    # Process chunks in parallel
+    try:
+        results = Parallel(
+            n_jobs=n_jobs, 
+            backend='loky', 
+            verbose=1, 
+            prefer="processes"
+        )(
+            delayed(_process_symbol_group)(df, config, chunk) 
+            for chunk in symbol_chunks
+        )
+        
+        # Filter out empty results and concatenate
+        valid_results = [result for result in results if not result.empty]
+        
+        if not valid_results:
+            logger.warning("No valid targets generated from any chunks")
+            return pd.DataFrame()
+        
+        # Combine all results
+        combined_targets = pd.concat(valid_results, ignore_index=True)
+        
+        logger.info(f"Generated {len(combined_targets)} total targets across {len(valid_results)} chunks")
+        
+        return combined_targets
+        
+    except Exception as e:
+        logger.error(f"Error in parallel target generation: {e}")
+        raise
 
 

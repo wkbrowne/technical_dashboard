@@ -8,6 +8,7 @@ import logging
 from typing import Tuple
 import numpy as np
 import pandas as pd
+import pandas_ta as ta
 
 logger = logging.getLogger(__name__)
 
@@ -111,4 +112,116 @@ def add_trend_features(
         df["trend_alignment"] = (pos / np.where(denom == 0, np.nan, denom)).astype('float32')
     
     logger.debug("Trend features computation completed")
+    return df
+
+
+def add_rsi_features(
+    df: pd.DataFrame,
+    src_col: str = 'adjclose',
+    periods: Tuple[int, ...] = (14, 21, 30)
+) -> pd.DataFrame:
+    """
+    Add RSI (Relative Strength Index) features using pandas-ta.
+    
+    Features added:
+    - rsi_{period}: RSI values for each period (raw values for tree models)
+    
+    Args:
+        df: Input DataFrame with price data
+        src_col: Column name for source price data  
+        periods: Tuple of RSI periods to compute
+        
+    Returns:
+        DataFrame with added RSI features (mutates input DataFrame)
+    """
+    logger.debug(f"Adding RSI features for periods: {periods}")
+    
+    if src_col not in df.columns:
+        logger.warning(f"Source column '{src_col}' not found for RSI calculation")
+        return df
+    
+    price_series = pd.to_numeric(df[src_col], errors='coerce')
+    
+    for period in periods:
+        try:
+            # Use pandas-ta to calculate RSI
+            rsi_values = ta.rsi(price_series, length=period)
+            df[f"rsi_{period}"] = rsi_values.astype('float32')
+            logger.debug(f"Added RSI_{period} feature")
+        except Exception as e:
+            logger.warning(f"Failed to compute RSI_{period}: {e}")
+    
+    logger.debug("RSI features computation completed")
+    return df
+
+
+def add_macd_features(
+    df: pd.DataFrame,
+    src_col: str = 'adjclose',
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+    derivative_ema_span: int = 3
+) -> pd.DataFrame:
+    """
+    Add MACD histogram and its exponential moving average derivative using pandas-ta.
+    
+    Features added:
+    - macd_histogram: MACD histogram (MACD line - signal line)
+    - macd_hist_deriv_ema3: 3-day EMA of MACD histogram derivative
+    
+    Args:
+        df: Input DataFrame with price data
+        src_col: Column name for source price data
+        fast: Fast EMA period for MACD (default: 12)
+        slow: Slow EMA period for MACD (default: 26) 
+        signal: Signal line EMA period (default: 9)
+        derivative_ema_span: EMA span for histogram derivative (default: 3)
+        
+    Returns:
+        DataFrame with added MACD features (mutates input DataFrame)
+    """
+    logger.debug(f"Adding MACD features (fast={fast}, slow={slow}, signal={signal})")
+    
+    if src_col not in df.columns:
+        logger.warning(f"Source column '{src_col}' not found for MACD calculation")
+        return df
+    
+    price_series = pd.to_numeric(df[src_col], errors='coerce')
+    
+    try:
+        # Use pandas-ta to calculate MACD (returns DataFrame with MACD, signal, and histogram)
+        macd_data = ta.macd(price_series, fast=fast, slow=slow, signal=signal)
+        
+        if macd_data is not None and not macd_data.empty:
+            # Extract MACD histogram (already computed by pandas-ta)
+            histogram_col = f'MACDh_{fast}_{slow}_{signal}'  # pandas-ta naming convention
+            
+            if histogram_col in macd_data.columns:
+                macd_histogram = macd_data[histogram_col].astype('float32')
+                df['macd_histogram'] = macd_histogram
+                logger.debug("Added MACD histogram feature")
+                
+                # Calculate histogram derivative (change from previous period)
+                histogram_derivative = macd_histogram.diff()
+                
+                # Apply 3-day EMA to the derivative
+                macd_hist_deriv_ema = histogram_derivative.ewm(
+                    span=derivative_ema_span, 
+                    adjust=False, 
+                    min_periods=1
+                ).mean().astype('float32')
+                
+                df['macd_hist_deriv_ema3'] = macd_hist_deriv_ema
+                logger.debug(f"Added MACD histogram derivative EMA{derivative_ema_span} feature")
+            else:
+                logger.warning(f"Expected MACD histogram column '{histogram_col}' not found in pandas-ta output")
+                logger.debug(f"Available MACD columns: {list(macd_data.columns)}")
+        else:
+            logger.warning("MACD calculation returned empty result")
+            
+    except Exception as e:
+        logger.warning(f"Failed to compute MACD features: {e}")
+    
+    logger.debug("MACD features computation completed")
     return df
