@@ -73,6 +73,35 @@ def main():
         help="Number of parallel jobs for NaN interpolation (-1 for all cores, 1 for sequential)"
     )
     
+    # Triple barrier ATR configuration
+    parser.add_argument(
+        "--atr-up-mult",
+        type=float,
+        default=3.0,
+        help="Upper barrier ATR multiplier for triple barrier targets (default: 3.0)"
+    )
+    
+    parser.add_argument(
+        "--atr-dn-mult", 
+        type=float,
+        default=1.5,
+        help="Lower barrier ATR multiplier for triple barrier targets (default: 1.5)"
+    )
+    
+    parser.add_argument(
+        "--atr-horizon",
+        type=int,
+        default=20,
+        help="Maximum days to track triple barrier targets (default: 20)"
+    )
+    
+    parser.add_argument(
+        "--atr-start-every",
+        type=int,
+        default=3,
+        help="Days between new triple barrier target starts (default: 3)"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -81,6 +110,7 @@ def main():
         logger.info(f"Output directory: {args.output_dir}")
         logger.info(f"Weekly features: {'No' if args.no_weekly else 'Yes'}")
         logger.info(f"Interpolation jobs: {args.interp_jobs}")
+        logger.info(f"Triple barrier config: up_mult={args.atr_up_mult}, dn_mult={args.atr_dn_mult}, horizon={args.atr_horizon}, start_every={args.atr_start_every}")
         
         # Import SP500 tickers
         try:
@@ -113,6 +143,14 @@ def main():
             "miscellaneous": "SPY",
         }
         
+        # Create triple barrier configuration
+        triple_barrier_config = {
+            'up_mult': args.atr_up_mult,
+            'dn_mult': args.atr_dn_mult, 
+            'max_horizon': args.atr_horizon,
+            'start_every': args.atr_start_every
+        }
+        
         # Run pipeline with command-line arguments
         run_pipeline(
             max_stocks=args.max_stocks,
@@ -123,7 +161,8 @@ def main():
             sp500_tickers=SP500_TICKERS,
             output_dir=Path(args.output_dir),
             include_weekly=not args.no_weekly,
-            interpolation_n_jobs=args.interp_jobs
+            interpolation_n_jobs=args.interp_jobs,
+            triple_barrier_config=triple_barrier_config
         )
         
         logger.info("Pipeline completed successfully!")

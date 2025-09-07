@@ -177,7 +177,8 @@ def build_feature_universe(
     spy_symbol: str = "SPY",
     sector_to_etf: Dict[str, str] = None,
     sp500_tickers: List[str] = None,
-    interpolation_n_jobs: int = -1
+    interpolation_n_jobs: int = -1,
+    triple_barrier_config: Dict[str, float] = None
 ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame, Dict[str, Dict]]:
     """
     Build the complete feature universe by loading data and computing all features.
@@ -191,6 +192,7 @@ def build_feature_universe(
         sector_to_etf: Mapping of sector names to ETF symbols
         sp500_tickers: List of S&P 500 ticker symbols for breadth calculation
         interpolation_n_jobs: Number of parallel jobs for NaN interpolation (-1 for all cores)
+        triple_barrier_config: Configuration for triple barrier target generation
         
     Returns:
         Tuple of (features_dict, targets_dataframe, enhanced_mappings) where:
@@ -325,7 +327,7 @@ def build_feature_universe(
 
     # 9) Generate triple barrier targets (parallel)
     logger.info("Generating triple barrier targets...")
-    targets_df = _generate_triple_barrier_targets(indicators_by_symbol)
+    targets_df = _generate_triple_barrier_targets(indicators_by_symbol, triple_barrier_config)
     
     # 10) Interpolate internal gaps (NaNs between observed values only) - parallelized
     logger.info(f"Starting NaN interpolation (n_jobs={interpolation_n_jobs})...")
@@ -339,12 +341,13 @@ def build_feature_universe(
     return indicators_by_symbol, targets_df, enhanced_mappings
 
 
-def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFrame], config: Dict[str, float] = None) -> pd.DataFrame:
     """
     Convert indicators to long format and generate triple barrier targets in parallel.
     
     Args:
         indicators_by_symbol: Dictionary of symbol DataFrames with features
+        config: Triple barrier configuration dictionary
         
     Returns:
         DataFrame with triple barrier targets
@@ -391,23 +394,48 @@ def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFram
     df_long = pd.concat(long_format_data, ignore_index=True)
     logger.info(f"Prepared long format data: {len(df_long)} rows across {df_long['symbol'].nunique()} symbols")
     
-    # Triple barrier configuration
-    config = {
-        'up_mult': 3.0,
-        'dn_mult': 2.5,
-        'max_horizon': 20,
-        'start_every': 3,
-    }
+    # Triple barrier configuration (use provided config or defaults)
+    if config is None:
+        config = {
+            'up_mult': 3.0,
+            'dn_mult': 1.5,  # Updated default
+            'max_horizon': 20,
+            'start_every': 3,
+        }
+    
+    logger.info(f"Triple barrier config: up_mult={config['up_mult']}, dn_mult={config['dn_mult']}, "
+                f"max_horizon={config['max_horizon']}, start_every={config['start_every']}")
     
     # Generate targets in parallel
     targets_df = generate_targets_parallel(df_long, config, n_jobs=-1, chunk_size=32)
     
     if not targets_df.empty:
         logger.info(f"Generated {len(targets_df)} triple barrier targets")
+        # Log class distribution
+        _log_target_class_distribution(targets_df)
     else:
         logger.warning("No triple barrier targets generated")
     
     return targets_df
+
+
+def _log_target_class_distribution(targets_df: pd.DataFrame) -> None:
+    """Log distribution of triple barrier target classes."""
+    if targets_df.empty:
+        logger.info("No targets generated for class distribution analysis")
+        return
+    
+    hit_counts = targets_df['hit'].value_counts().sort_index()
+    total_targets = len(targets_df)
+    
+    logger.info("Triple Barrier Target Class Distribution:")
+    logger.info(f"  Total targets: {total_targets:,}")
+    
+    for hit_value in [-1, 0, 1]:
+        count = hit_counts.get(hit_value, 0)
+        percentage = (count / total_targets * 100) if total_targets > 0 else 0
+        class_name = {-1: "Lower barrier hit", 0: "Time expired", 1: "Upper barrier hit"}[hit_value]
+        logger.info(f"  {class_name}: {count:,} ({percentage:.1f}%)")
 
 
 def run_pipeline(
@@ -421,7 +449,8 @@ def run_pipeline(
     output_dir: Path = Path("./artifacts"),
     include_sectors: bool = True,
     include_weekly: bool = True,
-    interpolation_n_jobs: int = -1
+    interpolation_n_jobs: int = -1,
+    triple_barrier_config: Dict[str, float] = None
 ) -> None:
     """
     Run the complete feature computation pipeline and save outputs.
@@ -446,6 +475,7 @@ def run_pipeline(
         include_sectors: Whether to include sector information in processing
         include_weekly: Whether to add comprehensive weekly features (default: True)
         interpolation_n_jobs: Number of parallel jobs for NaN interpolation (-1 for all cores)
+        triple_barrier_config: Configuration for triple barrier target generation
     """
     logger.info("Starting feature computation pipeline")
     
@@ -462,7 +492,8 @@ def run_pipeline(
         spy_symbol=spy_symbol,
         sector_to_etf=sector_to_etf,
         sp500_tickers=sp500_tickers,
-        interpolation_n_jobs=interpolation_n_jobs
+        interpolation_n_jobs=interpolation_n_jobs,
+        triple_barrier_config=triple_barrier_config
     )
 
     # Save outputs (import saving functions)
@@ -517,6 +548,8 @@ def run_pipeline(
     if not targets_df.empty:
         targets_df.to_parquet(output_dir / "targets_triple_barrier.parquet", index=False)
         logger.info(f"Saved {len(targets_df)} triple barrier targets")
+        # Log final class distribution summary
+        _log_target_class_distribution(targets_df)
     
     # Summary
     if include_weekly and final_features is not None:
