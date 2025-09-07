@@ -15,22 +15,43 @@ import pandas as pd
 from joblib import Parallel, delayed
 
 
-# Relative imports for feature modules
-from ..features.assemble import assemble_indicators_from_wide
-from ..features.trend import add_trend_features, add_rsi_features, add_macd_features
-from ..features.volatility import add_multiscale_vol_regime, add_vol_regime_cs_context
-from ..features.hurst import add_hurst_features
-from ..features.distance import add_distance_to_ma_features
-from ..features.range_breakout import add_range_breakout_features
-from ..features.volume import add_volume_features, add_volume_shock_features
-from ..features.relstrength import add_relative_strength
-from ..features.alpha import add_alpha_momentum_features
-from ..features.breadth import add_breadth_series
-from ..features.xsec import add_xsec_momentum_panel
-from ..features.postprocessing import interpolate_internal_gaps
-from ..features.ohlc_adjustment import adjust_ohlc_to_adjclose
-from ..features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
-from ..features.target_generation import generate_targets_parallel
+# Feature module imports with fallback for both relative and absolute imports
+try:
+    # Try relative imports first (when run as module)
+    from ..features.assemble import assemble_indicators_from_wide
+    from ..features.trend import add_trend_features, add_rsi_features, add_macd_features
+    from ..features.volatility import add_multiscale_vol_regime, add_vol_regime_cs_context
+    from ..features.hurst import add_hurst_features
+    from ..features.distance import add_distance_to_ma_features
+    from ..features.range_breakout import add_range_breakout_features
+    from ..features.volume import add_volume_features, add_volume_shock_features
+    from ..features.relstrength import add_relative_strength
+    from ..features.alpha import add_alpha_momentum_features
+    from ..features.breadth import add_breadth_series
+    from ..features.xsec import add_xsec_momentum_panel
+    from ..features.postprocessing import interpolate_internal_gaps
+    from ..features.ohlc_adjustment import adjust_ohlc_to_adjclose
+    from ..features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
+    from ..features.target_generation import generate_targets_parallel
+    from ..features.weekly import add_weekly_features_to_daily
+except ImportError:
+    # Fallback to absolute imports (when run directly)
+    from src.features.assemble import assemble_indicators_from_wide
+    from src.features.trend import add_trend_features, add_rsi_features, add_macd_features
+    from src.features.volatility import add_multiscale_vol_regime, add_vol_regime_cs_context
+    from src.features.hurst import add_hurst_features
+    from src.features.distance import add_distance_to_ma_features
+    from src.features.range_breakout import add_range_breakout_features
+    from src.features.volume import add_volume_features, add_volume_shock_features
+    from src.features.relstrength import add_relative_strength
+    from src.features.alpha import add_alpha_momentum_features
+    from src.features.breadth import add_breadth_series
+    from src.features.xsec import add_xsec_momentum_panel
+    from src.features.postprocessing import interpolate_internal_gaps
+    from src.features.ohlc_adjustment import adjust_ohlc_to_adjclose
+    from src.features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
+    from src.features.target_generation import generate_targets_parallel
+    from src.features.weekly import add_weekly_features_to_daily
 
 logger = logging.getLogger(__name__)
 
@@ -155,8 +176,9 @@ def build_feature_universe(
     default_etfs: List[str] = None,
     spy_symbol: str = "SPY",
     sector_to_etf: Dict[str, str] = None,
-    sp500_tickers: List[str] = None
-) -> Dict[str, pd.DataFrame]:
+    sp500_tickers: List[str] = None,
+    interpolation_n_jobs: int = -1
+) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame, Dict[str, Dict]]:
     """
     Build the complete feature universe by loading data and computing all features.
     
@@ -168,11 +190,13 @@ def build_feature_universe(
         spy_symbol: Symbol to use as market benchmark
         sector_to_etf: Mapping of sector names to ETF symbols
         sp500_tickers: List of S&P 500 ticker symbols for breadth calculation
+        interpolation_n_jobs: Number of parallel jobs for NaN interpolation (-1 for all cores)
         
     Returns:
-        Tuple of (features_dict, targets_dataframe) where:
+        Tuple of (features_dict, targets_dataframe, enhanced_mappings) where:
         - features_dict: Dictionary mapping symbol -> DataFrame with all computed features  
         - targets_dataframe: DataFrame with triple barrier targets
+        - enhanced_mappings: Enhanced sector/subsector mappings dictionary
         
     Raises:
         RuntimeError: If data loading fails
@@ -222,12 +246,13 @@ def build_feature_universe(
     }
     indicators_by_symbol = assemble_indicators_from_wide(data, adjust_ohlc_with_factor=False)
 
-    # 2.5) Enhanced sector/subsector mapping
+    # 2.5) Enhanced sector/subsector mapping - moved here to be available for both daily and weekly features
     try:
         from ...data.loader import _discover_universe_csv
     except ImportError:
         from src.data.loader import _discover_universe_csv
     
+    logger.info("Building enhanced sector/subsector mappings...")
     universe_csv = _discover_universe_csv(str(Path(__file__).parent.parent.parent / "cache" / "stock_data.pkl"))
     enhanced_mappings = build_enhanced_sector_mappings(
         universe_csv=universe_csv,
@@ -241,6 +266,8 @@ def build_feature_universe(
     missing_etfs = set(required_etfs) - set(etfs.keys())
     if missing_etfs:
         logger.warning(f"Missing {len(missing_etfs)} required ETFs for enhanced mappings: {list(missing_etfs)[:5]}...")
+    
+    logger.info(f"Enhanced mappings completed: {len(enhanced_mappings)} symbols mapped")
 
     # 3) Core features (parallelized)
     logger.info(f"Processing {len(indicators_by_symbol)} symbols in parallel...")
@@ -300,11 +327,16 @@ def build_feature_universe(
     logger.info("Generating triple barrier targets...")
     targets_df = _generate_triple_barrier_targets(indicators_by_symbol)
     
-    # 10) Interpolate internal gaps (NaNs between observed values only)
-    indicators_by_symbol = interpolate_internal_gaps(indicators_by_symbol)
+    # 10) Interpolate internal gaps (NaNs between observed values only) - parallelized
+    logger.info(f"Starting NaN interpolation (n_jobs={interpolation_n_jobs})...")
+    indicators_by_symbol = interpolate_internal_gaps(
+        indicators_by_symbol, 
+        n_jobs=interpolation_n_jobs,
+        batch_size=32  # Process 32 symbols per batch
+    )
 
     logger.info("Feature universe construction completed")
-    return indicators_by_symbol, targets_df
+    return indicators_by_symbol, targets_df, enhanced_mappings
 
 
 def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -387,16 +419,20 @@ def run_pipeline(
     sector_to_etf: Dict[str, str] = None,
     sp500_tickers: List[str] = None,
     output_dir: Path = Path("./artifacts"),
-    include_sectors: bool = True
+    include_sectors: bool = True,
+    include_weekly: bool = True,
+    interpolation_n_jobs: int = -1
 ) -> None:
     """
     Run the complete feature computation pipeline and save outputs.
     
     This function orchestrates the entire process:
     1. Load stock and ETF data
-    2. Compute all features in parallel
+    2. Compute all daily features in parallel
     3. Add cross-sectional features
-    4. Save single long-format parquet file
+    4. Generate triple barrier targets
+    5. Add comprehensive weekly features (optional)
+    6. Save feature and target files
     
     Args:
         max_stocks: Maximum number of stocks to process (None for all)
@@ -408,6 +444,8 @@ def run_pipeline(
         sp500_tickers: List of S&P 500 tickers for breadth calculation
         output_dir: Directory for output files
         include_sectors: Whether to include sector information in processing
+        include_weekly: Whether to add comprehensive weekly features (default: True)
+        interpolation_n_jobs: Number of parallel jobs for NaN interpolation (-1 for all cores)
     """
     logger.info("Starting feature computation pipeline")
     
@@ -415,15 +453,16 @@ def run_pipeline(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build feature universe (now returns features and targets)
-    indicators_by_symbol, targets_df = build_feature_universe(
+    # Build feature universe (now returns features, targets, and enhanced mappings)
+    indicators_by_symbol, targets_df, enhanced_mappings = build_feature_universe(
         max_stocks=max_stocks,
         rate_limit=rate_limit,
         interval=interval,
         default_etfs=default_etfs,
         spy_symbol=spy_symbol,
         sector_to_etf=sector_to_etf,
-        sp500_tickers=sp500_tickers
+        sp500_tickers=sp500_tickers,
+        interpolation_n_jobs=interpolation_n_jobs
     )
 
     # Save outputs (import saving functions)
@@ -434,14 +473,64 @@ def run_pipeline(
         from src.io.saving import save_long_parquet
 
     logger.info("Saving output files...")
-    save_long_parquet(indicators_by_symbol, out_path=output_dir / "features_long.parquet")
+    
+    # Save basic daily features
+    daily_features_path = output_dir / "features_daily.parquet"
+    save_long_parquet(indicators_by_symbol, out_path=daily_features_path)
+    logger.info(f"Saved daily features to {daily_features_path}")
+    
+    # Add comprehensive weekly features if requested
+    final_features = None
+    if include_weekly:
+        logger.info("Adding comprehensive weekly features...")
+        try:
+            # Load the daily features we just saved
+            from ..io.saving import load_long_parquet
+            daily_df = load_long_parquet(daily_features_path)
+            
+            # Add weekly features using the enhanced mappings computed earlier
+            final_features = add_weekly_features_to_daily(
+                daily_df,
+                spy_symbol=spy_symbol,
+                n_jobs=-1,
+                enhanced_mappings=enhanced_mappings
+            )
+            
+            # Save complete feature set
+            complete_features_path = output_dir / "features_complete.parquet"
+            final_features.to_parquet(complete_features_path, index=False)
+            
+            weekly_count = len([col for col in final_features.columns if col.startswith('w_')])
+            logger.info(f"Added {weekly_count} weekly features")
+            logger.info(f"Saved complete feature set to {complete_features_path}")
+            
+        except Exception as e:
+            logger.error(f"Error adding weekly features: {e}")
+            logger.info("Continuing with daily features only...")
+    
+    # Also save the legacy format for backward compatibility
+    if final_features is not None:
+        # Save in long format for legacy compatibility
+        save_long_parquet(indicators_by_symbol, out_path=output_dir / "features_long.parquet")
     
     # Save triple barrier targets if generated
     if not targets_df.empty:
         targets_df.to_parquet(output_dir / "targets_triple_barrier.parquet", index=False)
         logger.info(f"Saved {len(targets_df)} triple barrier targets")
     
-    logger.info(f"Pipeline completed. Outputs saved to {output_dir}")
+    # Summary
+    if include_weekly and final_features is not None:
+        daily_feature_count = len([col for col in final_features.columns 
+                                 if not col.startswith('w_') and col not in ['symbol', 'date']])
+        weekly_feature_count = len([col for col in final_features.columns if col.startswith('w_')])
+        logger.info(f"Pipeline completed successfully!")
+        logger.info(f"  - Daily features: {daily_feature_count}")
+        logger.info(f"  - Weekly features: {weekly_feature_count}")
+        logger.info(f"  - Total features: {daily_feature_count + weekly_feature_count}")
+        logger.info(f"  - Symbols processed: {final_features['symbol'].nunique()}")
+        logger.info(f"  - Outputs saved to {output_dir}")
+    else:
+        logger.info(f"Pipeline completed. Daily features and targets saved to {output_dir}")
 
 
 def main(include_sectors: bool = True) -> None:
@@ -489,3 +578,110 @@ def main(include_sectors: bool = True) -> None:
         sector_to_etf=sector_to_etf if include_sectors else None,
         sp500_tickers=SP500_TICKERS,
     )
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    parser = argparse.ArgumentParser(
+        description="Run comprehensive financial feature computation pipeline",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument(
+        "--max-stocks", 
+        type=int, 
+        default=None,
+        help="Maximum number of stocks to process (None for all)"
+    )
+    
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./artifacts",
+        help="Output directory for feature and target files"
+    )
+    
+    parser.add_argument(
+        "--no-weekly",
+        action="store_true",
+        help="Skip weekly features computation (faster but less comprehensive)"
+    )
+    
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=1.0,
+        help="Rate limit for data requests (requests per second)"
+    )
+    
+    args = parser.parse_args()
+    
+    try:
+        logger.info("Starting financial features pipeline...")
+        logger.info(f"Max stocks: {args.max_stocks or 'All'}")
+        logger.info(f"Output directory: {args.output_dir}")
+        logger.info(f"Weekly features: {'No' if args.no_weekly else 'Yes'}")
+        
+        # Import SP500 tickers
+        try:
+            from ...cache.sp500_list import SP500_TICKERS
+        except ImportError:
+            from cache.sp500_list import SP500_TICKERS
+
+        # Default sector mapping
+        sector_to_etf = {
+            "technology services": "XLK",
+            "electronic technology": "XLK", 
+            "finance": "XLF",
+            "retail trade": "XLY",
+            "health technology": "XLV",
+            "consumer non-durables": "XLP",
+            "producer manufacturing": "XLI",
+            "energy minerals": "XLE",
+            "consumer services": "XLY",
+            "consumer durables": "XLY",
+            "utilities": "XLU",
+            "non-energy minerals": "XLB",
+            "industrial services": "XLI",
+            "transportation": "IYT",
+            "commercial services": "XLC",
+            "process industries": "XLB", 
+            "communications": "XLC",
+            "health services": "XLV",
+            "distribution services": "XLI",
+            "miscellaneous": "SPY",
+        }
+        
+        # Run pipeline with command-line arguments
+        run_pipeline(
+            max_stocks=args.max_stocks,
+            rate_limit=args.rate_limit,
+            interval="1d",
+            spy_symbol="SPY",
+            sector_to_etf=sector_to_etf,
+            sp500_tickers=SP500_TICKERS,
+            output_dir=Path(args.output_dir),
+            include_weekly=not args.no_weekly
+        )
+        
+        logger.info("Pipeline completed successfully!")
+        logger.info(f"Check {args.output_dir} for output files:")
+        logger.info("  - features_daily.parquet: Daily features only")
+        if not args.no_weekly:
+            logger.info("  - features_complete.parquet: Daily + weekly features")
+        logger.info("  - targets_triple_barrier.parquet: Triple barrier targets")
+        
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}")
+        sys.exit(1)
