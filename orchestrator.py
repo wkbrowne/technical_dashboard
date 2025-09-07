@@ -102,6 +102,13 @@ def main():
         help="Days between new triple barrier target starts (default: 3)"
     )
     
+    # Profiling control
+    parser.add_argument(
+        "--no-profiling",
+        action="store_true",
+        help="Disable pipeline stage profiling (default: profiling enabled)"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -110,6 +117,7 @@ def main():
         logger.info(f"Output directory: {args.output_dir}")
         logger.info(f"Weekly features: {'No' if args.no_weekly else 'Yes'}")
         logger.info(f"Interpolation jobs: {args.interp_jobs}")
+        logger.info(f"Profiling: {'Disabled' if args.no_profiling else 'Enabled'}")
         logger.info(f"Triple barrier config: up_mult={args.atr_up_mult}, dn_mult={args.atr_dn_mult}, horizon={args.atr_horizon}, start_every={args.atr_start_every}")
         
         # Import SP500 tickers
@@ -162,7 +170,8 @@ def main():
             output_dir=Path(args.output_dir),
             include_weekly=not args.no_weekly,
             interpolation_n_jobs=args.interp_jobs,
-            triple_barrier_config=triple_barrier_config
+            triple_barrier_config=triple_barrier_config,
+            enable_profiling=not args.no_profiling
         )
         
         logger.info("Pipeline completed successfully!")
