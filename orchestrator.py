@@ -109,6 +109,21 @@ def main():
         help="Disable pipeline stage profiling (default: profiling enabled)"
     )
     
+    # Configurable lag parameters
+    parser.add_argument(
+        "--daily-lags",
+        type=str,
+        default="",
+        help="Daily feature lags specification (e.g., '1,2,5' or '1-5,10'). Empty for no daily lags."
+    )
+    
+    parser.add_argument(
+        "--weekly-lags", 
+        type=str,
+        default="",
+        help="Weekly feature lags specification (e.g., '1,2,4' or '1-3'). Empty for no weekly lags."
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -119,6 +134,18 @@ def main():
         logger.info(f"Interpolation jobs: {args.interp_jobs}")
         logger.info(f"Profiling: {'Disabled' if args.no_profiling else 'Enabled'}")
         logger.info(f"Triple barrier config: up_mult={args.atr_up_mult}, dn_mult={args.atr_dn_mult}, horizon={args.atr_horizon}, start_every={args.atr_start_every}")
+        
+        # Parse lag specifications
+        from src.features.lagging import parse_lag_specification
+        daily_lags = parse_lag_specification(args.daily_lags)
+        weekly_lags = parse_lag_specification(args.weekly_lags)
+        
+        if daily_lags:
+            logger.info(f"Daily lags: {daily_lags}")
+        if weekly_lags:
+            logger.info(f"Weekly lags: {weekly_lags}")
+        if not daily_lags and not weekly_lags:
+            logger.info("No feature lags specified")
         
         # Import SP500 tickers
         try:
@@ -171,7 +198,9 @@ def main():
             include_weekly=not args.no_weekly,
             interpolation_n_jobs=args.interp_jobs,
             triple_barrier_config=triple_barrier_config,
-            enable_profiling=not args.no_profiling
+            enable_profiling=not args.no_profiling,
+            daily_lags=daily_lags,
+            weekly_lags=weekly_lags
         )
         
         logger.info("Pipeline completed successfully!")

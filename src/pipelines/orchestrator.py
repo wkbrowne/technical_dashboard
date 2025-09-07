@@ -37,6 +37,7 @@ try:
     from ..features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
     from ..features.target_generation import generate_targets_parallel
     from ..features.weekly import add_weekly_features_to_daily
+    from ..features.lagging import apply_configurable_lags
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.assemble import assemble_indicators_from_wide
@@ -55,6 +56,7 @@ except ImportError:
     from src.features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
     from src.features.target_generation import generate_targets_parallel
     from src.features.weekly import add_weekly_features_to_daily
+    from src.features.lagging import apply_configurable_lags
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +256,9 @@ def build_feature_universe(
     sector_to_etf: Dict[str, str] = None,
     sp500_tickers: List[str] = None,
     interpolation_n_jobs: int = -1,
-    triple_barrier_config: Dict[str, float] = None
+    triple_barrier_config: Dict[str, float] = None,
+    daily_lags: List[int] = None,
+    weekly_lags: List[int] = None
 ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame, Dict[str, Dict]]:
     """
     Build the complete feature universe by loading data and computing all features.
@@ -269,6 +273,8 @@ def build_feature_universe(
         sp500_tickers: List of S&P 500 ticker symbols for breadth calculation
         interpolation_n_jobs: Number of parallel jobs for NaN interpolation (-1 for all cores)
         triple_barrier_config: Configuration for triple barrier target generation
+        daily_lags: List of daily lag periods in trading days (None for no daily lags)
+        weekly_lags: List of weekly lag periods in weeks (None for no weekly lags)
         
     Returns:
         Tuple of (features_dict, targets_dataframe, enhanced_mappings) where:
@@ -421,6 +427,17 @@ def build_feature_universe(
             batch_size=32  # Process 32 symbols per batch
         )
 
+    # 11) Apply configurable feature lags (optional)
+    if (daily_lags and len(daily_lags) > 0) or (weekly_lags and len(weekly_lags) > 0):
+        with profile_stage("Feature Lag Application"):
+            logger.info("Applying configurable feature lags...")
+            indicators_by_symbol = apply_configurable_lags(
+                indicators_by_symbol,
+                daily_lags=daily_lags,
+                weekly_lags=weekly_lags,
+                n_jobs=max(1, (os.cpu_count() or 4) - 1)
+            )
+
     logger.info("Feature universe construction completed")
     return indicators_by_symbol, targets_df, enhanced_mappings
 
@@ -535,7 +552,9 @@ def run_pipeline(
     include_weekly: bool = True,
     interpolation_n_jobs: int = -1,
     triple_barrier_config: Dict[str, float] = None,
-    enable_profiling: bool = True
+    enable_profiling: bool = True,
+    daily_lags: List[int] = None,
+    weekly_lags: List[int] = None
 ) -> None:
     """
     Run the complete feature computation pipeline and save outputs.
@@ -545,8 +564,9 @@ def run_pipeline(
     2. Compute all daily features in parallel
     3. Add cross-sectional features
     4. Generate triple barrier targets
-    5. Add comprehensive weekly features (optional)
-    6. Save feature and target files
+    5. Apply configurable daily and weekly feature lags (optional)
+    6. Add comprehensive weekly features (optional)
+    7. Save feature and target files
     
     Args:
         max_stocks: Maximum number of stocks to process (None for all)
@@ -562,6 +582,8 @@ def run_pipeline(
         interpolation_n_jobs: Number of parallel jobs for NaN interpolation (-1 for all cores)
         triple_barrier_config: Configuration for triple barrier target generation
         enable_profiling: Whether to enable pipeline stage profiling (default: True)
+        daily_lags: List of daily lag periods in trading days (None for no daily lags)
+        weekly_lags: List of weekly lag periods in weeks (None for no weekly lags)
     """
     # Set profiling state and clear any previous profiling data
     _set_profiling_enabled(enable_profiling)
@@ -584,7 +606,9 @@ def run_pipeline(
         sector_to_etf=sector_to_etf,
         sp500_tickers=sp500_tickers,
         interpolation_n_jobs=interpolation_n_jobs,
-        triple_barrier_config=triple_barrier_config
+        triple_barrier_config=triple_barrier_config,
+        daily_lags=daily_lags,
+        weekly_lags=weekly_lags
     )
 
     # Save outputs (import saving functions)

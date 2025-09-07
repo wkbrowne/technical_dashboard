@@ -14,7 +14,7 @@ import pandas as pd
 from pathlib import Path
 
 # Add project root to Python path
-project_root = Path(__file__).parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.features.postprocessing import interpolate_internal_gaps
@@ -52,13 +52,15 @@ def create_test_data(n_symbols: int = 100, n_rows: int = 1000, nan_prob: float =
         price_series = base_price * np.exp(np.cumsum(np.random.randn(n_rows) * 0.02))
         
         # Create DataFrame with multiple numeric columns
+        price_df = pd.DataFrame({'price': price_series}, index=date_range)
+        
         df = pd.DataFrame({
             'adjclose': price_series,
             'volume': np.random.exponential(1000000, n_rows),
             'feature1': np.random.randn(n_rows),
             'feature2': np.random.randn(n_rows) * 10,
-            'feature3': price_series.rolling(20).mean(),
-            'feature4': price_series.rolling(50).std(),
+            'feature3': price_df['price'].rolling(20).mean(),
+            'feature4': price_df['price'].rolling(50).std(),
             'feature5': np.random.randn(n_rows).cumsum(),
         }, index=date_range)
         
