@@ -258,7 +258,9 @@ def build_feature_universe(
     interpolation_n_jobs: int = -1,
     triple_barrier_config: Dict[str, float] = None,
     daily_lags: List[int] = None,
-    weekly_lags: List[int] = None
+    weekly_lags: List[int] = None,
+    weight_min_clip: float = 0.01,
+    weight_max_clip: float = 10.0
 ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame, Dict[str, Dict]]:
     """
     Build the complete feature universe by loading data and computing all features.
@@ -275,6 +277,8 @@ def build_feature_universe(
         triple_barrier_config: Configuration for triple barrier target generation
         daily_lags: List of daily lag periods in trading days (None for no daily lags)
         weekly_lags: List of weekly lag periods in weeks (None for no weekly lags)
+        weight_min_clip: Minimum weight value for target generation (prevents zero weights)
+        weight_max_clip: Maximum weight value for target generation (prevents extreme weights)
         
     Returns:
         Tuple of (features_dict, targets_dataframe, enhanced_mappings) where:
@@ -416,7 +420,8 @@ def build_feature_universe(
     # 9) Generate triple barrier targets (parallel)
     with profile_stage("Triple Barrier Target Generation"):
         logger.info("Generating triple barrier targets...")
-        targets_df = _generate_triple_barrier_targets(indicators_by_symbol, triple_barrier_config)
+        targets_df = _generate_triple_barrier_targets(indicators_by_symbol, triple_barrier_config, 
+                                                     weight_min_clip, weight_max_clip)
     
     # 10) Interpolate internal gaps (NaNs between observed values only) - parallelized
     with profile_stage("NaN Interpolation"):
@@ -442,16 +447,19 @@ def build_feature_universe(
     return indicators_by_symbol, targets_df, enhanced_mappings
 
 
-def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFrame], config: Dict[str, float] = None) -> pd.DataFrame:
+def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFrame], config: Dict[str, float] = None,
+                                    weight_min_clip: float = 0.01, weight_max_clip: float = 10.0) -> pd.DataFrame:
     """
     Convert indicators to long format and generate triple barrier targets in parallel.
     
     Args:
         indicators_by_symbol: Dictionary of symbol DataFrames with features
         config: Triple barrier configuration dictionary
+        weight_min_clip: Minimum weight value (prevents zero weights)
+        weight_max_clip: Maximum weight value (prevents extreme weights)
         
     Returns:
-        DataFrame with triple barrier targets
+        DataFrame with triple barrier targets and combined weights
     """
     # Convert to long format for target generation
     long_format_data = []
@@ -507,8 +515,9 @@ def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFram
     logger.info(f"Triple barrier config: up_mult={config['up_mult']}, dn_mult={config['dn_mult']}, "
                 f"max_horizon={config['max_horizon']}, start_every={config['start_every']}")
     
-    # Generate targets in parallel
-    targets_df = generate_targets_parallel(df_long, config, n_jobs=-1, chunk_size=32)
+    # Generate targets in parallel with combined weights
+    targets_df = generate_targets_parallel(df_long, config, n_jobs=-1, chunk_size=32, 
+                                          weight_min_clip=weight_min_clip, weight_max_clip=weight_max_clip)
     
     if not targets_df.empty:
         logger.info(f"Generated {len(targets_df)} triple barrier targets")
@@ -554,7 +563,9 @@ def run_pipeline(
     triple_barrier_config: Dict[str, float] = None,
     enable_profiling: bool = True,
     daily_lags: List[int] = None,
-    weekly_lags: List[int] = None
+    weekly_lags: List[int] = None,
+    weight_min_clip: float = 0.01,
+    weight_max_clip: float = 10.0
 ) -> None:
     """
     Run the complete feature computation pipeline and save outputs.
@@ -584,6 +595,8 @@ def run_pipeline(
         enable_profiling: Whether to enable pipeline stage profiling (default: True)
         daily_lags: List of daily lag periods in trading days (None for no daily lags)
         weekly_lags: List of weekly lag periods in weeks (None for no weekly lags)
+        weight_min_clip: Minimum weight value for target generation (prevents zero weights)
+        weight_max_clip: Maximum weight value for target generation (prevents extreme weights)
     """
     # Set profiling state and clear any previous profiling data
     _set_profiling_enabled(enable_profiling)
@@ -608,7 +621,9 @@ def run_pipeline(
         interpolation_n_jobs=interpolation_n_jobs,
         triple_barrier_config=triple_barrier_config,
         daily_lags=daily_lags,
-        weekly_lags=weekly_lags
+        weekly_lags=weekly_lags,
+        weight_min_clip=weight_min_clip,
+        weight_max_clip=weight_max_clip
     )
 
     # Save outputs (import saving functions)
@@ -664,7 +679,18 @@ def run_pipeline(
         # Save triple barrier targets if generated
         if not targets_df.empty:
             targets_df.to_parquet(output_dir / "targets_triple_barrier.parquet", index=False)
-            logger.info(f"Saved {len(targets_df)} triple barrier targets")
+            logger.info(f"Saved {len(targets_df)} triple barrier targets with combined weights")
+            
+            # Log weight information
+            if 'weight_final' in targets_df.columns:
+                weight_stats = targets_df['weight_final'].describe()
+                logger.info(f"Final weight statistics: min={weight_stats['min']:.4f}, "
+                           f"mean={weight_stats['mean']:.4f}, max={weight_stats['max']:.4f}")
+                
+                # Count columns for comprehensive summary
+                weight_cols = [col for col in targets_df.columns if col.startswith('weight_')]
+                logger.info(f"Saved weight columns: {weight_cols}")
+            
             # Log final class distribution summary
             _log_target_class_distribution(targets_df)
     

@@ -14,7 +14,9 @@ from joblib import Parallel, delayed
 logger = logging.getLogger(__name__)
 
 
-def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict) -> pd.DataFrame:
+def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict, 
+                                   weight_min_clip: float = 0.01, 
+                                   weight_max_clip: float = 10.0) -> pd.DataFrame:
     """
     Generate triple barrier targets from long-format price data.
     
@@ -28,16 +30,21 @@ def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict) -> pd.DataFr
             - dn_mult: Lower barrier multiplier (e.g., 3.0 = 3x ATR below entry)  
             - max_horizon: Maximum days to track each target
             - start_every: Minimum days between new targets (when not hit early)
+        weight_min_clip: Minimum weight value (prevents zero weights)
+        weight_max_clip: Maximum weight value (prevents extreme weights)
             
     Returns:
         DataFrame with columns: symbol, t0, t_hit, hit, entry_px, top, bot, 
-                               h_used, price_hit, ret_from_entry, n_overlapping_trajs, weight
+                               h_used, price_hit, ret_from_entry, n_overlapping_trajs, 
+                               weight_overlap, weight_class_balance, weight_final
         
     Notes:
         - hit: 1 = upper barrier hit, -1 = lower barrier hit, 0 = time expired
         - ret_from_entry: Log return from entry to exit price
         - n_overlapping_trajs: Count of overlapping trajectories at t0 for this symbol
-        - weight: Inverse of overlap count, normalized to sum to 1.0 across dataset
+        - weight_overlap: Inverse of overlap count (uniqueness weight)
+        - weight_class_balance: Inverse frequency weight for class balancing
+        - weight_final: Combined multiplicative weight (clipped & normalized)
         - Assumes df is sorted by symbol and date
     """
     required_cols = {'symbol', 'date', 'close', 'high', 'low', 'atr'}
@@ -122,12 +129,11 @@ def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict) -> pd.DataFr
     # Add overlap counting
     targets_df = _add_overlap_counts(targets_df, config)
     
-    # Calculate weights as inverse of overlap counts with pseudocount
-    targets_df['weight'] = 1.0 / (targets_df['n_overlapping_trajs'] + 0.5)
-    targets_df['weight'] /= targets_df['weight'].sum()  # Optional normalization
+    # Calculate combined weights (overlap + class balance)
+    targets_df = _add_combined_weights(targets_df, weight_min_clip, weight_max_clip)
     
-    logger.debug(f"Added weight column with sum={targets_df['weight'].sum():.6f}, "
-                f"min={targets_df['weight'].min():.6f}, max={targets_df['weight'].max():.6f}")
+    logger.info(f"Added combined weights: min={targets_df['weight_final'].min():.6f}, "
+               f"max={targets_df['weight_final'].max():.6f}, sum={targets_df['weight_final'].sum():.2f}")
     
     # Top-level validation to ensure no NaNs in t0 column
     if 't0' in targets_df.columns:
@@ -404,7 +410,8 @@ def _count_overlaps_efficient(symbol_targets: pd.DataFrame) -> Dict:
     return overlap_counts
 
 
-def _process_symbol_group(df: pd.DataFrame, config: Dict, symbols: List[str]) -> pd.DataFrame:
+def _process_symbol_group(df: pd.DataFrame, config: Dict, symbols: List[str],
+                         weight_min_clip: float = 0.01, weight_max_clip: float = 10.0) -> pd.DataFrame:
     """
     Process a group of symbols by filtering and running triple barrier target generation.
     
@@ -412,6 +419,8 @@ def _process_symbol_group(df: pd.DataFrame, config: Dict, symbols: List[str]) ->
         df: Long-format DataFrame with all symbol data
         config: Triple barrier configuration dictionary
         symbols: List of symbols to process in this chunk
+        weight_min_clip: Minimum weight value (prevents zero weights)
+        weight_max_clip: Maximum weight value (prevents extreme weights)
         
     Returns:
         DataFrame with triple barrier targets for the specified symbols
@@ -429,14 +438,16 @@ def _process_symbol_group(df: pd.DataFrame, config: Dict, symbols: List[str]) ->
     logger.debug(f"Processing {len(symbols)} symbols: {symbols}")
     
     # Generate targets for this chunk
-    return generate_triple_barrier_targets(chunk_df, config)
+    return generate_triple_barrier_targets(chunk_df, config, weight_min_clip, weight_max_clip)
 
 
 def generate_targets_parallel(
     df: pd.DataFrame,
     config: Dict,
     n_jobs: int = -1,
-    chunk_size: int = 25
+    chunk_size: int = 25,
+    weight_min_clip: float = 0.01,
+    weight_max_clip: float = 10.0
 ) -> pd.DataFrame:
     """
     Chunk long-format data by symbol and run target generation in parallel.
@@ -450,6 +461,8 @@ def generate_targets_parallel(
                 - start_every: Minimum days between new targets
         n_jobs: Number of parallel workers (-1 = all cores)
         chunk_size: Number of symbols per parallel chunk
+        weight_min_clip: Minimum weight value (prevents zero weights)
+        weight_max_clip: Maximum weight value (prevents extreme weights)
 
     Returns:
         Combined DataFrame with triple barrier targets for all symbols
@@ -486,7 +499,7 @@ def generate_targets_parallel(
             verbose=1, 
             prefer="processes"
         )(
-            delayed(_process_symbol_group)(df, config, chunk) 
+            delayed(_process_symbol_group)(df, config, chunk, weight_min_clip, weight_max_clip) 
             for chunk in symbol_chunks
         )
         
@@ -507,5 +520,81 @@ def generate_targets_parallel(
     except Exception as e:
         logger.error(f"Error in parallel target generation: {e}")
         raise
+
+
+def _add_combined_weights(targets_df: pd.DataFrame, 
+                         weight_min_clip: float = 0.01, 
+                         weight_max_clip: float = 10.0) -> pd.DataFrame:
+    """
+    Add combined weights to targets DataFrame using overlap and class balance components.
+    
+    Args:
+        targets_df: DataFrame with targets and overlap counts
+        weight_min_clip: Minimum weight value (prevents zero weights)
+        weight_max_clip: Maximum weight value (prevents extreme weights)
+        
+    Returns:
+        DataFrame with additional weight columns: weight_overlap, weight_class_balance, weight_final
+    """
+    if targets_df.empty:
+        logger.warning("Empty targets DataFrame provided for weight calculation")
+        return targets_df
+    
+    targets_df = targets_df.copy()
+    
+    # 1. Calculate overlap weights (inverse of overlap count with pseudocount)
+    targets_df['weight_overlap'] = 1.0 / (targets_df['n_overlapping_trajs'] + 0.5)
+    
+    # 2. Calculate class balance weights (inverse frequency per class)
+    if 'hit' not in targets_df.columns:
+        logger.error("Missing 'hit' column for class balance weight calculation")
+        # Fallback to overlap-only weights
+        targets_df['weight_class_balance'] = 1.0
+        targets_df['weight_final'] = targets_df['weight_overlap']
+    else:
+        # Count class frequencies
+        class_counts = targets_df['hit'].value_counts()
+        total_samples = len(targets_df)
+        n_classes = len(class_counts)
+        
+        # Calculate class balance weights (sklearn-style: n_samples / (n_classes * bincount))
+        class_weights = {}
+        for class_val, count in class_counts.items():
+            class_weights[class_val] = total_samples / (n_classes * count)
+        
+        # Map class weights to each sample
+        targets_df['weight_class_balance'] = targets_df['hit'].map(class_weights)
+        
+        # 3. Combine multiplicatively
+        targets_df['weight_final'] = targets_df['weight_overlap'] * targets_df['weight_class_balance']
+    
+    # 4. Apply clipping to raw combined weights
+    targets_df['weight_final'] = np.clip(targets_df['weight_final'], weight_min_clip, weight_max_clip)
+    
+    # 5. Normalize to sum to number of samples (standard for ML frameworks)
+    weight_sum = targets_df['weight_final'].sum()
+    if weight_sum > 0:
+        targets_df['weight_final'] = targets_df['weight_final'] * len(targets_df) / weight_sum
+        # Re-apply clipping after normalization to ensure bounds are respected
+        targets_df['weight_final'] = np.clip(targets_df['weight_final'], weight_min_clip, weight_max_clip)
+    else:
+        logger.error("All weights are zero after clipping - using uniform weights")
+        targets_df['weight_final'] = 1.0
+    
+    # Log weight statistics
+    logger.info(f"Weight statistics:")
+    logger.info(f"  Overlap weights: min={targets_df['weight_overlap'].min():.4f}, "
+               f"max={targets_df['weight_overlap'].max():.4f}")
+    
+    if 'weight_class_balance' in targets_df.columns and 'hit' in targets_df.columns:
+        logger.info(f"  Class balance weights: min={targets_df['weight_class_balance'].min():.4f}, "
+                   f"max={targets_df['weight_class_balance'].max():.4f}")
+        logger.info(f"  Class distribution: {dict(targets_df['hit'].value_counts().sort_index())}")
+    
+    logger.info(f"  Final weights: min={targets_df['weight_final'].min():.4f}, "
+               f"max={targets_df['weight_final'].max():.4f}, "
+               f"sum={targets_df['weight_final'].sum():.2f}")
+    
+    return targets_df
 
 

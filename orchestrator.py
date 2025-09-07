@@ -124,6 +124,21 @@ def main():
         help="Weekly feature lags specification (e.g., '1,2,4' or '1-3'). Empty for no weekly lags."
     )
     
+    # Combined weight clipping parameters
+    parser.add_argument(
+        "--weight-min-clip",
+        type=float,
+        default=0.01,
+        help="Minimum weight value for target generation (prevents zero weights, default: 0.01)"
+    )
+    
+    parser.add_argument(
+        "--weight-max-clip",
+        type=float,
+        default=10.0,
+        help="Maximum weight value for target generation (prevents extreme weights, default: 10.0)"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -146,6 +161,8 @@ def main():
             logger.info(f"Weekly lags: {weekly_lags}")
         if not daily_lags and not weekly_lags:
             logger.info("No feature lags specified")
+        
+        logger.info(f"Weight clipping: min={args.weight_min_clip}, max={args.weight_max_clip}")
         
         # Import SP500 tickers
         try:
@@ -200,7 +217,9 @@ def main():
             triple_barrier_config=triple_barrier_config,
             enable_profiling=not args.no_profiling,
             daily_lags=daily_lags,
-            weekly_lags=weekly_lags
+            weekly_lags=weekly_lags,
+            weight_min_clip=args.weight_min_clip,
+            weight_max_clip=args.weight_max_clip
         )
         
         logger.info("Pipeline completed successfully!")
