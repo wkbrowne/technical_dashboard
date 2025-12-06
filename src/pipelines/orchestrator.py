@@ -42,11 +42,6 @@ try:
     )
     # New config system
     from ..config.features import FeatureConfig, FeatureSpec, Timeframe
-    # Legacy imports for backward compatibility
-    from ..features.weekly import add_weekly_features_to_daily
-    from ..features.weekly_enhanced import add_weekly_features_to_daily_enhanced, ChunkProcessingConfig
-    from ..features.weekly_optimized import add_weekly_features_to_daily_optimized, OptimizedWeeklyConfig
-    from ..features.weekly_multiprocessing import add_weekly_features_to_daily_multiprocessing, MultiprocessingConfig
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.assemble import assemble_indicators_from_wide
@@ -65,11 +60,6 @@ except ImportError:
     )
     # New config system
     from src.config.features import FeatureConfig, FeatureSpec, Timeframe
-    # Legacy imports for backward compatibility
-    from src.features.weekly import add_weekly_features_to_daily
-    from src.features.weekly_enhanced import add_weekly_features_to_daily_enhanced, ChunkProcessingConfig
-    from src.features.weekly_optimized import add_weekly_features_to_daily_optimized, OptimizedWeeklyConfig
-    from src.features.weekly_multiprocessing import add_weekly_features_to_daily_multiprocessing, MultiprocessingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -665,7 +655,30 @@ def run_pipeline_v2(
                 market_symbol=spy_symbol
             )
 
-    # Step 3: Generate targets (before adding higher TF features)
+    # Step 3: Add higher timeframe features (W/M) - compute alongside daily features
+    higher_tfs = [tf for tf in timeframes if tf in ['W', 'M']]
+    if higher_tfs:
+        with profile_stage(f"Higher Timeframe Features ({','.join(higher_tfs)})"):
+            # Convert to long format for higher TF processing
+            daily_df = combine_to_long(indicators_by_symbol)
+            daily_df = compute_higher_timeframe_features(
+                daily_df,
+                timeframes=higher_tfs,
+                spy_symbol=spy_symbol,
+                enhanced_mappings=enhanced_mappings,
+                n_jobs=n_jobs
+            )
+            # Convert back to dict format for subsequent steps
+            indicators_by_symbol = partition_by_symbol(daily_df, optimize_dtypes=False)
+
+    # Step 4: Interpolate NaNs (applies to daily AND higher TF features)
+    with profile_stage("NaN Interpolation"):
+        indicators_by_symbol = interpolate_internal_gaps(
+            indicators_by_symbol,
+            n_jobs=n_jobs
+        )
+
+    # Step 5: Generate targets (after all features computed and interpolated)
     targets_df = None
     if include_targets:
         with profile_stage("Triple Barrier Targets"):
@@ -674,27 +687,8 @@ def run_pipeline_v2(
                 triple_barrier_config
             )
 
-    # Step 4: Interpolate NaNs
-    with profile_stage("NaN Interpolation"):
-        indicators_by_symbol = interpolate_internal_gaps(
-            indicators_by_symbol,
-            n_jobs=n_jobs
-        )
-
-    # Step 5: Convert to long format for higher TF processing
+    # Step 6: Convert to final long format
     daily_df = combine_to_long(indicators_by_symbol)
-
-    # Step 6: Add higher timeframe features
-    higher_tfs = [tf for tf in timeframes if tf in ['W', 'M']]
-    if higher_tfs:
-        with profile_stage(f"Higher Timeframe Features ({','.join(higher_tfs)})"):
-            daily_df = compute_higher_timeframe_features(
-                daily_df,
-                timeframes=higher_tfs,
-                spy_symbol=spy_symbol,
-                enhanced_mappings=enhanced_mappings,
-                n_jobs=n_jobs
-            )
 
     logger.info(f"Pipeline v2 completed: {len(daily_df)} rows, {len(daily_df.columns)} columns")
 
@@ -720,8 +714,7 @@ def run_pipeline(
     weekly_lags: List[int] = None,
     weight_min_clip: float = 0.01,
     weight_max_clip: float = 10.0,
-    feature_config: Optional[FeatureConfig] = None,
-    use_unified_timeframe: bool = True
+    feature_config: Optional[FeatureConfig] = None
 ) -> None:
     """
     Run the complete feature computation pipeline and save outputs.
@@ -730,9 +723,9 @@ def run_pipeline(
     1. Load stock and ETF data
     2. Compute all daily features in parallel
     3. Add cross-sectional features
-    4. Generate triple barrier targets
-    5. Apply configurable daily and weekly feature lags (optional)
-    6. Add comprehensive weekly/monthly features (optional)
+    4. Add higher timeframe features (weekly/monthly)
+    5. Interpolate NaNs
+    6. Generate triple barrier targets
     7. Save feature and target files
 
     Args:
@@ -755,7 +748,6 @@ def run_pipeline(
         weight_min_clip: Minimum weight value for target generation (prevents zero weights)
         weight_max_clip: Maximum weight value for target generation (prevents extreme weights)
         feature_config: Optional FeatureConfig for feature selection (None for all features)
-        use_unified_timeframe: Use new unified TimeframeResampler instead of legacy weekly (default: True)
     """
     # Set profiling state and clear any previous profiling data
     _set_profiling_enabled(enable_profiling)
@@ -820,43 +812,19 @@ def run_pipeline(
                 daily_df = load_long_parquet(daily_features_path)
                 n_symbols = daily_df['symbol'].nunique()
 
-                if use_unified_timeframe:
-                    # NEW: Use unified TimeframeResampler (recommended)
-                    logger.info(f"Using unified TimeframeResampler for {higher_timeframes}")
-                    final_features = compute_higher_timeframe_features(
-                        daily_df,
-                        timeframes=higher_timeframes,
-                        spy_symbol=spy_symbol,
-                        enhanced_mappings=enhanced_mappings,
-                        n_jobs=interpolation_n_jobs
-                    )
-                    feature_counts = {
-                        'weekly': len([c for c in final_features.columns if c.startswith('w_')]),
-                        'monthly': len([c for c in final_features.columns if c.startswith('m_')])
-                    }
-                    logger.info(f"Added features: {feature_counts}")
-
-                else:
-                    # LEGACY: Use old multiprocessing implementation (fallback)
-                    logger.info("Using legacy weekly implementation...")
-                    multiprocessing_config = MultiprocessingConfig(
-                        n_jobs=-1,
-                        backend='loky',
-                        batch_size=1,
-                        memory_limit_mb=2048,
-                        dtype_optimization=True,
-                        adaptive_chunking=True,
-                        verbose=1
-                    )
-
-                    final_features = add_weekly_features_to_daily_multiprocessing(
-                        daily_df,
-                        spy_symbol=spy_symbol,
-                        config=multiprocessing_config,
-                        enhanced_mappings=enhanced_mappings
-                    )
-                    weekly_count = len([col for col in final_features.columns if col.startswith('w_')])
-                    logger.info(f"Added {weekly_count} weekly features (legacy)")
+                logger.info(f"Using unified TimeframeResampler for {higher_timeframes}")
+                final_features = compute_higher_timeframe_features(
+                    daily_df,
+                    timeframes=higher_timeframes,
+                    spy_symbol=spy_symbol,
+                    enhanced_mappings=enhanced_mappings,
+                    n_jobs=interpolation_n_jobs
+                )
+                feature_counts = {
+                    'weekly': len([c for c in final_features.columns if c.startswith('w_')]),
+                    'monthly': len([c for c in final_features.columns if c.startswith('m_')])
+                }
+                logger.info(f"Added features: {feature_counts}")
 
             except Exception as e:
                 logger.error(f"Higher timeframe feature computation failed: {e}")
