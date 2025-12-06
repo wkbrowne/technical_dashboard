@@ -40,8 +40,9 @@ try:
         partition_by_symbol, combine_to_long, compute_features_at_timeframe,
         add_prefix_to_features
     )
-    # New config system
+    # Config system
     from ..config.features import FeatureConfig, FeatureSpec, Timeframe
+    from ..config.parallel import ParallelConfig
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.assemble import assemble_indicators_from_wide
@@ -58,8 +59,9 @@ except ImportError:
         partition_by_symbol, combine_to_long, compute_features_at_timeframe,
         add_prefix_to_features
     )
-    # New config system
+    # Config system
     from src.config.features import FeatureConfig, FeatureSpec, Timeframe
+    from src.config.parallel import ParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -371,20 +373,28 @@ def build_feature_universe(
     return indicators_by_symbol, targets_df, enhanced_mappings
 
 
-def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFrame], config: Dict[str, float] = None,
-                                    weight_min_clip: float = 0.01, weight_max_clip: float = 10.0) -> pd.DataFrame:
+def _generate_triple_barrier_targets(
+    indicators_by_symbol: Dict[str, pd.DataFrame],
+    config: Dict[str, float] = None,
+    weight_min_clip: float = 0.01,
+    weight_max_clip: float = 10.0,
+    parallel_config: Optional[ParallelConfig] = None
+) -> pd.DataFrame:
     """
     Convert indicators to long format and generate triple barrier targets in parallel.
-    
+
     Args:
         indicators_by_symbol: Dictionary of symbol DataFrames with features
         config: Triple barrier configuration dictionary
         weight_min_clip: Minimum weight value (prevents zero weights)
         weight_max_clip: Maximum weight value (prevents extreme weights)
-        
+        parallel_config: ParallelConfig for parallel processing
+
     Returns:
         DataFrame with triple barrier targets and combined weights
     """
+    if parallel_config is None:
+        parallel_config = ParallelConfig.default()
     # Convert to long format for target generation
     long_format_data = []
     
@@ -440,8 +450,12 @@ def _generate_triple_barrier_targets(indicators_by_symbol: Dict[str, pd.DataFram
                 f"max_horizon={config['max_horizon']}, start_every={config['start_every']}")
     
     # Generate targets in parallel with combined weights
-    targets_df = generate_targets_parallel(df_long, config, n_jobs=-1, chunk_size=32, 
-                                          weight_min_clip=weight_min_clip, weight_max_clip=weight_max_clip)
+    targets_df = generate_targets_parallel(
+        df_long, config,
+        weight_min_clip=weight_min_clip,
+        weight_max_clip=weight_max_clip,
+        parallel_config=parallel_config
+    )
     
     if not targets_df.empty:
         logger.info(f"Generated {len(targets_df)} triple barrier targets")
@@ -477,7 +491,8 @@ def compute_higher_timeframe_features(
     timeframes: List[str] = None,
     spy_symbol: str = "SPY",
     enhanced_mappings: Optional[Dict] = None,
-    n_jobs: int = -1
+    n_jobs: int = -1,
+    parallel_config: Optional[ParallelConfig] = None
 ) -> pd.DataFrame:
     """
     Compute features at higher timeframes (weekly/monthly) using unified TimeframeResampler.
@@ -490,19 +505,23 @@ def compute_higher_timeframe_features(
         timeframes: List of timeframes to compute ('W', 'M'). Default: ['W']
         spy_symbol: Market benchmark symbol
         enhanced_mappings: Enhanced sector mappings for relative strength
-        n_jobs: Number of parallel jobs (-1 for all cores)
+        n_jobs: Number of parallel jobs (deprecated, use parallel_config)
+        parallel_config: ParallelConfig for unified parallel processing
 
     Returns:
         Daily DataFrame with higher timeframe features merged in
     """
+    # Use ParallelConfig if provided
+    if parallel_config is None:
+        parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size=16)
+
     if timeframes is None:
         timeframes = ['W']
 
     logger.info(f"Computing higher timeframe features: {timeframes}")
 
-    # Initialize resampler with config
-    tf_config = TimeframeConfig(n_jobs=n_jobs, verbose=0)
-    resampler = TimeframeResampler(config=tf_config)
+    # Initialize resampler with ParallelConfig
+    resampler = TimeframeResampler(config=parallel_config)
 
     # Partition daily data by symbol
     daily_by_symbol = partition_by_symbol(daily_df, optimize_dtypes=True)
@@ -562,7 +581,7 @@ def compute_higher_timeframe_features(
                 higher_tf_data,
                 compute_tf_features,
                 tf_type,
-                config=tf_config
+                config=parallel_config
             )
 
             # Step 3: Add prefix to feature columns
@@ -599,7 +618,8 @@ def run_pipeline_v2(
     enhanced_mappings: Optional[Dict] = None,
     include_targets: bool = True,
     triple_barrier_config: Optional[Dict] = None,
-    n_jobs: int = -1
+    n_jobs: int = -1,
+    parallel_config: Optional[ParallelConfig] = None
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Simplified pipeline using new config system.
@@ -616,11 +636,16 @@ def run_pipeline_v2(
         enhanced_mappings: Enhanced sector mappings
         include_targets: Whether to generate triple barrier targets
         triple_barrier_config: Config for target generation
-        n_jobs: Number of parallel jobs
+        n_jobs: Number of parallel jobs (deprecated, use parallel_config)
+        parallel_config: ParallelConfig for unified parallel processing
 
     Returns:
         Tuple of (features_df, targets_df)
     """
+    # Use ParallelConfig if provided, otherwise create from n_jobs
+    if parallel_config is None:
+        parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size=16)
+
     if feature_config is None:
         feature_config = FeatureConfig.default()
 
@@ -629,6 +654,7 @@ def run_pipeline_v2(
 
     logger.info(f"Running pipeline v2 with {len(indicators_by_symbol)} symbols")
     logger.info(f"Timeframes: {timeframes}")
+    logger.info(f"Parallel config: {parallel_config.summary()}")
     logger.info(feature_config.summary())
 
     # Get enabled features
@@ -640,13 +666,19 @@ def run_pipeline_v2(
 
     # Step 1: Compute daily single-stock features (parallel)
     with profile_stage("Daily Single-Stock Features"):
-        results = Parallel(n_jobs=n_jobs, backend='loky')(
+        results = Parallel(
+            n_jobs=parallel_config.n_jobs,
+            backend=parallel_config.backend,
+            batch_size=parallel_config.batch_size,
+            verbose=parallel_config.verbose,
+            prefer=parallel_config.prefer
+        )(
             delayed(_feature_worker)(sym, df)
             for sym, df in indicators_by_symbol.items()
         )
         indicators_by_symbol = dict(results)
 
-    # Step 2: Compute cross-sectional features
+    # Step 2: Compute cross-sectional features (sequential - needs full universe)
     if enabled_cs:
         with profile_stage("Cross-Sectional Features"):
             compute_cross_sectional_features(
@@ -666,7 +698,7 @@ def run_pipeline_v2(
                 timeframes=higher_tfs,
                 spy_symbol=spy_symbol,
                 enhanced_mappings=enhanced_mappings,
-                n_jobs=n_jobs
+                parallel_config=parallel_config
             )
             # Convert back to dict format for subsequent steps
             indicators_by_symbol = partition_by_symbol(daily_df, optimize_dtypes=False)
@@ -675,7 +707,7 @@ def run_pipeline_v2(
     with profile_stage("NaN Interpolation"):
         indicators_by_symbol = interpolate_internal_gaps(
             indicators_by_symbol,
-            n_jobs=n_jobs
+            parallel_config=parallel_config
         )
 
     # Step 5: Generate targets (after all features computed and interpolated)
@@ -684,7 +716,8 @@ def run_pipeline_v2(
         with profile_stage("Triple Barrier Targets"):
             targets_df = _generate_triple_barrier_targets(
                 indicators_by_symbol,
-                triple_barrier_config
+                triple_barrier_config,
+                parallel_config=parallel_config
             )
 
     # Step 6: Convert to final long format

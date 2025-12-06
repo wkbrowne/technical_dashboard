@@ -11,17 +11,24 @@ Key design decisions:
 - Single-pass data partitioning (O(N) not O(N²))
 - Memory-efficient dtype optimization
 - Leakage-safe merge using merge_asof with direction='backward'
+- Unified ParallelConfig for consistent parallelization
 """
 
 import logging
 import time
-from typing import Dict, List, Optional, Tuple, Callable, Any
+from typing import Dict, List, Optional, Tuple, Callable, Any, Union
 from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+
+# Import ParallelConfig - with fallback for different import contexts
+try:
+    from ..config.parallel import ParallelConfig
+except ImportError:
+    from src.config.parallel import ParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +40,48 @@ class TimeframeType(str, Enum):
     MONTHLY = "M"
 
 
+# Keep TimeframeConfig for backward compatibility, but prefer ParallelConfig
 @dataclass
 class TimeframeConfig:
-    """Configuration for timeframe processing."""
+    """Configuration for timeframe processing (legacy, prefer ParallelConfig)."""
     n_jobs: int = -1
     backend: str = 'loky'
     batch_size: int = 1
     verbose: int = 0
     dtype_optimization: bool = True
     memory_limit_mb: int = 2048
+
+    @classmethod
+    def from_parallel_config(cls, pc: ParallelConfig) -> 'TimeframeConfig':
+        """Create TimeframeConfig from ParallelConfig."""
+        return cls(
+            n_jobs=pc.n_jobs,
+            backend=pc.backend,
+            batch_size=pc.batch_size,
+            verbose=pc.verbose
+        )
+
+
+def _get_parallel_params(config: Union[ParallelConfig, TimeframeConfig, None]) -> dict:
+    """Extract joblib Parallel parameters from config."""
+    if config is None:
+        config = ParallelConfig.default()
+    elif isinstance(config, TimeframeConfig):
+        # Convert legacy config
+        return {
+            'n_jobs': config.n_jobs,
+            'backend': config.backend,
+            'batch_size': config.batch_size,
+            'verbose': config.verbose,
+        }
+
+    return {
+        'n_jobs': config.n_jobs,
+        'backend': config.backend,
+        'batch_size': config.batch_size,
+        'verbose': config.verbose,
+        'prefer': getattr(config, 'prefer', 'processes'),
+    }
 
 
 class TimeframeResampler:
@@ -77,13 +117,27 @@ class TimeframeResampler:
         TimeframeType.MONTHLY: 'm_',
     }
 
-    def __init__(self, config: Optional[TimeframeConfig] = None):
+    def __init__(self, config: Union[ParallelConfig, TimeframeConfig, None] = None):
         """Initialize resampler with configuration.
 
         Args:
-            config: Optional configuration for parallel processing
+            config: ParallelConfig or legacy TimeframeConfig for parallel processing
         """
-        self.config = config or TimeframeConfig()
+        if config is None:
+            self.parallel_config = ParallelConfig.default()
+        elif isinstance(config, ParallelConfig):
+            self.parallel_config = config
+        else:
+            # Legacy TimeframeConfig
+            self.parallel_config = ParallelConfig(
+                n_jobs=config.n_jobs,
+                backend=config.backend,
+                batch_size=config.batch_size,
+                verbose=config.verbose
+            )
+
+        # Keep legacy attribute for backward compatibility
+        self.config = TimeframeConfig.from_parallel_config(self.parallel_config)
 
     @classmethod
     def resample_single(
@@ -200,12 +254,10 @@ class TimeframeResampler:
         logger.info(f"Resampling {len(daily_data)} symbols to {timeframe.value}")
         start_time = time.time()
 
+        params = _get_parallel_params(self.parallel_config)
+
         # Process in parallel
-        results = Parallel(
-            n_jobs=self.config.n_jobs,
-            backend=self.config.backend,
-            verbose=self.config.verbose
-        )(
+        results = Parallel(**params)(
             delayed(self._resample_symbol_safe)(symbol, df, timeframe)
             for symbol, df in daily_data.items()
         )
@@ -328,7 +380,7 @@ class TimeframeResampler:
         higher_tf_data: Dict[str, pd.DataFrame],
         timeframe: TimeframeType
     ) -> Dict[str, pd.DataFrame]:
-        """Merge higher timeframe features to daily data for multiple symbols.
+        """Merge higher timeframe features to daily data for multiple symbols (parallel).
 
         Args:
             daily_data: Dict mapping symbol -> daily DataFrame
@@ -341,22 +393,62 @@ class TimeframeResampler:
         logger.info(f"Merging {timeframe.value} features to daily for {len(daily_data)} symbols")
         start_time = time.time()
 
-        merged_data = {}
+        # Prepare merge tasks
+        merge_tasks = []
+        symbols_without_higher_tf = []
+
         for symbol, daily_df in daily_data.items():
             if symbol in higher_tf_data:
-                merged = self.merge_to_daily(
-                    daily_df,
-                    higher_tf_data[symbol],
-                    timeframe
-                )
-                merged_data[symbol] = merged
+                merge_tasks.append((symbol, daily_df, higher_tf_data[symbol]))
             else:
-                merged_data[symbol] = daily_df
+                symbols_without_higher_tf.append(symbol)
+
+        # Parallel merge
+        if merge_tasks:
+            params = _get_parallel_params(self.parallel_config)
+
+            results = Parallel(**params)(
+                delayed(_merge_single_symbol)(symbol, daily_df, htf_df, timeframe)
+                for symbol, daily_df, htf_df in merge_tasks
+            )
+
+            merged_data = dict(results)
+        else:
+            merged_data = {}
+
+        # Add symbols without higher timeframe data
+        for symbol in symbols_without_higher_tf:
+            merged_data[symbol] = daily_data[symbol]
 
         elapsed = time.time() - start_time
         logger.info(f"Merge completed in {elapsed:.2f}s")
 
         return merged_data
+
+
+def _merge_single_symbol(
+    symbol: str,
+    daily_df: pd.DataFrame,
+    higher_tf_df: pd.DataFrame,
+    timeframe: TimeframeType
+) -> Tuple[str, pd.DataFrame]:
+    """Merge higher TF features for a single symbol (for parallel execution).
+
+    Args:
+        symbol: Symbol identifier
+        daily_df: Daily DataFrame
+        higher_tf_df: Higher timeframe DataFrame
+        timeframe: The higher timeframe
+
+    Returns:
+        Tuple of (symbol, merged DataFrame)
+    """
+    try:
+        merged = TimeframeResampler.merge_to_daily(daily_df, higher_tf_df, timeframe)
+        return symbol, merged
+    except Exception as e:
+        logger.warning(f"Merge failed for {symbol}: {e}")
+        return symbol, daily_df
 
 
 def partition_by_symbol(
@@ -420,7 +512,7 @@ def compute_features_at_timeframe(
     data_dict: Dict[str, pd.DataFrame],
     feature_func: Callable[[pd.DataFrame], pd.DataFrame],
     timeframe: TimeframeType,
-    config: Optional[TimeframeConfig] = None,
+    config: Union[ParallelConfig, TimeframeConfig, None] = None,
     **feature_kwargs
 ) -> Dict[str, pd.DataFrame]:
     """Compute features for all symbols at a given timeframe.
@@ -429,13 +521,14 @@ def compute_features_at_timeframe(
         data_dict: Dict mapping symbol -> DataFrame at target timeframe
         feature_func: Function that computes features on a single DataFrame
         timeframe: The timeframe of the data
-        config: Processing configuration
+        config: ParallelConfig or legacy TimeframeConfig
         **feature_kwargs: Additional arguments passed to feature_func
 
     Returns:
         Dict mapping symbol -> DataFrame with features added
     """
-    config = config or TimeframeConfig()
+    if config is None:
+        config = ParallelConfig.default()
 
     logger.info(f"Computing features for {len(data_dict)} symbols at {timeframe.value}")
     start_time = time.time()
@@ -448,11 +541,9 @@ def compute_features_at_timeframe(
             logger.warning(f"Feature computation failed for {symbol}: {e}")
             return symbol, df
 
-    results = Parallel(
-        n_jobs=config.n_jobs,
-        backend=config.backend,
-        verbose=config.verbose
-    )(
+    params = _get_parallel_params(config)
+
+    results = Parallel(**params)(
         delayed(process_symbol)(symbol, df)
         for symbol, df in data_dict.items()
     )

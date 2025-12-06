@@ -28,6 +28,8 @@ from .features import (
     get_default_feature_config,
 )
 
+from .parallel import ParallelConfig
+
 # Import basic configuration settings
 import os
 from pathlib import Path
@@ -65,6 +67,8 @@ __all__ = [
     'FeatureSpec',
     'FeatureConfig',
     'get_default_feature_config',
+    # Parallel configuration
+    'ParallelConfig',
     # Global settings
     'CACHE_FILE',
     'PROJECT_ROOT',

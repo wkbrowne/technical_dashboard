@@ -126,7 +126,7 @@ def run_feature_pipeline(
     include_targets: bool = True,
     max_stocks: Optional[int] = None,
     n_jobs: int = -1,
-    use_unified_timeframe: bool = True
+    batch_size: int = 16
 ):
     """Run the feature computation pipeline.
 
@@ -138,15 +138,20 @@ def run_feature_pipeline(
         include_targets: Whether to compute triple barrier targets
         max_stocks: Maximum number of stocks to process
         n_jobs: Number of parallel jobs
-        use_unified_timeframe: Use unified TimeframeResampler (default: True)
+        batch_size: Number of symbols per parallel batch
     """
     from src.config.features import FeatureConfig, Timeframe
+    from src.config.parallel import ParallelConfig
     from src.pipelines.orchestrator import run_pipeline_v2, compute_higher_timeframe_features
     from src.features.single_stock import compute_single_stock_features
     from src.features.cross_sectional import compute_cross_sectional_features
     from src.features.postprocessing import interpolate_internal_gaps
     from src.features.timeframe import combine_to_long, partition_by_symbol
     from joblib import Parallel, delayed
+
+    # Create unified parallel config
+    parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size=batch_size)
+    logger.info(f"Parallel config: {parallel_config.summary()}")
 
     start_time = time.time()
 
@@ -198,7 +203,7 @@ def run_feature_pipeline(
             feature_config=config,
             timeframes=timeframes,
             include_targets=include_targets,
-            n_jobs=n_jobs
+            parallel_config=parallel_config
         )
 
         # Save features
@@ -318,14 +323,15 @@ Examples:
         help="Number of parallel jobs (default: -1 for all cores)"
     )
     parser.add_argument(
+        "--batch-size", "-b",
+        type=int,
+        default=16,
+        help="Symbols per parallel batch (default: 16). Larger = less IPC overhead, more memory"
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose logging"
-    )
-    parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help="Use legacy weekly implementation instead of unified TimeframeResampler"
     )
 
     args = parser.parse_args()
@@ -349,7 +355,7 @@ Examples:
         include_targets=not args.no_targets,
         max_stocks=args.max_stocks,
         n_jobs=args.n_jobs,
-        use_unified_timeframe=not args.legacy
+        batch_size=args.batch_size
     )
 
 

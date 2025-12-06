@@ -5,10 +5,16 @@ This module contains functions for handling missing values, outliers, and
 other data quality issues in the computed feature datasets.
 """
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+
+# Import ParallelConfig - with fallback for different import contexts
+try:
+    from ..config.parallel import ParallelConfig
+except ImportError:
+    from src.config.parallel import ParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -62,25 +68,29 @@ def _interpolate_single_symbol(symbol: str, df: pd.DataFrame) -> Tuple[str, pd.D
 
 
 def interpolate_internal_gaps(
-    indicators_by_symbol: Dict[str, pd.DataFrame], 
+    indicators_by_symbol: Dict[str, pd.DataFrame],
     n_jobs: int = -1,
-    batch_size: int = 32
+    batch_size: int = 16,
+    parallel_config: Optional[ParallelConfig] = None
 ) -> Dict[str, pd.DataFrame]:
     """
     Interpolate internal NaN gaps in numeric columns only using parallel processing.
-    
+
     This function fills NaN values that are strictly between observed values,
     without filling leading or trailing NaNs. This preserves data integrity
     by only filling gaps in continuous time series data.
-    
+
     Args:
         indicators_by_symbol: Dictionary mapping symbol -> DataFrame
         n_jobs: Number of parallel jobs (-1 for all cores, 1 for sequential)
+                Deprecated: Use parallel_config instead
         batch_size: Number of symbols to process per batch
-        
+                    Deprecated: Use parallel_config instead
+        parallel_config: ParallelConfig for parallel processing settings
+
     Returns:
         Dictionary with same structure but interpolated DataFrames
-        
+
     Notes:
         - Only fills NaNs that are bounded by non-NaN values (limit_area='inside')
         - Uses 'time' interpolation for datetime indexes, 'linear' for others
@@ -88,23 +98,35 @@ def interpolate_internal_gaps(
         - Works only on numeric columns, preserves other column types
         - Parallelized for improved performance with large symbol counts
     """
+    # Use ParallelConfig if provided, otherwise fall back to legacy params
+    if parallel_config is not None:
+        n_jobs = parallel_config.n_jobs
+        batch_size = parallel_config.batch_size
+        backend = parallel_config.backend
+        verbose = parallel_config.verbose
+        prefer = parallel_config.prefer
+    else:
+        backend = 'loky'
+        verbose = 1
+        prefer = 'processes'
+
     if not indicators_by_symbol:
         logger.info("No symbols to interpolate")
         return indicators_by_symbol
-    
+
     logger.info(f"Interpolating internal NaN gaps for {len(indicators_by_symbol)} symbols "
-               f"(parallel processing: {n_jobs} jobs, batch size: {batch_size})...")
-    
+               f"(n_jobs={n_jobs}, batch_size={batch_size})...")
+
     # Filter out empty/None DataFrames before processing
-    valid_symbols = [(sym, df) for sym, df in indicators_by_symbol.items() 
+    valid_symbols = [(sym, df) for sym, df in indicators_by_symbol.items()
                     if df is not None and not df.empty]
-    
+
     if not valid_symbols:
         logger.info("No valid symbols with data to interpolate")
         return indicators_by_symbol
-    
+
     logger.debug(f"Processing {len(valid_symbols)} valid symbols out of {len(indicators_by_symbol)} total")
-    
+
     # Use sequential processing if n_jobs=1 or small dataset
     if n_jobs == 1 or len(valid_symbols) < 10:
         logger.info("Using sequential processing for interpolation")
@@ -118,10 +140,10 @@ def interpolate_internal_gaps(
         try:
             results = Parallel(
                 n_jobs=n_jobs,
-                backend='loky',
+                backend=backend,
                 batch_size=batch_size,
-                verbose=1,
-                prefer="processes"
+                verbose=verbose,
+                prefer=prefer
             )(
                 delayed(_interpolate_single_symbol)(symbol, df)
                 for symbol, df in valid_symbols
@@ -132,23 +154,23 @@ def interpolate_internal_gaps(
             for symbol, df in valid_symbols:
                 result = _interpolate_single_symbol(symbol, df)
                 results.append(result)
-    
+
     # Reconstruct the dictionary with processed DataFrames
     processed_dict = indicators_by_symbol.copy()  # Start with original (includes empty/None)
-    
+
     total_filled = 0
     successful_symbols = 0
-    
+
     for symbol, processed_df, filled_count in results:
         processed_dict[symbol] = processed_df
         total_filled += filled_count
         if filled_count > 0:
             successful_symbols += 1
-    
+
     logger.info(f"Interpolation complete. Symbols processed: {len(results)} | "
                f"Symbols with fills: {successful_symbols} | "
                f"Total values filled: {total_filled:,}")
-    
+
     return processed_dict
 
 

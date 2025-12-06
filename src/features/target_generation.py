@@ -6,10 +6,16 @@ barriers based on ATR (Average True Range). Each target represents a potential t
 with upper/lower barriers and time horizon constraints.
 """
 import logging
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Union
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+
+# Import ParallelConfig - with fallback for different import contexts
+try:
+    from ..config.parallel import ParallelConfig
+except ImportError:
+    from src.config.parallel import ParallelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -445,9 +451,10 @@ def generate_targets_parallel(
     df: pd.DataFrame,
     config: Dict,
     n_jobs: int = -1,
-    chunk_size: int = 25,
+    chunk_size: int = 16,
     weight_min_clip: float = 0.01,
-    weight_max_clip: float = 10.0
+    weight_max_clip: float = 10.0,
+    parallel_config: Optional[ParallelConfig] = None
 ) -> pd.DataFrame:
     """
     Chunk long-format data by symbol and run target generation in parallel.
@@ -456,67 +463,83 @@ def generate_targets_parallel(
         df: Long-format DataFrame with columns ['symbol', 'date', 'close', 'high', 'low', 'atr']
         config: Triple barrier config dictionary with keys:
                 - up_mult: Upper barrier multiplier
-                - dn_mult: Lower barrier multiplier  
+                - dn_mult: Lower barrier multiplier
                 - max_horizon: Maximum days to track each target
                 - start_every: Minimum days between new targets
         n_jobs: Number of parallel workers (-1 = all cores)
+                Deprecated: Use parallel_config instead
         chunk_size: Number of symbols per parallel chunk
+                    Deprecated: Use parallel_config.batch_size instead
         weight_min_clip: Minimum weight value (prevents zero weights)
         weight_max_clip: Maximum weight value (prevents extreme weights)
+        parallel_config: ParallelConfig for parallel processing settings
 
     Returns:
         Combined DataFrame with triple barrier targets for all symbols
     """
+    # Use ParallelConfig if provided, otherwise fall back to legacy params
+    if parallel_config is not None:
+        n_jobs = parallel_config.n_jobs
+        chunk_size = parallel_config.batch_size
+        backend = parallel_config.backend
+        verbose = parallel_config.verbose
+        prefer = parallel_config.prefer
+    else:
+        backend = 'loky'
+        verbose = 1
+        prefer = 'processes'
+
     if df.empty:
         logger.warning("Empty DataFrame provided to generate_targets_parallel")
         return pd.DataFrame()
-    
+
     # Validate required columns
     required_cols = {'symbol', 'date', 'close', 'high', 'low', 'atr'}
     missing_cols = required_cols - set(df.columns)
     if missing_cols:
         raise ValueError(f"Missing required columns for parallel target generation: {missing_cols}")
-    
+
     # Get unique symbols and create chunks
     unique_symbols = df['symbol'].dropna().unique()
     if len(unique_symbols) == 0:
         logger.warning("No valid symbols found in DataFrame")
         return pd.DataFrame()
-    
+
     # Create symbol chunks
     symbol_chunks = [
-        unique_symbols[i:i + chunk_size].tolist() 
+        unique_symbols[i:i + chunk_size].tolist()
         for i in range(0, len(unique_symbols), chunk_size)
     ]
-    
-    logger.info(f"Processing {len(unique_symbols)} symbols in {len(symbol_chunks)} chunks of size {chunk_size}")
-    
+
+    logger.info(f"Processing {len(unique_symbols)} symbols in {len(symbol_chunks)} chunks "
+                f"(n_jobs={n_jobs}, batch_size={chunk_size})")
+
     # Process chunks in parallel
     try:
         results = Parallel(
-            n_jobs=n_jobs, 
-            backend='loky', 
-            verbose=1, 
-            prefer="processes"
+            n_jobs=n_jobs,
+            backend=backend,
+            verbose=verbose,
+            prefer=prefer
         )(
-            delayed(_process_symbol_group)(df, config, chunk, weight_min_clip, weight_max_clip) 
+            delayed(_process_symbol_group)(df, config, chunk, weight_min_clip, weight_max_clip)
             for chunk in symbol_chunks
         )
-        
+
         # Filter out empty results and concatenate
         valid_results = [result for result in results if not result.empty]
-        
+
         if not valid_results:
             logger.warning("No valid targets generated from any chunks")
             return pd.DataFrame()
-        
+
         # Combine all results
         combined_targets = pd.concat(valid_results, ignore_index=True)
-        
+
         logger.info(f"Generated {len(combined_targets)} total targets across {len(valid_results)} chunks")
-        
+
         return combined_targets
-        
+
     except Exception as e:
         logger.error(f"Error in parallel target generation: {e}")
         raise
