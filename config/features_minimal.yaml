@@ -1,0 +1,87 @@
+# Minimal Feature Configuration
+# ==============================
+# A reduced feature set for fast iteration and testing.
+# Use this when you want quick compute times.
+
+nan_handling: preserve
+min_valid_ratio: 0.5
+
+features:
+
+  # Core trend features only
+  trend_ma:
+    category: trend
+    timeframes: [D]
+    enabled: true
+    description: "Basic moving average features"
+    params:
+      ma_periods: [20, 50, 200]
+      slope_window: 20
+      eps: 0.00001
+
+  # Single RSI period
+  rsi:
+    category: momentum
+    timeframes: [D]
+    enabled: true
+    description: "RSI-14 only"
+    params:
+      periods: [14]
+
+  # Basic volatility
+  volatility:
+    category: volatility
+    timeframes: [D]
+    enabled: true
+    description: "Single-scale volatility"
+    params:
+      short_windows: [20]
+      long_windows: [60]
+      z_window: 60
+      ema_span: 10
+      slope_win: 20
+
+  # ATR only (needed for targets)
+  range_breakout:
+    category: range
+    timeframes: [D]
+    enabled: true
+    description: "ATR feature for targets"
+    params:
+      win_list: [10]
+
+  # Disable all cross-sectional for speed
+  volatility_cs:
+    category: cross_sectional
+    timeframes: [D]
+    enabled: false
+    requires_cross_sectional: true
+    params: {}
+
+  alpha:
+    category: alpha
+    timeframes: [D]
+    enabled: false
+    requires_cross_sectional: true
+    params: {}
+
+  relative_strength:
+    category: relative_strength
+    timeframes: [D]
+    enabled: false
+    requires_cross_sectional: true
+    params: {}
+
+  breadth:
+    category: breadth
+    timeframes: [D]
+    enabled: false
+    requires_cross_sectional: true
+    params: {}
+
+  xsec_momentum:
+    category: cross_sectional
+    timeframes: [D]
+    enabled: false
+    requires_cross_sectional: true
+    params: {}

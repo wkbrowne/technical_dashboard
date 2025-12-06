@@ -12,37 +12,96 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _bayesian_linear_slope(series: pd.Series, window: int, alpha: float = 0.01) -> pd.Series:
+    """
+    Calculate rolling Bayesian linear regression slope with L2 regularization.
+
+    Uses ridge regression (L2 regularization) which is equivalent to Bayesian linear
+    regression with a Gaussian prior on the slope parameter.
+
+    Args:
+        series: Input time series
+        window: Rolling window size
+        alpha: Regularization strength (smaller = less regularization)
+               Default 0.01 provides slight regularization without over-smoothing
+
+    Returns:
+        Rolling slope series (per-period change)
+    """
+    def compute_ridge_slope(y):
+        """Compute regularized slope for a window of data."""
+        if len(y) < 3 or pd.isna(y).all():
+            return np.nan
+
+        # Remove NaNs
+        mask = ~pd.isna(y)
+        y_clean = y[mask].values
+        if len(y_clean) < 3:
+            return np.nan
+
+        # X = time indices (0, 1, 2, ..., n-1)
+        X = np.arange(len(y_clean)).reshape(-1, 1)
+
+        # Center X and y for numerical stability
+        X_mean = X.mean()
+        y_mean = y_clean.mean()
+        X_centered = X - X_mean
+        y_centered = y_clean - y_mean
+
+        # Ridge regression (Bayesian linear regression with Gaussian prior)
+        # slope = (X'X + alpha*I)^-1 X'y
+        XtX = X_centered.T @ X_centered
+        Xty = X_centered.T @ y_centered
+
+        # Add regularization to diagonal (L2 penalty / Gaussian prior)
+        slope = Xty / (XtX + alpha)
+
+        return float(slope[0, 0])
+
+    # Apply rolling window
+    return series.rolling(window, min_periods=max(3, window // 2)).apply(
+        compute_ridge_slope, raw=False
+    )
+
+
 def _compute_relative_strength_block(
-    price: pd.Series, 
-    bench: pd.Series, 
-    look: int = 60, 
-    slope_win: int = 20
+    price: pd.Series,
+    bench: pd.Series,
+    look: int = 60,
+    slope_win: int = 10,
+    slope_alpha: float = 0.01
 ) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """
     Compute relative strength metrics for a single price series vs benchmark.
-    
+
     Args:
         price: Price series for the security
         bench: Benchmark price series
         look: Lookback window for RS normalization
-        slope_win: Window for computing RS slope
-        
+        slope_win: Window for computing RS slope (in periods, default 10)
+        slope_alpha: Regularization strength for Bayesian slope (default 0.01)
+
     Returns:
-        Tuple of (raw_rs, normalized_rs, rs_slope)
+        Tuple of (raw_rs, normalized_rs, rs_slope) where:
+        - raw_rs: Price / benchmark price ratio
+        - normalized_rs: Current RS vs rolling mean RS (mean-centered)
+        - rs_slope: Bayesian linear regression slope of log(RS) per period
     """
     # Align benchmark to price index and handle missing values
     bench_aligned = pd.to_numeric(bench.reindex(price.index), errors='coerce').replace(0, np.nan)
-    
+
     # Raw relative strength ratio
     rs = price / bench_aligned
-    
+
     # Normalized RS: (current_rs / rolling_mean_rs) - 1
     roll = rs.rolling(look, min_periods=max(5, look//3)).mean()
     rs_norm = (rs / roll) - 1.0
-    
-    # RS slope: change in RS over slope_win periods, normalized per period
-    rs_slope = (rs - rs.shift(slope_win)) / float(slope_win)
-    
+
+    # RS slope: Bayesian linear regression on log(RS) with regularization
+    # Gives smoothed, robust estimate of trend in relative performance
+    log_rs = np.log(rs.replace(0, np.nan))
+    rs_slope = _bayesian_linear_slope(log_rs, window=slope_win, alpha=slope_alpha)
+
     return rs.astype('float32'), rs_norm.astype('float32'), rs_slope.astype('float32')
 
 

@@ -4,6 +4,11 @@ Main orchestration pipeline for feature computation.
 This module contains the high-level workflow that coordinates data loading,
 feature computation, and output generation. It includes parallel processing
 of individual symbols and cross-sectional feature computation.
+
+Refactored to use:
+- FeatureConfig for feature selection and toggling
+- TimeframeResampler for unified D/W/M handling
+- Feature registry for dynamic feature instantiation
 """
 import logging
 import os
@@ -12,7 +17,7 @@ import warnings
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -22,41 +27,49 @@ from joblib import Parallel, delayed
 try:
     # Try relative imports first (when run as module)
     from ..features.assemble import assemble_indicators_from_wide
-    from ..features.trend import add_trend_features, add_rsi_features, add_macd_features
-    from ..features.volatility import add_multiscale_vol_regime, add_vol_regime_cs_context
-    from ..features.hurst import add_hurst_features
-    from ..features.distance import add_distance_to_ma_features
-    from ..features.range_breakout import add_range_breakout_features
-    from ..features.volume import add_volume_features, add_volume_shock_features
-    from ..features.relstrength import add_relative_strength
-    from ..features.alpha import add_alpha_momentum_features
-    from ..features.breadth import add_breadth_series
-    from ..features.xsec import add_xsec_momentum_panel
-    from ..features.postprocessing import interpolate_internal_gaps
+    from ..features.single_stock import compute_single_stock_features
+    from ..features.cross_sectional import compute_cross_sectional_features
+    from ..features.postprocessing import interpolate_internal_gaps, drop_rows_with_excessive_nans
     from ..features.ohlc_adjustment import adjust_ohlc_to_adjclose
     from ..features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
     from ..features.target_generation import generate_targets_parallel
-    from ..features.weekly import add_weekly_features_to_daily
     from ..features.lagging import apply_configurable_lags
+    # New unified timeframe handler
+    from ..features.timeframe import (
+        TimeframeResampler, TimeframeType, TimeframeConfig,
+        partition_by_symbol, combine_to_long, compute_features_at_timeframe,
+        add_prefix_to_features
+    )
+    # New config system
+    from ..config.features import FeatureConfig, FeatureSpec, Timeframe
+    # Legacy imports for backward compatibility
+    from ..features.weekly import add_weekly_features_to_daily
+    from ..features.weekly_enhanced import add_weekly_features_to_daily_enhanced, ChunkProcessingConfig
+    from ..features.weekly_optimized import add_weekly_features_to_daily_optimized, OptimizedWeeklyConfig
+    from ..features.weekly_multiprocessing import add_weekly_features_to_daily_multiprocessing, MultiprocessingConfig
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.assemble import assemble_indicators_from_wide
-    from src.features.trend import add_trend_features, add_rsi_features, add_macd_features
-    from src.features.volatility import add_multiscale_vol_regime, add_vol_regime_cs_context
-    from src.features.hurst import add_hurst_features
-    from src.features.distance import add_distance_to_ma_features
-    from src.features.range_breakout import add_range_breakout_features
-    from src.features.volume import add_volume_features, add_volume_shock_features
-    from src.features.relstrength import add_relative_strength
-    from src.features.alpha import add_alpha_momentum_features
-    from src.features.breadth import add_breadth_series
-    from src.features.xsec import add_xsec_momentum_panel
-    from src.features.postprocessing import interpolate_internal_gaps
+    from src.features.single_stock import compute_single_stock_features
+    from src.features.cross_sectional import compute_cross_sectional_features
+    from src.features.postprocessing import interpolate_internal_gaps, drop_rows_with_excessive_nans
     from src.features.ohlc_adjustment import adjust_ohlc_to_adjclose
     from src.features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
     from src.features.target_generation import generate_targets_parallel
-    from src.features.weekly import add_weekly_features_to_daily
     from src.features.lagging import apply_configurable_lags
+    # New unified timeframe handler
+    from src.features.timeframe import (
+        TimeframeResampler, TimeframeType, TimeframeConfig,
+        partition_by_symbol, combine_to_long, compute_features_at_timeframe,
+        add_prefix_to_features
+    )
+    # New config system
+    from src.config.features import FeatureConfig, FeatureSpec, Timeframe
+    # Legacy imports for backward compatibility
+    from src.features.weekly import add_weekly_features_to_daily
+    from src.features.weekly_enhanced import add_weekly_features_to_daily_enhanced, ChunkProcessingConfig
+    from src.features.weekly_optimized import add_weekly_features_to_daily_optimized, OptimizedWeeklyConfig
+    from src.features.weekly_multiprocessing import add_weekly_features_to_daily_multiprocessing, MultiprocessingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -134,109 +147,37 @@ def _set_profiling_enabled(enabled: bool):
     _profiling_enabled = enabled
 
 
-def _feature_worker(sym: str, df: pd.DataFrame, cs_ratio_median: Optional[pd.Series] = None) -> Tuple[str, pd.DataFrame]:
+def _feature_worker(sym: str, df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     """
     Core feature computation worker for a single symbol.
-    
-    This function runs the complete feature stack for one symbol, including:
-    - Trend features (MA slopes, agreement, etc.)
-    - Multi-scale volatility regime features
-    - Hurst exponent features
-    - Distance-to-MA features
-    - Range/breakout features (including ATR14)
-    - Volume features and shocks
-    
+
+    This function runs the complete single-stock feature stack, including:
+    - OHLC adjustment to match adjusted close
+    - All single-stock features (trend, volatility, distance, range, volume, etc.)
+
+    Note: Cross-sectional features (volatility context, relative strength, etc.)
+    are added separately after all symbols are processed.
+
     Args:
         sym: Symbol ticker
         df: Input DataFrame with OHLCV data
-        cs_ratio_median: Cross-sectional median of volatility ratios (optional)
-        
+
     Returns:
         Tuple of (symbol, enriched_dataframe)
     """
     try:
         logger.debug(f"Processing features for {sym}")
-        out = df.copy()
 
-        # 0) First: Adjust OHLC to match adjusted close for consistent price data
-        out = adjust_ohlc_to_adjclose(out)
+        # First: Adjust OHLC to match adjusted close for consistent price data
+        out = adjust_ohlc_to_adjclose(df)
 
-        # Ensure returns exist (calculated from adjclose for consistency)
-        if "ret" not in out.columns:
-            if "adjclose" in out.columns:
-                out["ret"] = np.log(pd.to_numeric(out["adjclose"], errors="coerce")).diff()
-            else:
-                logger.warning(f"{sym}: No adjclose column for returns calculation")
-                return sym, out
-        else:
-            # Recalculate returns from adjclose to ensure consistency after OHLC adjustment
-            if "adjclose" in out.columns:
-                out["ret"] = np.log(pd.to_numeric(out["adjclose"], errors="coerce")).diff()
-
-        # 1) Trend features (MA slopes, agreement, etc.)
-        out = add_trend_features(
+        # Compute all single-stock features using the centralized function
+        out = compute_single_stock_features(
             out,
-            src_col='adjclose',
-            ma_periods=(10, 20, 30, 50, 75, 100, 150, 200),
-            slope_window=20,
-            eps=1e-5
-        )
-
-        # 1.5) RSI features (momentum oscillator)
-        out = add_rsi_features(
-            out,
-            src_col='adjclose',
-            periods=(14, 21, 30)
-        )
-
-        # 1.6) MACD features (histogram and derivative)
-        out = add_macd_features(
-            out,
-            src_col='adjclose',
-            fast=12,
-            slow=26,
-            signal=9,
-            derivative_ema_span=3
-        )
-
-        # 2) Enhanced multi-scale vol regime
-        out = add_multiscale_vol_regime(
-            out,
-            ret_col="ret",
-            short_windows=(10, 20),
-            long_windows=(60, 100),
-            z_window=60,
-            ema_span=10,
-            slope_win=20,
-            cs_ratio_median=cs_ratio_median,  # Will be None on first pass
-        )
-
-        # 3) Hurst exponent features
-        out = add_hurst_features(out, ret_col="ret", windows=(64, 128), ema_halflife=5)
-
-        # 4) Distance-to-MA + z-scores
-        out = add_distance_to_ma_features(
-            out,
-            src_col='adjclose',
-            ma_lengths=(20, 50, 100, 200),
-            z_window=60
-        )
-
-        # 5) Range / breakout features
-        out = add_range_breakout_features(out, win_list=(5, 10, 20))
-
-        # 6) Volume features
-        out = add_volume_features(out)
-
-        # 7) Volume shock + alignment features
-        out = add_volume_shock_features(
-            out,
-            vol_col="volume",
-            price_col_primary="close",
-            price_col_fallback="adjclose",
-            lookback=20,
-            ema_span=10,
-            prefix="volshock"
+            price_col='adjclose',
+            ret_col='ret',
+            vol_col='volume',
+            ensure_returns=True
         )
 
         logger.debug(f"Completed feature processing for {sym}")
@@ -296,6 +237,12 @@ def build_feature_universe(
         from ...data.loader import load_stock_universe, load_etf_universe
     except ImportError:
         from src.data.loader import load_stock_universe, load_etf_universe
+
+    # Import new pipeline runner
+    try:
+        from ..features.runner import run_pipeline_parallel
+    except ImportError:
+        from src.features.runner import run_pipeline_parallel
 
     # Set defaults - keep as None to use loader's DEFAULT_ETFS
     # default_etfs parameter is passed through to load_etf_universe()
@@ -360,79 +307,66 @@ def build_feature_universe(
         
         logger.info(f"Enhanced mappings completed: {len(enhanced_mappings)} symbols mapped")
 
-    # 3) Core features (parallelized)
+    # 3) Core features (parallelized using new pipeline)
     with profile_stage("Core Feature Computation"):
-        logger.info(f"Processing {len(indicators_by_symbol)} symbols in parallel...")
-        results = Parallel(
-            n_jobs=max(1, (os.cpu_count() or 4) - 1),
-            backend="loky",
-            batch_size=8,
-            verbose=0,
-        )(
-            delayed(_feature_worker)(sym, df) for sym, df in indicators_by_symbol.items()
+        logger.info(f"Processing {len(indicators_by_symbol)} symbols in parallel using FeaturePipeline...")
+        
+        # Convert combined DataFrame back to dict for pipeline if needed, 
+        # but run_pipeline_parallel takes a dict.
+        
+        # Run the new pipeline
+        combined_features_df = run_pipeline_parallel(
+            indicators_by_symbol,
+            config={}, # Pass any config if needed
+            n_jobs=max(1, (os.cpu_count() or 4) - 1)
         )
-
-        indicators_by_symbol = {sym: df for sym, df in results}
+        
+        # Convert back to dict for compatibility with downstream steps (cross-sectional, etc.)
+        # The new pipeline returns a single combined DataFrame, but existing logic expects a dict.
+        # We need to pivot or split it back.
+        
+        indicators_by_symbol = {}
+        if not combined_features_df.empty:
+            for sym, group in combined_features_df.groupby('symbol'):
+                # Set date as index again
+                if 'date' in group.columns:
+                    group = group.set_index('date')
+                indicators_by_symbol[sym] = group
+        
         logger.info(f"Core features completed for {len(indicators_by_symbol)} symbols")
 
-    # 4-8) Cross-sectional features (grouped for profiling)
+    # 4) Cross-sectional features (all computed together)
     with profile_stage("Cross-Sectional Features"):
-        # 4) Cross-sectional volatility regime context
-        logger.info("Adding cross-sectional volatility regime context...")
-        add_vol_regime_cs_context(indicators_by_symbol)
-
-        # 5) Alpha-momentum features
-        logger.info("Adding alpha-momentum features...")
-        add_alpha_momentum_features(
+        compute_cross_sectional_features(
             indicators_by_symbol,
             sectors=sectors,
             sector_to_etf=sector_to_etf,
             market_symbol=spy_symbol,
+            sp500_tickers=sp500_tickers,
+            enhanced_mappings=enhanced_mappings,
             beta_win=60,
-            windows=(20, 60, 120),
-            ema_span=10
+            alpha_windows=(20, 60, 120),
+            alpha_ema_span=10,
+            xsec_lookbacks=(5, 20, 60),
+            price_col="adjclose"
         )
 
-        # 6) Relative strength vs SPY, sectors, and subsectors
-        logger.info("Adding relative strength features...")
-        add_relative_strength(
-            indicators_by_symbol, 
-            sectors=sectors, 
-            sector_to_etf=sector_to_etf, 
-            spy_symbol=spy_symbol,
-            enhanced_mappings=enhanced_mappings
-        )
-
-        # 7) Breadth features
-        if sp500_tickers:
-            logger.info("Adding breadth series...")
-            add_breadth_series(indicators_by_symbol, sp500_tickers)
-
-        # 8) Cross-sectional momentum
-        logger.info("Adding cross-sectional momentum features...")
-        add_xsec_momentum_panel(
-            indicators_by_symbol,
-            lookbacks=(5, 20, 60),
-            price_col="adjclose",
-            sector_map=sectors
-        )
-
-    # 9) Generate triple barrier targets (parallel)
+    # 5) Generate triple barrier targets (parallel)
     with profile_stage("Triple Barrier Target Generation"):
         logger.info("Generating triple barrier targets...")
-        targets_df = _generate_triple_barrier_targets(indicators_by_symbol, triple_barrier_config, 
+        targets_df = _generate_triple_barrier_targets(indicators_by_symbol, triple_barrier_config,
                                                      weight_min_clip, weight_max_clip)
-    
-    # 10) Interpolate internal gaps (NaNs between observed values only) - parallelized
+
+    # 6) Interpolate internal gaps (NaNs between observed values only) - parallelized
     with profile_stage("NaN Interpolation"):
         logger.info(f"Starting NaN interpolation (n_jobs={interpolation_n_jobs})...")
         indicators_by_symbol = interpolate_internal_gaps(
-            indicators_by_symbol, 
+            indicators_by_symbol,
             n_jobs=interpolation_n_jobs,
             batch_size=32  # Process 32 symbols per batch
         )
 
-    # 11) Apply configurable feature lags (optional)
+    # 7) Apply configurable feature lags (optional)
     if (daily_lags and len(daily_lags) > 0) or (weekly_lags and len(weekly_lags) > 0):
         with profile_stage("Feature Lag Application"):
             logger.info("Applying configurable feature lags...")
@@ -534,18 +468,237 @@ def _log_target_class_distribution(targets_df: pd.DataFrame) -> None:
     if targets_df.empty:
         logger.info("No targets generated for class distribution analysis")
         return
-    
+
     hit_counts = targets_df['hit'].value_counts().sort_index()
     total_targets = len(targets_df)
-    
+
     logger.info("Triple Barrier Target Class Distribution:")
     logger.info(f"  Total targets: {total_targets:,}")
-    
+
     for hit_value in [-1, 0, 1]:
         count = hit_counts.get(hit_value, 0)
         percentage = (count / total_targets * 100) if total_targets > 0 else 0
         class_name = {-1: "Lower barrier hit", 0: "Time expired", 1: "Upper barrier hit"}[hit_value]
         logger.info(f"  {class_name}: {count:,} ({percentage:.1f}%)")
+
+
+def compute_higher_timeframe_features(
+    daily_df: pd.DataFrame,
+    timeframes: List[str] = None,
+    spy_symbol: str = "SPY",
+    enhanced_mappings: Optional[Dict] = None,
+    n_jobs: int = -1
+) -> pd.DataFrame:
+    """
+    Compute features at higher timeframes (weekly/monthly) using unified TimeframeResampler.
+
+    This function replaces the complex fallback chain of weekly implementations with
+    a single, clean implementation using the new TimeframeResampler.
+
+    Args:
+        daily_df: Long-format daily DataFrame with features
+        timeframes: List of timeframes to compute ('W', 'M'). Default: ['W']
+        spy_symbol: Market benchmark symbol
+        enhanced_mappings: Enhanced sector mappings for relative strength
+        n_jobs: Number of parallel jobs (-1 for all cores)
+
+    Returns:
+        Daily DataFrame with higher timeframe features merged in
+    """
+    if timeframes is None:
+        timeframes = ['W']
+
+    logger.info(f"Computing higher timeframe features: {timeframes}")
+
+    # Initialize resampler with config
+    tf_config = TimeframeConfig(n_jobs=n_jobs, verbose=0)
+    resampler = TimeframeResampler(config=tf_config)
+
+    # Partition daily data by symbol
+    daily_by_symbol = partition_by_symbol(daily_df, optimize_dtypes=True)
+
+    result_df = daily_df.copy()
+
+    for tf_str in timeframes:
+        tf_type = TimeframeType.WEEKLY if tf_str == 'W' else TimeframeType.MONTHLY
+        prefix = 'w_' if tf_str == 'W' else 'm_'
+
+        logger.info(f"Processing {tf_str} timeframe...")
+
+        try:
+            # Step 1: Resample to higher timeframe
+            higher_tf_data = resampler.resample_symbols(daily_by_symbol, tf_type)
+
+            if not higher_tf_data:
+                logger.warning(f"No data resampled for {tf_str} timeframe")
+                continue
+
+            # Step 2: Compute features at higher timeframe
+            def compute_tf_features(df: pd.DataFrame) -> pd.DataFrame:
+                """Compute basic features for higher timeframe."""
+                result = df.copy()
+                close = pd.to_numeric(result['close'], errors='coerce')
+
+                if len(close.dropna()) < 10:
+                    return result
+
+                # RSI
+                try:
+                    import pandas_ta as ta
+                    for period in [14, 21]:
+                        rsi = ta.rsi(close, length=period)
+                        if rsi is not None:
+                            result[f'rsi_{period}'] = rsi.astype('float32')
+                except Exception:
+                    pass
+
+                # SMAs and distance
+                for period in [20, 50]:
+                    sma = close.rolling(period, min_periods=period//2).mean()
+                    result[f'sma{period}'] = sma.astype('float32')
+                    if sma is not None:
+                        dist = (close - sma) / sma
+                        result[f'dist_sma{period}'] = dist.astype('float32')
+
+                # Trend slope
+                for period in [20]:
+                    if f'sma{period}' in result.columns:
+                        slope = result[f'sma{period}'].diff(4) / result[f'sma{period}'].shift(4)
+                        result[f'sma{period}_slope'] = slope.astype('float32')
+
+                return result
+
+            higher_tf_features = compute_features_at_timeframe(
+                higher_tf_data,
+                compute_tf_features,
+                tf_type,
+                config=tf_config
+            )
+
+            # Step 3: Add prefix to feature columns
+            for symbol, df in higher_tf_features.items():
+                higher_tf_features[symbol] = add_prefix_to_features(df, prefix)
+
+            # Step 4: Merge back to daily (need to work with result_df)
+            # Convert result_df to dict, merge, then convert back
+            result_by_symbol = partition_by_symbol(result_df, optimize_dtypes=False)
+            merged_by_symbol = resampler.merge_symbols_to_daily(
+                result_by_symbol,
+                higher_tf_features,
+                tf_type
+            )
+
+            # Combine back to long format
+            result_df = combine_to_long(merged_by_symbol)
+
+            feature_count = len([c for c in result_df.columns if c.startswith(prefix)])
+            logger.info(f"Added {feature_count} {tf_str} features")
+
+        except Exception as e:
+            logger.error(f"Failed to compute {tf_str} features: {e}")
+            logger.info(f"Continuing without {tf_str} features...")
+
+    return result_df
+
+
+def run_pipeline_v2(
+    indicators_by_symbol: Dict[str, pd.DataFrame],
+    feature_config: Optional[FeatureConfig] = None,
+    timeframes: List[str] = None,
+    spy_symbol: str = "SPY",
+    enhanced_mappings: Optional[Dict] = None,
+    include_targets: bool = True,
+    triple_barrier_config: Optional[Dict] = None,
+    n_jobs: int = -1
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """
+    Simplified pipeline using new config system.
+
+    This is the new recommended entry point for feature computation.
+    It uses FeatureConfig for feature selection and TimeframeResampler
+    for unified timeframe handling.
+
+    Args:
+        indicators_by_symbol: Dict of symbol -> daily OHLCV DataFrame
+        feature_config: Feature configuration (None for defaults)
+        timeframes: List of timeframes ['D', 'W', 'M'] (default: ['D', 'W'])
+        spy_symbol: Market benchmark symbol
+        enhanced_mappings: Enhanced sector mappings
+        include_targets: Whether to generate triple barrier targets
+        triple_barrier_config: Config for target generation
+        n_jobs: Number of parallel jobs
+
+    Returns:
+        Tuple of (features_df, targets_df)
+    """
+    if feature_config is None:
+        feature_config = FeatureConfig.default()
+
+    if timeframes is None:
+        timeframes = ['D', 'W']
+
+    logger.info(f"Running pipeline v2 with {len(indicators_by_symbol)} symbols")
+    logger.info(f"Timeframes: {timeframes}")
+    logger.info(feature_config.summary())
+
+    # Get enabled features
+    enabled_single = feature_config.get_enabled_features(single_stock_only=True)
+    enabled_cs = feature_config.get_enabled_features(cross_sectional_only=True)
+
+    logger.info(f"Enabled single-stock features: {[f.name for f in enabled_single]}")
+    logger.info(f"Enabled cross-sectional features: {[f.name for f in enabled_cs]}")
+
+    # Step 1: Compute daily single-stock features (parallel)
+    with profile_stage("Daily Single-Stock Features"):
+        results = Parallel(n_jobs=n_jobs, backend='loky')(
+            delayed(_feature_worker)(sym, df)
+            for sym, df in indicators_by_symbol.items()
+        )
+        indicators_by_symbol = dict(results)
+
+    # Step 2: Compute cross-sectional features
+    if enabled_cs:
+        with profile_stage("Cross-Sectional Features"):
+            compute_cross_sectional_features(
+                indicators_by_symbol,
+                enhanced_mappings=enhanced_mappings,
+                market_symbol=spy_symbol
+            )
+
+    # Step 3: Generate targets (before adding higher TF features)
+    targets_df = None
+    if include_targets:
+        with profile_stage("Triple Barrier Targets"):
+            targets_df = _generate_triple_barrier_targets(
+                indicators_by_symbol,
+                triple_barrier_config
+            )
+
+    # Step 4: Interpolate NaNs
+    with profile_stage("NaN Interpolation"):
+        indicators_by_symbol = interpolate_internal_gaps(
+            indicators_by_symbol,
+            n_jobs=n_jobs
+        )
+
+    # Step 5: Convert to long format for higher TF processing
+    daily_df = combine_to_long(indicators_by_symbol)
+
+    # Step 6: Add higher timeframe features
+    higher_tfs = [tf for tf in timeframes if tf in ['W', 'M']]
+    if higher_tfs:
+        with profile_stage(f"Higher Timeframe Features ({','.join(higher_tfs)})"):
+            daily_df = compute_higher_timeframe_features(
+                daily_df,
+                timeframes=higher_tfs,
+                spy_symbol=spy_symbol,
+                enhanced_mappings=enhanced_mappings,
+                n_jobs=n_jobs
+            )
+
+    logger.info(f"Pipeline v2 completed: {len(daily_df)} rows, {len(daily_df.columns)} columns")
+
+    return daily_df, targets_df
 
 
 def run_pipeline(
@@ -559,30 +712,33 @@ def run_pipeline(
     output_dir: Path = Path("./artifacts"),
     include_sectors: bool = True,
     include_weekly: bool = True,
+    include_monthly: bool = False,
     interpolation_n_jobs: int = -1,
     triple_barrier_config: Dict[str, float] = None,
     enable_profiling: bool = True,
     daily_lags: List[int] = None,
     weekly_lags: List[int] = None,
     weight_min_clip: float = 0.01,
-    weight_max_clip: float = 10.0
+    weight_max_clip: float = 10.0,
+    feature_config: Optional[FeatureConfig] = None,
+    use_unified_timeframe: bool = True
 ) -> None:
     """
     Run the complete feature computation pipeline and save outputs.
-    
+
     This function orchestrates the entire process:
     1. Load stock and ETF data
     2. Compute all daily features in parallel
     3. Add cross-sectional features
     4. Generate triple barrier targets
     5. Apply configurable daily and weekly feature lags (optional)
-    6. Add comprehensive weekly features (optional)
+    6. Add comprehensive weekly/monthly features (optional)
     7. Save feature and target files
-    
+
     Args:
         max_stocks: Maximum number of stocks to process (None for all)
         rate_limit: Rate limit for data requests (requests per second)
-        interval: Data interval (e.g., "1d")  
+        interval: Data interval (e.g., "1d")
         default_etfs: List of ETF symbols to include
         spy_symbol: Market benchmark symbol
         sector_to_etf: Mapping of sector names to ETF symbols
@@ -590,6 +746,7 @@ def run_pipeline(
         output_dir: Directory for output files
         include_sectors: Whether to include sector information in processing
         include_weekly: Whether to add comprehensive weekly features (default: True)
+        include_monthly: Whether to add monthly features (default: False)
         interpolation_n_jobs: Number of parallel jobs for NaN interpolation (-1 for all cores)
         triple_barrier_config: Configuration for triple barrier target generation
         enable_profiling: Whether to enable pipeline stage profiling (default: True)
@@ -597,6 +754,8 @@ def run_pipeline(
         weekly_lags: List of weekly lag periods in weeks (None for no weekly lags)
         weight_min_clip: Minimum weight value for target generation (prevents zero weights)
         weight_max_clip: Maximum weight value for target generation (prevents extreme weights)
+        feature_config: Optional FeatureConfig for feature selection (None for all features)
+        use_unified_timeframe: Use new unified TimeframeResampler instead of legacy weekly (default: True)
     """
     # Set profiling state and clear any previous profiling data
     _set_profiling_enabled(enable_profiling)
@@ -640,30 +799,69 @@ def run_pipeline(
     save_long_parquet(indicators_by_symbol, out_path=daily_features_path)
     logger.info(f"Saved daily features to {daily_features_path}")
     
-    # Add comprehensive weekly features if requested
+    # Add higher timeframe features (weekly/monthly) if requested
     final_features = None
+    higher_timeframes = []
     if include_weekly:
-        with profile_stage("Weekly Features Computation"):
-            logger.info("Adding comprehensive weekly features...")
+        higher_timeframes.append('W')
+    if include_monthly:
+        higher_timeframes.append('M')
+
+    if higher_timeframes:
+        stage_name = f"Higher Timeframe Features ({','.join(higher_timeframes)})"
+        with profile_stage(stage_name):
             try:
                 # Load the daily features we just saved
-                from ..io.saving import load_long_parquet
+                try:
+                    from ..io.saving import load_long_parquet
+                except ImportError:
+                    from src.io.saving import load_long_parquet
+
                 daily_df = load_long_parquet(daily_features_path)
-                
-                # Add weekly features using the enhanced mappings computed earlier
-                final_features = add_weekly_features_to_daily(
-                    daily_df,
-                    spy_symbol=spy_symbol,
-                    n_jobs=-1,
-                    enhanced_mappings=enhanced_mappings
-                )
-                
-                weekly_count = len([col for col in final_features.columns if col.startswith('w_')])
-                logger.info(f"Added {weekly_count} weekly features")
-                
+                n_symbols = daily_df['symbol'].nunique()
+
+                if use_unified_timeframe:
+                    # NEW: Use unified TimeframeResampler (recommended)
+                    logger.info(f"Using unified TimeframeResampler for {higher_timeframes}")
+                    final_features = compute_higher_timeframe_features(
+                        daily_df,
+                        timeframes=higher_timeframes,
+                        spy_symbol=spy_symbol,
+                        enhanced_mappings=enhanced_mappings,
+                        n_jobs=interpolation_n_jobs
+                    )
+                    feature_counts = {
+                        'weekly': len([c for c in final_features.columns if c.startswith('w_')]),
+                        'monthly': len([c for c in final_features.columns if c.startswith('m_')])
+                    }
+                    logger.info(f"Added features: {feature_counts}")
+
+                else:
+                    # LEGACY: Use old multiprocessing implementation (fallback)
+                    logger.info("Using legacy weekly implementation...")
+                    multiprocessing_config = MultiprocessingConfig(
+                        n_jobs=-1,
+                        backend='loky',
+                        batch_size=1,
+                        memory_limit_mb=2048,
+                        dtype_optimization=True,
+                        adaptive_chunking=True,
+                        verbose=1
+                    )
+
+                    final_features = add_weekly_features_to_daily_multiprocessing(
+                        daily_df,
+                        spy_symbol=spy_symbol,
+                        config=multiprocessing_config,
+                        enhanced_mappings=enhanced_mappings
+                    )
+                    weekly_count = len([col for col in final_features.columns if col.startswith('w_')])
+                    logger.info(f"Added {weekly_count} weekly features (legacy)")
+
             except Exception as e:
-                logger.error(f"Error adding weekly features: {e}")
+                logger.error(f"Higher timeframe feature computation failed: {e}")
                 logger.info("Continuing with daily features only...")
+                final_features = None
     
     # File I/O operations (group remaining saves together)  
     with profile_stage("File I/O Operations"):
@@ -797,12 +995,45 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip weekly features computation (faster but less comprehensive)"
     )
-    
+
+    parser.add_argument(
+        "--monthly",
+        action="store_true",
+        help="Include monthly timeframe features (m_ prefix)"
+    )
+
+    parser.add_argument(
+        "--legacy-weekly",
+        action="store_true",
+        help="Use legacy weekly implementation instead of unified TimeframeResampler"
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to features.yaml config file for feature selection"
+    )
+
     parser.add_argument(
         "--rate-limit",
         type=float,
         default=1.0,
         help="Rate limit for data requests (requests per second)"
+    )
+    
+    parser.add_argument(
+        "--daily-lag",
+        type=int,
+        action="append",
+        help="Daily lag periods in trading days (can be specified multiple times, e.g., --daily-lag 1 --daily-lag 5)"
+    )
+    
+    parser.add_argument(
+        "--weekly-lag",
+        type=int,
+        action="append",
+        help="Weekly lag periods in weeks (can be specified multiple times, e.g., --weekly-lag 1 --weekly-lag 2)"
     )
     
     args = parser.parse_args()
@@ -812,6 +1043,14 @@ if __name__ == "__main__":
         logger.info(f"Max stocks: {args.max_stocks or 'All'}")
         logger.info(f"Output directory: {args.output_dir}")
         logger.info(f"Weekly features: {'No' if args.no_weekly else 'Yes'}")
+        logger.info(f"Monthly features: {'Yes' if args.monthly else 'No'}")
+        logger.info(f"Unified timeframe: {'No (legacy)' if args.legacy_weekly else 'Yes'}")
+        if args.config:
+            logger.info(f"Config file: {args.config}")
+        if args.daily_lag:
+            logger.info(f"Daily lags: {args.daily_lag}")
+        if args.weekly_lag:
+            logger.info(f"Weekly lags: {args.weekly_lag}")
         
         # Import SP500 tickers
         try:
@@ -843,6 +1082,12 @@ if __name__ == "__main__":
             "miscellaneous": "SPY",
         }
         
+        # Load feature config if provided
+        feature_config = None
+        if args.config:
+            feature_config = FeatureConfig.from_yaml(args.config)
+            logger.info(feature_config.summary())
+
         # Run pipeline with command-line arguments
         run_pipeline(
             max_stocks=args.max_stocks,
@@ -852,14 +1097,24 @@ if __name__ == "__main__":
             sector_to_etf=sector_to_etf,
             sp500_tickers=SP500_TICKERS,
             output_dir=Path(args.output_dir),
-            include_weekly=not args.no_weekly
+            include_weekly=not args.no_weekly,
+            include_monthly=args.monthly,
+            daily_lags=args.daily_lag,
+            weekly_lags=args.weekly_lag,
+            feature_config=feature_config,
+            use_unified_timeframe=not args.legacy_weekly
         )
         
         logger.info("Pipeline completed successfully!")
         logger.info(f"Check {args.output_dir} for output files:")
         logger.info("  - features_daily.parquet: Daily features only")
-        if not args.no_weekly:
-            logger.info("  - features_complete.parquet: Daily + weekly features")
+        if not args.no_weekly or args.monthly:
+            timeframes = []
+            if not args.no_weekly:
+                timeframes.append("weekly")
+            if args.monthly:
+                timeframes.append("monthly")
+            logger.info(f"  - features_complete.parquet: Daily + {' + '.join(timeframes)} features")
         logger.info("  - targets_triple_barrier.parquet: Triple barrier targets")
         
     except Exception as e:

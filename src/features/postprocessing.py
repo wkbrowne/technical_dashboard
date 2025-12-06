@@ -185,6 +185,85 @@ def clean_infinite_values(indicators_by_symbol: Dict[str, pd.DataFrame]) -> Dict
     return indicators_by_symbol
 
 
+def drop_rows_with_excessive_nans(
+    indicators_by_symbol: Dict[str, pd.DataFrame],
+    min_valid_ratio: float = 0.5,
+    exclude_cols: Optional[List[str]] = None
+) -> Dict[str, pd.DataFrame]:
+    """
+    Drop rows with too many NaN values across all symbols.
+
+    This is the final cleanup step in the pipeline, after all features have been
+    computed and internal gaps have been interpolated. Uses pandas built-in dropna()
+    with the thresh parameter.
+
+    Args:
+        indicators_by_symbol: Dictionary mapping symbol -> DataFrame
+        min_valid_ratio: Minimum ratio of non-NaN values required (0.0 to 1.0)
+                        E.g., 0.5 means at least 50% of features must be non-NaN
+        exclude_cols: Columns to exclude when counting NaNs (e.g., ['symbol', 'date'])
+                     These columns won't be considered in the threshold calculation
+
+    Returns:
+        Dictionary with filtered DataFrames (same symbols, fewer rows)
+
+    Example:
+        # Keep rows with at least 50% non-NaN feature values
+        clean_data = drop_rows_with_excessive_nans(
+            indicators_by_symbol,
+            min_valid_ratio=0.5,
+            exclude_cols=['symbol', 'date']
+        )
+    """
+    if exclude_cols is None:
+        exclude_cols = []
+
+    logger.info(f"Dropping rows with < {min_valid_ratio:.0%} valid feature values...")
+
+    filtered_dict = {}
+    total_rows_before = 0
+    total_rows_after = 0
+
+    for symbol, df in indicators_by_symbol.items():
+        if df is None or df.empty:
+            filtered_dict[symbol] = df
+            continue
+
+        total_rows_before += len(df)
+
+        # Get feature columns (exclude specified columns)
+        feature_cols = [col for col in df.columns if col not in exclude_cols]
+
+        if len(feature_cols) == 0:
+            filtered_dict[symbol] = df
+            total_rows_after += len(df)
+            continue
+
+        # Calculate minimum number of non-NaN values required
+        thresh = int(len(feature_cols) * min_valid_ratio)
+
+        # Use pandas built-in dropna with thresh parameter
+        # thresh: require that many non-NA values in the specified columns
+        df_filtered = df.dropna(subset=feature_cols, thresh=thresh)
+
+        filtered_dict[symbol] = df_filtered
+        total_rows_after += len(df_filtered)
+
+        rows_removed = len(df) - len(df_filtered)
+        if rows_removed > 0:
+            logger.debug(f"{symbol}: removed {rows_removed}/{len(df)} rows "
+                        f"({rows_removed/len(df)*100:.1f}%)")
+
+    rows_removed_total = total_rows_before - total_rows_after
+
+    logger.info(f"Row filtering complete:")
+    logger.info(f"  Symbols: {len(indicators_by_symbol)} (unchanged)")
+    logger.info(f"  Rows: {total_rows_before:,} → {total_rows_after:,} "
+               f"({rows_removed_total:,} removed, {rows_removed_total/total_rows_before*100:.1f}%)")
+
+    return filtered_dict
+
+
 def get_data_quality_summary(indicators_by_symbol: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """
     Generate a data quality summary report.

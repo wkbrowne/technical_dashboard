@@ -1,0 +1,138 @@
+# Feature Pipeline Configuration
+# ===============================
+# This file defines all available features, their parameters, and whether they are enabled.
+# Modify this file to toggle features on/off or adjust parameters.
+
+# Global settings
+nan_handling: preserve  # Options: preserve, interpolate_inside, drop
+min_valid_ratio: 0.5    # Minimum ratio of valid values to keep a row
+
+# Feature definitions
+features:
+
+  # ============================================================================
+  # SINGLE-STOCK FEATURES (computed per symbol independently)
+  # ============================================================================
+
+  trend_ma:
+    category: trend
+    timeframes: [D, W, M]
+    enabled: true
+    description: "Moving average slopes, agreement, trend scores"
+    params:
+      ma_periods: [10, 20, 30, 50, 75, 100, 150, 200]
+      slope_window: 20
+      eps: 0.00001
+
+  rsi:
+    category: momentum
+    timeframes: [D, W]
+    enabled: true
+    description: "RSI momentum oscillator at multiple periods"
+    params:
+      periods: [14, 21, 30]
+
+  macd:
+    category: momentum
+    timeframes: [D, W]
+    enabled: true
+    description: "MACD histogram and derivative EMA"
+    params:
+      fast: 12
+      slow: 26
+      signal: 9
+      derivative_ema_span: 3
+
+  volatility:
+    category: volatility
+    timeframes: [D]
+    enabled: true
+    description: "Multi-scale volatility regime features"
+    params:
+      short_windows: [10, 20]
+      long_windows: [60, 100]
+      z_window: 60
+      ema_span: 10
+      slope_win: 20
+
+  distance_ma:
+    category: distance
+    timeframes: [D, W]
+    enabled: true
+    description: "Distance to moving averages with z-scores"
+    params:
+      ma_lengths: [20, 50, 100, 200]
+      z_window: 60
+
+  range_breakout:
+    category: range
+    timeframes: [D]
+    enabled: true
+    description: "Range, breakout, and ATR features"
+    params:
+      win_list: [5, 10, 20]
+
+  volume:
+    category: volume
+    timeframes: [D]
+    enabled: true
+    description: "Volume ratios and patterns"
+    params: {}
+
+  volume_shock:
+    category: volume
+    timeframes: [D]
+    enabled: true
+    description: "Volume shock and price alignment features"
+    params:
+      lookback: 20
+      ema_span: 10
+
+  # ============================================================================
+  # CROSS-SECTIONAL FEATURES (require data from multiple stocks)
+  # ============================================================================
+
+  volatility_cs:
+    category: cross_sectional
+    timeframes: [D]
+    enabled: true
+    requires_cross_sectional: true
+    depends_on: [volatility]
+    description: "Cross-sectional volatility regime context"
+    params: {}
+
+  alpha:
+    category: alpha
+    timeframes: [D]
+    enabled: true
+    requires_cross_sectional: true
+    description: "Alpha-momentum vs market and sectors"
+    params:
+      beta_win: 60
+      windows: [20, 60, 120]
+      ema_span: 10
+
+  relative_strength:
+    category: relative_strength
+    timeframes: [D, W]
+    enabled: true
+    requires_cross_sectional: true
+    description: "Relative strength vs SPY, sectors, subsectors"
+    params: {}
+
+  breadth:
+    category: breadth
+    timeframes: [D]
+    enabled: true
+    requires_cross_sectional: true
+    description: "Market breadth (advancing/declining, highs/lows)"
+    params: {}
+
+  xsec_momentum:
+    category: cross_sectional
+    timeframes: [D]
+    enabled: true
+    requires_cross_sectional: true
+    description: "Cross-sectional momentum rankings"
+    params:
+      lookbacks: [5, 20, 60]

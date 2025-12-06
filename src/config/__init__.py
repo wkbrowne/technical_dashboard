@@ -3,6 +3,7 @@ Configuration package for the technical dashboard.
 
 This package contains centralized configuration for all models including:
 - Regime configuration (trend and volatility thresholds)
+- Feature configuration (feature specs, toggles, parameters)
 - Model parameters
 - Global settings
 """
@@ -10,13 +11,21 @@ This package contains centralized configuration for all models including:
 from .regime_config import (
     REGIME_CONFIG,
     GlobalRegimeConfig,
-    TrendRegimeConfig, 
+    TrendRegimeConfig,
     VolatilityRegimeConfig,
     get_regime_config,
     update_trend_thresholds,
     update_volatility_thresholds,
     get_all_combined_regimes,
     ModelRegimeConfig
+)
+
+from .features import (
+    FeatureCategory,
+    Timeframe,
+    FeatureSpec,
+    FeatureConfig,
+    get_default_feature_config,
 )
 
 # Import basic configuration settings
@@ -40,15 +49,23 @@ DEFAULT_RATE_LIMIT = 1.0
 DEFAULT_INTERVAL = "1d"
 
 __all__ = [
+    # Regime configuration
     'REGIME_CONFIG',
     'GlobalRegimeConfig',
     'TrendRegimeConfig',
-    'VolatilityRegimeConfig', 
+    'VolatilityRegimeConfig',
     'get_regime_config',
     'update_trend_thresholds',
     'update_volatility_thresholds',
     'get_all_combined_regimes',
     'ModelRegimeConfig',
+    # Feature configuration
+    'FeatureCategory',
+    'Timeframe',
+    'FeatureSpec',
+    'FeatureConfig',
+    'get_default_feature_config',
+    # Global settings
     'CACHE_FILE',
     'PROJECT_ROOT',
     'RAPIDAPI_KEY',

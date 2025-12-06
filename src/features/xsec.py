@@ -53,9 +53,16 @@ def add_xsec_momentum_panel(
     
     logger.debug(f"Building price panel for {len(syms)} symbols")
     
-    panel = pd.DataFrame(index=pd.Index([], name=None))
+    # Collect all price series first to avoid DataFrame fragmentation
+    # Using pd.concat instead of iterative column insertion for better performance
+    price_series_list = []
     for s in syms:
-        panel[s] = pd.to_numeric(indicators_by_symbol[s][price_col], errors='coerce')
+        price_series = pd.to_numeric(indicators_by_symbol[s][price_col], errors='coerce')
+        price_series.name = s
+        price_series_list.append(price_series)
+    
+    # Create panel DataFrame in single operation to avoid fragmentation warning
+    panel = pd.concat(price_series_list, axis=1, sort=True) if price_series_list else pd.DataFrame()
 
     # Align all indexes (outer join) and sort
     panel = panel.sort_index()

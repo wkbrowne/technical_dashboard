@@ -69,7 +69,15 @@ def add_range_breakout_features(
 
     # Use pandas_ta for clean ATR calculation
     atr14 = ta.atr(high=high, low=low, close=close, length=14)
-    df["atr14"] = atr14.astype("float32")  # Raw ATR value
+
+    # Handle case where ATR calculation returns None (insufficient data)
+    if atr14 is None:
+        logger.debug("ATR calculation returned None, creating NaN series")
+        atr14 = pd.Series(np.nan, index=df.index, dtype="float32")
+    else:
+        atr14 = atr14.astype("float32")
+
+    df["atr14"] = atr14  # Raw ATR value
     df["atr_percent"] = _safe_div(atr14, close).astype("float32")  # ATR as % of close
 
     # --- Gaps ---
