@@ -61,15 +61,47 @@ def load_cached_data(cache_dir: Path) -> dict:
             logger.warning("No stock data found in cache")
             data['stocks'] = pd.DataFrame()
 
-    # Load ETF data
+    # Load ETF data (includes VIX/VXN if downloaded via load_etf_universe)
     etf_file = cache_dir / "stock_data_etf.parquet"
     if etf_file.exists():
         data['etfs'] = pd.read_parquet(etf_file)
         logger.info(f"Loaded {len(data['etfs'])} ETF records")
+
+        # Check if VIX is present
+        if 'symbol' in data['etfs'].columns:
+            etf_symbols = data['etfs']['symbol'].unique()
+            has_vix = '^VIX' in etf_symbols or 'VIX' in etf_symbols
+            if not has_vix:
+                logger.warning("VIX not found in ETF cache. Run 'python -m src.cli.download --universe etf' to download VIX data.")
     else:
         data['etfs'] = pd.DataFrame()
 
     return data
+
+
+def _pivot_long_to_wide(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Pivot long-format data (date, symbol, value, metric) to wide format per metric.
+
+    Args:
+        df: Long-format DataFrame with columns: date, symbol, value, metric
+
+    Returns:
+        Dict mapping metric name (e.g., 'Open', 'AdjClose') -> wide DataFrame (dates x symbols)
+    """
+    if df.empty:
+        return {}
+
+    # Check if it's already in wide format (no 'metric' column)
+    if 'metric' not in df.columns:
+        logger.debug("Data appears to already be in wide format")
+        return {}
+
+    result = {}
+    for metric, chunk in df.groupby('metric'):
+        wide = chunk.pivot(index='date', columns='symbol', values='value').sort_index()
+        result[str(metric)] = wide
+
+    return result
 
 
 def prepare_indicators_from_cached(data: Dict) -> Dict[str, pd.DataFrame]:
@@ -77,45 +109,138 @@ def prepare_indicators_from_cached(data: Dict) -> Dict[str, pd.DataFrame]:
 
     Args:
         data: Dict with 'stocks' and 'etfs' DataFrames in long format
+              (columns: date, symbol, value, metric)
 
     Returns:
-        Dict mapping symbol -> DataFrame with date index
+        Dict mapping symbol -> DataFrame with date index and columns:
+        open, high, low, close, adjclose, volume, ret
     """
     from src.features.assemble import assemble_indicators_from_wide
-    from src.features.ohlc_adjustment import adjust_ohlc_to_adjclose
 
-    indicators = {}
+    # Convert long format to wide format per metric
+    stocks_wide = {}
+    etfs_wide = {}
 
-    # Process stocks
     if 'stocks' in data and not data['stocks'].empty:
-        stock_df = data['stocks']
-        if 'symbol' in stock_df.columns:
-            for symbol, group in stock_df.groupby('symbol'):
-                df = group.copy()
-                if 'date' in df.columns:
-                    df['date'] = pd.to_datetime(df['date'])
-                    df = df.set_index('date').sort_index()
-                df = df.drop(columns=['symbol'], errors='ignore')
-                # Adjust OHLC if adjclose is present
-                if 'adjclose' in df.columns:
-                    df = adjust_ohlc_to_adjclose(df)
-                indicators[symbol] = df
+        stocks_wide = _pivot_long_to_wide(data['stocks'])
+        logger.debug(f"Pivoted stocks data to wide format: {list(stocks_wide.keys())}")
 
-    # Process ETFs similarly
     if 'etfs' in data and not data['etfs'].empty:
-        etf_df = data['etfs']
-        if 'symbol' in etf_df.columns:
-            for symbol, group in etf_df.groupby('symbol'):
-                df = group.copy()
-                if 'date' in df.columns:
-                    df['date'] = pd.to_datetime(df['date'])
-                    df = df.set_index('date').sort_index()
-                df = df.drop(columns=['symbol'], errors='ignore')
-                if 'adjclose' in df.columns:
-                    df = adjust_ohlc_to_adjclose(df)
-                indicators[symbol] = df
+        etfs_wide = _pivot_long_to_wide(data['etfs'])
+        logger.debug(f"Pivoted ETFs data to wide format: {list(etfs_wide.keys())}")
+
+    # Combine stocks and ETFs into single wide dict
+    # Concatenate symbols from both sources for each metric
+    combined_wide = {}
+    all_metrics = set(stocks_wide.keys()) | set(etfs_wide.keys())
+
+    for metric in all_metrics:
+        dfs_to_concat = []
+        if metric in stocks_wide:
+            dfs_to_concat.append(stocks_wide[metric])
+        if metric in etfs_wide:
+            dfs_to_concat.append(etfs_wide[metric])
+
+        if dfs_to_concat:
+            combined_wide[metric] = pd.concat(dfs_to_concat, axis=1).sort_index()
+
+    if not combined_wide:
+        logger.warning("No data to process after pivoting")
+        return {}
+
+    # Use assemble_indicators_from_wide to convert to per-symbol DataFrames
+    # with proper lowercase column names and returns calculation
+    indicators = assemble_indicators_from_wide(combined_wide, adjust_ohlc_with_factor=True)
 
     return indicators
+
+
+def _discover_universe_csv(cache_dir: Path) -> Optional[str]:
+    """Find the universe CSV file in cache directory.
+
+    Args:
+        cache_dir: Directory containing cached data
+
+    Returns:
+        Path to universe CSV or None if not found
+    """
+    candidates = [f for f in cache_dir.iterdir()
+                  if f.name.startswith("US universe_") and f.suffix == ".csv"]
+    if not candidates:
+        return None
+    return str(sorted(candidates)[0])
+
+
+def _load_sectors_from_cache(cache_dir: Path, max_stocks: Optional[int] = None) -> Dict[str, str]:
+    """Load sector mappings from universe CSV in cache directory.
+
+    Args:
+        cache_dir: Directory containing cached data and universe CSV
+        max_stocks: Optional limit on number of stocks
+
+    Returns:
+        Dict mapping symbol -> sector name
+    """
+    try:
+        universe_csv = _discover_universe_csv(cache_dir)
+        if not universe_csv:
+            logger.warning("No universe CSV found in cache directory")
+            return {}
+
+        df = pd.read_csv(universe_csv)
+
+        # Find symbol and sector columns
+        sym_col = "Symbol" if "Symbol" in df.columns else next(
+            (c for c in df.columns if "symbol" in c.lower()), None)
+        sec_col = "Sector" if "Sector" in df.columns else next(
+            (c for c in df.columns if "sector" in c.lower()), None)
+
+        if not sym_col or not sec_col:
+            logger.warning(f"No Symbol/Sector columns in {universe_csv}")
+            return {}
+
+        # Build symbol -> sector mapping
+        result = (df[[sym_col, sec_col]]
+                  .dropna(subset=[sym_col])
+                  .assign(**{sym_col: df[sym_col].astype(str).str.strip(),
+                            sec_col: df[sec_col].astype(str).str.strip()}))
+
+        if max_stocks and max_stocks > 0:
+            result = result.iloc[:max_stocks]
+
+        sectors = dict(zip(result[sym_col], result[sec_col]))
+        logger.info(f"Loaded sector mappings for {len(sectors)} symbols")
+        return sectors
+
+    except Exception as e:
+        logger.warning(f"Could not load sector mappings: {e}")
+        return {}
+
+
+def _get_default_sector_to_etf() -> Dict[str, str]:
+    """Return default mapping of sector names to ETF symbols."""
+    return {
+        "technology services": "XLK",
+        "electronic technology": "XLK",
+        "finance": "XLF",
+        "retail trade": "XLY",
+        "health technology": "XLV",
+        "consumer non-durables": "XLP",
+        "producer manufacturing": "XLI",
+        "energy minerals": "XLE",
+        "consumer services": "XLY",
+        "consumer durables": "XLY",
+        "utilities": "XLU",
+        "non-energy minerals": "XLB",
+        "industrial services": "XLI",
+        "transportation": "XLI",
+        "commercial services": "XLC",
+        "process industries": "XLB",
+        "communications": "XLC",
+        "health services": "XLV",
+        "distribution services": "XLI",
+        "miscellaneous": "SPY",
+    }
 
 
 def run_feature_pipeline(
@@ -147,6 +272,7 @@ def run_feature_pipeline(
     from src.features.cross_sectional import compute_cross_sectional_features
     from src.features.postprocessing import interpolate_internal_gaps
     from src.features.timeframe import combine_to_long, partition_by_symbol
+    from src.features.sector_mapping import build_enhanced_sector_mappings
     from joblib import Parallel, delayed
 
     # Create unified parallel config
@@ -185,6 +311,19 @@ def run_feature_pipeline(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load sector mappings for cross-sectional features
+    sectors = _load_sectors_from_cache(cache_dir, max_stocks)
+    sector_to_etf = _get_default_sector_to_etf()
+
+    # Load SP500 tickers for breadth features
+    try:
+        from cache.sp500_list import SP500_TICKERS
+        sp500_tickers = SP500_TICKERS
+        logger.info(f"Loaded {len(sp500_tickers)} S&P 500 tickers for breadth features")
+    except ImportError:
+        sp500_tickers = None
+        logger.warning("Could not load S&P 500 ticker list for breadth features")
+
     try:
         # Convert cached data to indicators dict
         logger.info("Preparing indicators from cached data...")
@@ -196,6 +335,41 @@ def run_feature_pipeline(
 
         logger.info(f"Prepared {len(indicators_by_symbol)} symbols for feature computation")
 
+        # Build enhanced sector/subsector mappings for relative strength
+        enhanced_mappings = None
+        if sectors:
+            try:
+                universe_csv = _discover_universe_csv(cache_dir)
+
+                if universe_csv:
+                    # Get ALL ETF data from indicators (includes sector + subsector ETFs)
+                    # The ETF parquet should contain all ETFs loaded by prepare_indicators_from_cached
+                    # Filter to just ETF-like symbols (typically 2-5 letter uppercase, no numbers)
+                    from src.features.sector_mapping import SUBSECTOR_ETF_KEYWORDS
+                    all_known_etfs = (
+                        set(sector_to_etf.values()) |  # Sector ETFs
+                        set(SUBSECTOR_ETF_KEYWORDS.keys()) |  # Subsector ETFs
+                        {'SPY', 'RSP', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO'}  # Common benchmarks
+                    )
+                    etf_data = {sym: df for sym, df in indicators_by_symbol.items()
+                                if sym in all_known_etfs}
+                    logger.info(f"Found {len(etf_data)} ETFs for enhanced mappings: {sorted(etf_data.keys())[:10]}...")
+
+                    enhanced_mappings = build_enhanced_sector_mappings(
+                        universe_csv=universe_csv,
+                        stock_data=indicators_by_symbol,
+                        etf_data=etf_data,
+                        base_sectors=sectors
+                    )
+                    logger.info(f"Built enhanced mappings for {len(enhanced_mappings)} symbols")
+                else:
+                    logger.warning("No universe CSV found for enhanced mappings")
+            except Exception as e:
+                logger.warning(f"Could not build enhanced mappings: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                enhanced_mappings = None
+
         # Use the new pipeline_v2 for feature computation
         logger.info("Running feature pipeline v2...")
         features_df, targets_df = run_pipeline_v2(
@@ -203,7 +377,11 @@ def run_feature_pipeline(
             feature_config=config,
             timeframes=timeframes,
             include_targets=include_targets,
-            parallel_config=parallel_config
+            parallel_config=parallel_config,
+            sectors=sectors,
+            sector_to_etf=sector_to_etf,
+            enhanced_mappings=enhanced_mappings,
+            sp500_tickers=sp500_tickers
         )
 
         # Save features

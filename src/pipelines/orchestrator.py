@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from joblib.externals.loky import get_reusable_executor
 
 
 # Feature module imports with fallback for both relative and absolute imports
@@ -139,6 +140,21 @@ def _set_profiling_enabled(enabled: bool):
     _profiling_enabled = enabled
 
 
+def shutdown_loky_workers():
+    """
+    Shut down the loky worker pool to free memory.
+
+    Should be called at the end of pipeline execution to release
+    worker processes that would otherwise sit idle consuming memory.
+    """
+    try:
+        executor = get_reusable_executor()
+        executor.shutdown(wait=True)
+        logger.info("Loky worker pool shut down")
+    except Exception as e:
+        logger.debug(f"Loky shutdown: {e}")
+
+
 def _feature_worker(sym: str, df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     """
     Core feature computation worker for a single symbol.
@@ -178,6 +194,56 @@ def _feature_worker(sym: str, df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     except Exception as e:
         logger.error(f"Feature processing failed for {sym}: {e}")
         return sym, df
+
+
+def _feature_worker_batch(symbol_data_list: List[Tuple[str, pd.DataFrame]]) -> List[Tuple[str, pd.DataFrame]]:
+    """
+    Process a batch of symbols in a single worker to reduce IPC overhead.
+
+    This function processes multiple symbols sequentially within a single worker,
+    which significantly reduces inter-process communication overhead compared to
+    processing each symbol as a separate task.
+
+    Args:
+        symbol_data_list: List of (symbol, dataframe) tuples to process
+
+    Returns:
+        List of (symbol, enriched_dataframe) tuples
+    """
+    results = []
+    for sym, df in symbol_data_list:
+        try:
+            # Adjust OHLC to match adjusted close
+            out = adjust_ohlc_to_adjclose(df)
+
+            # Compute all single-stock features
+            out = compute_single_stock_features(
+                out,
+                price_col='adjclose',
+                ret_col='ret',
+                vol_col='volume',
+                ensure_returns=True
+            )
+            results.append((sym, out))
+        except Exception as e:
+            logger.error(f"Feature processing failed for {sym}: {e}")
+            results.append((sym, df))
+    return results
+
+
+def _chunk_dict(data_dict: Dict[str, pd.DataFrame], chunk_size: int) -> List[List[Tuple[str, pd.DataFrame]]]:
+    """
+    Split a dictionary into chunks for batch processing.
+
+    Args:
+        data_dict: Dictionary of symbol -> DataFrame
+        chunk_size: Number of symbols per chunk
+
+    Returns:
+        List of chunks, where each chunk is a list of (symbol, dataframe) tuples
+    """
+    items = list(data_dict.items())
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
 def build_feature_universe(
@@ -340,7 +406,8 @@ def build_feature_universe(
             alpha_windows=(20, 60, 120),
             alpha_ema_span=10,
             xsec_lookbacks=(5, 20, 60),
-            price_col="adjclose"
+            price_col="adjclose",
+            n_jobs=interpolation_n_jobs
         )
 
     # 5) Generate triple barrier targets (parallel)
@@ -355,7 +422,7 @@ def build_feature_universe(
         indicators_by_symbol = interpolate_internal_gaps(
             indicators_by_symbol,
             n_jobs=interpolation_n_jobs,
-            batch_size=32  # Process 32 symbols per batch
+            batch_size='auto'  # Let joblib determine optimal batch size
         )
 
     # 7) Apply configurable feature lags (optional)
@@ -486,6 +553,251 @@ def _log_target_class_distribution(targets_df: pd.DataFrame) -> None:
         logger.info(f"  {class_name}: {count:,} ({percentage:.1f}%)")
 
 
+def _compute_higher_tf_for_symbol(
+    symbol: str,
+    daily_df: pd.DataFrame,
+    timeframe: TimeframeType,
+    prefix: str
+) -> Tuple[str, pd.DataFrame]:
+    """
+    Compute higher timeframe features for a single symbol.
+
+    This is a pure function designed for parallel execution.
+
+    Args:
+        symbol: Symbol identifier
+        daily_df: Daily DataFrame for this symbol (can have DatetimeIndex or 'date' column)
+        timeframe: Target timeframe (WEEKLY or MONTHLY)
+        prefix: Column prefix ('w_' or 'm_')
+
+    Returns:
+        Tuple of (symbol, daily_df with higher TF features merged)
+    """
+    try:
+        # Handle DatetimeIndex: convert to 'date' column for merge_to_daily
+        had_datetime_index = isinstance(daily_df.index, pd.DatetimeIndex) and 'date' not in daily_df.columns
+        if had_datetime_index:
+            daily_df = daily_df.reset_index()
+            # The index might be named 'date' or unnamed
+            if 'index' in daily_df.columns:
+                daily_df = daily_df.rename(columns={'index': 'date'})
+            elif daily_df.columns[0] != 'date' and pd.api.types.is_datetime64_any_dtype(daily_df.iloc[:, 0]):
+                # First column is datetime but not named 'date'
+                daily_df = daily_df.rename(columns={daily_df.columns[0]: 'date'})
+
+        # Step 1: Resample to higher timeframe
+        resampled = TimeframeResampler.resample_single(daily_df, timeframe, symbol)
+
+        if resampled.empty or len(resampled) < 5:
+            # Restore index if we changed it
+            if had_datetime_index:
+                daily_df = daily_df.set_index('date')
+            return symbol, daily_df
+
+        # Step 2: Compute features at higher timeframe
+        close = pd.to_numeric(resampled['close'], errors='coerce')
+
+        if len(close.dropna()) < 10:
+            if had_datetime_index:
+                daily_df = daily_df.set_index('date')
+            return symbol, daily_df
+
+        # RSI
+        try:
+            import pandas_ta as ta
+            for period in [14, 21]:
+                rsi = ta.rsi(close, length=period)
+                if rsi is not None:
+                    resampled[f'rsi_{period}'] = rsi.astype('float32')
+        except Exception:
+            pass
+
+        # SMAs and distance
+        for period in [20, 50]:
+            sma = close.rolling(period, min_periods=period//2).mean()
+            resampled[f'sma{period}'] = sma.astype('float32')
+            if sma is not None:
+                dist = (close - sma) / sma
+                resampled[f'dist_sma{period}'] = dist.astype('float32')
+
+        # Trend slope
+        for period in [20]:
+            if f'sma{period}' in resampled.columns:
+                slope = resampled[f'sma{period}'].diff(4) / resampled[f'sma{period}'].shift(4)
+                resampled[f'sma{period}_slope'] = slope.astype('float32')
+
+        # Step 3: Add prefix to feature columns
+        resampled = add_prefix_to_features(resampled, prefix)
+
+        # Step 4: Merge back to daily using merge_asof
+        merged = TimeframeResampler.merge_to_daily(daily_df, resampled, timeframe)
+
+        # Restore DatetimeIndex if the input had it
+        if had_datetime_index and 'date' in merged.columns:
+            merged = merged.set_index('date')
+
+        return symbol, merged
+
+    except Exception as e:
+        logger.debug(f"Higher TF computation failed for {symbol}: {e}")
+        # Try to restore index if we changed it
+        if 'date' in daily_df.columns and not isinstance(daily_df.index, pd.DatetimeIndex):
+            try:
+                daily_df = daily_df.set_index('date')
+            except Exception:
+                pass
+        return symbol, daily_df
+
+
+def _compute_higher_tf_batch(
+    symbol_data_list: List[Tuple[str, pd.DataFrame]],
+    tf_type: TimeframeType,
+    prefix: str
+) -> List[Tuple[str, pd.DataFrame]]:
+    """
+    Process a batch of symbols for higher timeframe features.
+
+    Args:
+        symbol_data_list: List of (symbol, dataframe) tuples to process
+        tf_type: TimeframeType (WEEKLY or MONTHLY)
+        prefix: Column prefix ('w_' or 'm_')
+
+    Returns:
+        List of (symbol, enriched_dataframe) tuples
+    """
+    results = []
+    for symbol, df in symbol_data_list:
+        _, result_df = _compute_higher_tf_for_symbol(symbol, df, tf_type, prefix)
+        results.append((symbol, result_df))
+    return results
+
+
+def _compute_all_higher_tf_for_symbol(
+    symbol: str,
+    df: pd.DataFrame,
+    timeframes: List[str]
+) -> Tuple[str, pd.DataFrame]:
+    """
+    Compute ALL higher timeframe features for a single symbol.
+
+    Args:
+        symbol: Symbol identifier
+        df: Daily DataFrame for this symbol
+        timeframes: List of timeframes to compute ('W', 'M')
+
+    Returns:
+        Tuple of (symbol, DataFrame with all higher TF features)
+    """
+    result_df = df
+    for tf_str in timeframes:
+        tf_type = TimeframeType.WEEKLY if tf_str == 'W' else TimeframeType.MONTHLY
+        prefix = 'w_' if tf_str == 'W' else 'm_'
+        _, result_df = _compute_higher_tf_for_symbol(symbol, result_df, tf_type, prefix)
+    return symbol, result_df
+
+
+def _compute_all_higher_tf_batch(
+    symbol_data_list: List[Tuple[str, pd.DataFrame]],
+    timeframes: List[str]
+) -> List[Tuple[str, pd.DataFrame]]:
+    """
+    Process a batch of symbols for ALL higher timeframe features (W + M together).
+
+    Args:
+        symbol_data_list: List of (symbol, dataframe) tuples to process
+        timeframes: List of timeframes to compute ('W', 'M')
+
+    Returns:
+        List of (symbol, enriched_dataframe) tuples
+    """
+    results = []
+    for symbol, df in symbol_data_list:
+        sym, result_df = _compute_all_higher_tf_for_symbol(symbol, df, timeframes)
+        results.append((sym, result_df))
+    return results
+
+
+def compute_higher_timeframe_features_dict(
+    daily_by_symbol: Dict[str, pd.DataFrame],
+    timeframes: List[str] = None,
+    n_jobs: int = -1,
+    parallel_config: Optional[ParallelConfig] = None
+) -> Dict[str, pd.DataFrame]:
+    """
+    Compute higher timeframe features for all symbols (optimized, dict-based).
+
+    This function works directly with Dict[str, pd.DataFrame] to avoid
+    expensive long format conversions. All timeframes (W, M) are computed
+    together in a single parallel job per symbol batch.
+
+    Args:
+        daily_by_symbol: Dict mapping symbol -> daily DataFrame
+        timeframes: List of timeframes to compute ('W', 'M'). Default: ['W']
+        n_jobs: Number of parallel jobs
+        parallel_config: ParallelConfig for parallel processing
+
+    Returns:
+        Dict mapping symbol -> DataFrame with higher TF features merged
+    """
+    if parallel_config is None:
+        parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size='auto')
+
+    if timeframes is None:
+        timeframes = ['W']
+
+    logger.info(f"Computing higher timeframe features (dict-based): {timeframes}")
+
+    n_symbols = len(daily_by_symbol)
+    effective_jobs = parallel_config.effective_n_jobs
+
+    start_time = time.time()
+
+    # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
+    min_chunk_size = 100
+    chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
+    n_chunks = max(1, n_symbols // chunk_size)
+
+    # Adjust workers if we have fewer chunks than cores
+    actual_workers = min(effective_jobs, n_chunks)
+
+    # Create batches
+    symbol_chunks = _chunk_dict(daily_by_symbol, chunk_size)
+    n_chunks = len(symbol_chunks)
+
+    logger.info(f"Processing {n_symbols} symbols for timeframes {timeframes} in {n_chunks} batches "
+                f"(~{chunk_size} symbols/batch, {actual_workers} workers)")
+
+    # Single parallel job that computes ALL timeframes for each symbol batch
+    batch_results = Parallel(
+        n_jobs=parallel_config.n_jobs,
+        backend=parallel_config.backend,
+        verbose=parallel_config.verbose,
+        prefer=parallel_config.prefer
+    )(
+        delayed(_compute_all_higher_tf_batch)(chunk, timeframes)
+        for chunk in symbol_chunks
+    )
+
+    # Flatten results back into dict
+    result_by_symbol = {}
+    for batch in batch_results:
+        for sym, df in batch:
+            result_by_symbol[sym] = df
+
+    elapsed = time.time() - start_time
+
+    # Count features added per timeframe
+    sample_sym = next(iter(result_by_symbol.keys()))
+    for tf_str in timeframes:
+        prefix = 'w_' if tf_str == 'W' else 'm_'
+        feature_count = len([c for c in result_by_symbol[sample_sym].columns if c.startswith(prefix)])
+        logger.info(f"Added {feature_count} {tf_str} features to {len(result_by_symbol)} symbols")
+
+    logger.info(f"Higher timeframe features completed in {elapsed:.1f}s")
+
+    return result_by_symbol
+
+
 def compute_higher_timeframe_features(
     daily_df: pd.DataFrame,
     timeframes: List[str] = None,
@@ -513,99 +825,25 @@ def compute_higher_timeframe_features(
     """
     # Use ParallelConfig if provided
     if parallel_config is None:
-        parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size=16)
+        parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size='auto')
 
     if timeframes is None:
         timeframes = ['W']
 
     logger.info(f"Computing higher timeframe features: {timeframes}")
 
-    # Initialize resampler with ParallelConfig
-    resampler = TimeframeResampler(config=parallel_config)
-
-    # Partition daily data by symbol
+    # Partition daily data by symbol (single conversion)
     daily_by_symbol = partition_by_symbol(daily_df, optimize_dtypes=True)
 
-    result_df = daily_df.copy()
+    # Use the optimized dict-based function
+    result_by_symbol = compute_higher_timeframe_features_dict(
+        daily_by_symbol,
+        timeframes=timeframes,
+        parallel_config=parallel_config
+    )
 
-    for tf_str in timeframes:
-        tf_type = TimeframeType.WEEKLY if tf_str == 'W' else TimeframeType.MONTHLY
-        prefix = 'w_' if tf_str == 'W' else 'm_'
-
-        logger.info(f"Processing {tf_str} timeframe...")
-
-        try:
-            # Step 1: Resample to higher timeframe
-            higher_tf_data = resampler.resample_symbols(daily_by_symbol, tf_type)
-
-            if not higher_tf_data:
-                logger.warning(f"No data resampled for {tf_str} timeframe")
-                continue
-
-            # Step 2: Compute features at higher timeframe
-            def compute_tf_features(df: pd.DataFrame) -> pd.DataFrame:
-                """Compute basic features for higher timeframe."""
-                result = df.copy()
-                close = pd.to_numeric(result['close'], errors='coerce')
-
-                if len(close.dropna()) < 10:
-                    return result
-
-                # RSI
-                try:
-                    import pandas_ta as ta
-                    for period in [14, 21]:
-                        rsi = ta.rsi(close, length=period)
-                        if rsi is not None:
-                            result[f'rsi_{period}'] = rsi.astype('float32')
-                except Exception:
-                    pass
-
-                # SMAs and distance
-                for period in [20, 50]:
-                    sma = close.rolling(period, min_periods=period//2).mean()
-                    result[f'sma{period}'] = sma.astype('float32')
-                    if sma is not None:
-                        dist = (close - sma) / sma
-                        result[f'dist_sma{period}'] = dist.astype('float32')
-
-                # Trend slope
-                for period in [20]:
-                    if f'sma{period}' in result.columns:
-                        slope = result[f'sma{period}'].diff(4) / result[f'sma{period}'].shift(4)
-                        result[f'sma{period}_slope'] = slope.astype('float32')
-
-                return result
-
-            higher_tf_features = compute_features_at_timeframe(
-                higher_tf_data,
-                compute_tf_features,
-                tf_type,
-                config=parallel_config
-            )
-
-            # Step 3: Add prefix to feature columns
-            for symbol, df in higher_tf_features.items():
-                higher_tf_features[symbol] = add_prefix_to_features(df, prefix)
-
-            # Step 4: Merge back to daily (need to work with result_df)
-            # Convert result_df to dict, merge, then convert back
-            result_by_symbol = partition_by_symbol(result_df, optimize_dtypes=False)
-            merged_by_symbol = resampler.merge_symbols_to_daily(
-                result_by_symbol,
-                higher_tf_features,
-                tf_type
-            )
-
-            # Combine back to long format
-            result_df = combine_to_long(merged_by_symbol)
-
-            feature_count = len([c for c in result_df.columns if c.startswith(prefix)])
-            logger.info(f"Added {feature_count} {tf_str} features")
-
-        except Exception as e:
-            logger.error(f"Failed to compute {tf_str} features: {e}")
-            logger.info(f"Continuing without {tf_str} features...")
+    # Convert back to long format (single conversion)
+    result_df = combine_to_long(result_by_symbol)
 
     return result_df
 
@@ -619,7 +857,10 @@ def run_pipeline_v2(
     include_targets: bool = True,
     triple_barrier_config: Optional[Dict] = None,
     n_jobs: int = -1,
-    parallel_config: Optional[ParallelConfig] = None
+    parallel_config: Optional[ParallelConfig] = None,
+    sectors: Optional[Dict[str, str]] = None,
+    sector_to_etf: Optional[Dict[str, str]] = None,
+    sp500_tickers: Optional[List[str]] = None
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Simplified pipeline using new config system.
@@ -638,13 +879,16 @@ def run_pipeline_v2(
         triple_barrier_config: Config for target generation
         n_jobs: Number of parallel jobs (deprecated, use parallel_config)
         parallel_config: ParallelConfig for unified parallel processing
+        sectors: Dict mapping symbol -> sector name (for cross-sectional features)
+        sector_to_etf: Dict mapping sector name -> ETF symbol (for alpha/relative strength)
+        sp500_tickers: List of S&P 500 tickers (for breadth features)
 
     Returns:
         Tuple of (features_df, targets_df)
     """
     # Use ParallelConfig if provided, otherwise create from n_jobs
     if parallel_config is None:
-        parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size=16)
+        parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size='auto')
 
     if feature_config is None:
         feature_config = FeatureConfig.default()
@@ -664,44 +908,67 @@ def run_pipeline_v2(
     logger.info(f"Enabled single-stock features: {[f.name for f in enabled_single]}")
     logger.info(f"Enabled cross-sectional features: {[f.name for f in enabled_cs]}")
 
-    # Step 1: Compute daily single-stock features (parallel)
+    # Step 1: Compute daily single-stock features (parallel with batching)
     with profile_stage("Daily Single-Stock Features"):
-        results = Parallel(
+        n_symbols = len(indicators_by_symbol)
+        effective_jobs = parallel_config.effective_n_jobs
+
+        # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
+        # If we can't achieve that, reduce the number of effective workers
+        min_chunk_size = 100
+        chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
+        n_chunks = max(1, n_symbols // chunk_size)
+
+        # Adjust workers if we have fewer chunks than cores
+        actual_workers = min(effective_jobs, n_chunks)
+
+        # Create batches of symbols
+        symbol_chunks = _chunk_dict(indicators_by_symbol, chunk_size)
+        n_chunks = len(symbol_chunks)
+
+        logger.info(f"Processing {n_symbols} symbols in {n_chunks} batches "
+                   f"(~{chunk_size} symbols/batch, {actual_workers} workers)")
+
+        # Process batches in parallel - each worker processes multiple symbols
+        batch_results = Parallel(
             n_jobs=parallel_config.n_jobs,
             backend=parallel_config.backend,
-            batch_size=parallel_config.batch_size,
             verbose=parallel_config.verbose,
             prefer=parallel_config.prefer
         )(
-            delayed(_feature_worker)(sym, df)
-            for sym, df in indicators_by_symbol.items()
+            delayed(_feature_worker_batch)(chunk)
+            for chunk in symbol_chunks
         )
-        indicators_by_symbol = dict(results)
 
-    # Step 2: Compute cross-sectional features (sequential - needs full universe)
+        # Flatten results back into dict
+        indicators_by_symbol = {}
+        for batch in batch_results:
+            for sym, df in batch:
+                indicators_by_symbol[sym] = df
+
+    # Step 2: Compute cross-sectional features (per-symbol features parallelized)
     if enabled_cs:
         with profile_stage("Cross-Sectional Features"):
             compute_cross_sectional_features(
                 indicators_by_symbol,
+                sectors=sectors,
+                sector_to_etf=sector_to_etf,
+                market_symbol=spy_symbol,
+                sp500_tickers=sp500_tickers,
                 enhanced_mappings=enhanced_mappings,
-                market_symbol=spy_symbol
+                n_jobs=parallel_config.n_jobs
             )
 
     # Step 3: Add higher timeframe features (W/M) - compute alongside daily features
     higher_tfs = [tf for tf in timeframes if tf in ['W', 'M']]
     if higher_tfs:
         with profile_stage(f"Higher Timeframe Features ({','.join(higher_tfs)})"):
-            # Convert to long format for higher TF processing
-            daily_df = combine_to_long(indicators_by_symbol)
-            daily_df = compute_higher_timeframe_features(
-                daily_df,
+            # Use dict-based parallel computation directly (avoids expensive long format conversions)
+            indicators_by_symbol = compute_higher_timeframe_features_dict(
+                indicators_by_symbol,
                 timeframes=higher_tfs,
-                spy_symbol=spy_symbol,
-                enhanced_mappings=enhanced_mappings,
                 parallel_config=parallel_config
             )
-            # Convert back to dict format for subsequent steps
-            indicators_by_symbol = partition_by_symbol(daily_df, optimize_dtypes=False)
 
     # Step 4: Interpolate NaNs (applies to daily AND higher TF features)
     with profile_stage("NaN Interpolation"):
@@ -722,6 +989,9 @@ def run_pipeline_v2(
 
     # Step 6: Convert to final long format
     daily_df = combine_to_long(indicators_by_symbol)
+
+    # Step 7: Shut down loky workers to free memory
+    shutdown_loky_workers()
 
     logger.info(f"Pipeline v2 completed: {len(daily_df)} rows, {len(daily_df.columns)} columns")
 

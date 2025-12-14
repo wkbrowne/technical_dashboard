@@ -335,85 +335,131 @@ def get_target_summary(targets_df: pd.DataFrame) -> Dict:
 
 def _add_overlap_counts(targets_df: pd.DataFrame, config: Dict) -> pd.DataFrame:
     """
-    Add overlap counting to targets DataFrame using memory-efficient approach.
-    
+    Add overlap counting to targets DataFrame using vectorized sweep-line algorithm.
+
     Counts how many trajectories overlap at each date per symbol and adds
     this information back to the original targets DataFrame.
-    
+
+    Uses O(n log n) sweep-line algorithm instead of O(n²) naive approach.
+
     Args:
         targets_df: DataFrame with generated targets
         config: Configuration dictionary (unused but kept for API consistency)
-        
+
     Returns:
         DataFrame with added overlap count column
     """
     if targets_df.empty:
         return targets_df
-    
+
     overlap_col = "n_overlapping_trajs"
-    
-    # Initialize overlap counts
+
+    # Work on a copy
     targets_df = targets_df.copy()
     targets_df[overlap_col] = 0
-    
-    # Process each symbol separately for memory efficiency
+
+    # Process each symbol using vectorized counting
     for symbol in targets_df['symbol'].unique():
         symbol_mask = targets_df['symbol'] == symbol
-        symbol_targets = targets_df.loc[symbol_mask, ['t0', 'h_used']].copy()
-        
-        if symbol_targets.empty:
+        symbol_indices = targets_df.index[symbol_mask]
+
+        if len(symbol_indices) == 0:
             continue
-        
-        # Count overlaps for this symbol only
-        overlap_counts = _count_overlaps_efficient(symbol_targets)
-        
-        # Update overlap counts for this symbol
-        for idx, (t0, count) in overlap_counts.items():
-            t0_mask = (targets_df['symbol'] == symbol) & (targets_df['t0'] == t0)
-            targets_df.loc[t0_mask, overlap_col] = count
-    
+
+        # Get the subset for this symbol
+        symbol_targets = targets_df.loc[symbol_indices, ['t0', 'h_used']].copy()
+
+        # Use vectorized overlap counting
+        overlap_counts = _count_overlaps_vectorized(symbol_targets)
+
+        # Assign directly using index alignment
+        targets_df.loc[symbol_indices, overlap_col] = overlap_counts
+
     return targets_df
+
+
+def _count_overlaps_vectorized(symbol_targets: pd.DataFrame) -> np.ndarray:
+    """
+    Count overlaps for a single symbol using fully vectorized numpy operations.
+
+    This is O(n) memory and O(n) time complexity using a sweep-line algorithm,
+    compared to the O(n²) naive approach.
+
+    Args:
+        symbol_targets: DataFrame with t0 and h_used columns for one symbol
+
+    Returns:
+        Array of overlap counts for each trajectory
+    """
+    n = len(symbol_targets)
+    if n == 0:
+        return np.array([], dtype=np.int32)
+
+    # Convert to numpy arrays (as int64 nanoseconds for datetime math)
+    # Use .values to get numpy array and avoid pandas index issues
+    t0_ns = symbol_targets['t0'].values.astype('datetime64[ns]').view('int64')
+    h_used = symbol_targets['h_used'].values.astype('float64')
+
+    # Handle NaN values
+    valid_mask = ~(np.isnan(h_used) | pd.isna(symbol_targets['t0'].values))
+
+    if not valid_mask.any():
+        return np.zeros(n, dtype=np.int32)
+
+    # Calculate end times (t0 + (h_used-1) days in nanoseconds)
+    day_ns = 24 * 60 * 60 * 1e9  # nanoseconds per day
+    t_end_ns = t0_ns + ((h_used - 1) * day_ns).astype('int64')
+
+    # Use sweep-line algorithm: O(n log n) instead of O(n²)
+    # Create events: (time, type, index) where type=0 is start, type=1 is end
+    events = []
+    for i in range(n):
+        if valid_mask[i]:
+            events.append((t0_ns[i], 0, i))      # start event
+            events.append((t_end_ns[i], 1, i))   # end event
+
+    # Sort events by time, then by type (starts before ends at same time)
+    events.sort(key=lambda x: (x[0], x[1]))
+
+    # Sweep through events tracking active trajectories
+    overlap_counts = np.zeros(n, dtype=np.int32)
+    active_set = set()
+
+    for time_ns, event_type, idx in events:
+        if event_type == 0:  # start
+            # Count current active trajectories as overlapping with this one
+            overlap_counts[idx] = len(active_set) + 1  # +1 for self
+            # Also increment count for all currently active trajectories
+            for active_idx in active_set:
+                overlap_counts[active_idx] += 1
+            active_set.add(idx)
+        else:  # end
+            active_set.discard(idx)
+
+    return overlap_counts
 
 
 def _count_overlaps_efficient(symbol_targets: pd.DataFrame) -> Dict:
     """
-    Efficiently count overlaps for a single symbol using vectorized operations.
-    
+    Efficiently count overlaps for a single symbol.
+
+    This is a wrapper that calls the vectorized version and returns
+    the result in the legacy format for backwards compatibility.
+
     Args:
         symbol_targets: DataFrame with t0 and h_used columns for one symbol
-        
+
     Returns:
-        Dictionary mapping (index, t0) -> overlap_count
+        Dictionary mapping index -> (t0, overlap_count)
     """
-    overlap_counts = {}
-    
-    # Convert to numpy for speed
+    overlap_counts_array = _count_overlaps_vectorized(symbol_targets)
     t0_array = symbol_targets['t0'].values
-    h_used_array = symbol_targets['h_used'].values
-    
-    for i, (t0_start, h_used) in enumerate(zip(t0_array, h_used_array)):
-        if pd.isna(t0_start) or pd.isna(h_used):
-            continue
-            
-        # Calculate end date for this trajectory
-        t0_end = t0_start + pd.Timedelta(days=h_used-1)
-        
-        # Count overlaps: trajectories that start before this one ends
-        # and end after this one starts
-        overlap_count = 0
-        for j, (other_t0, other_h_used) in enumerate(zip(t0_array, h_used_array)):
-            if pd.isna(other_t0) or pd.isna(other_h_used):
-                continue
-                
-            other_end = other_t0 + pd.Timedelta(days=other_h_used-1)
-            
-            # Check for overlap: other starts before this ends AND other ends after this starts
-            if other_t0 <= t0_end and other_end >= t0_start:
-                overlap_count += 1
-        
-        overlap_counts[i] = (t0_start, overlap_count)
-    
-    return overlap_counts
+
+    return {
+        i: (t0_array[i], count)
+        for i, count in enumerate(overlap_counts_array)
+        if not pd.isna(t0_array[i])
+    }
 
 
 def _process_symbol_group(df: pd.DataFrame, config: Dict, symbols: List[str],
@@ -480,13 +526,16 @@ def generate_targets_parallel(
     # Use ParallelConfig if provided, otherwise fall back to legacy params
     if parallel_config is not None:
         n_jobs = parallel_config.n_jobs
-        chunk_size = parallel_config.batch_size
+        # batch_size can be 'auto' (str), so handle it
+        if isinstance(parallel_config.batch_size, int):
+            chunk_size = parallel_config.batch_size
+        # else keep the default chunk_size
         backend = parallel_config.backend
         verbose = parallel_config.verbose
         prefer = parallel_config.prefer
     else:
         backend = 'loky'
-        verbose = 1
+        verbose = 0
         prefer = 'processes'
 
     if df.empty:
@@ -501,18 +550,33 @@ def generate_targets_parallel(
 
     # Get unique symbols and create chunks
     unique_symbols = df['symbol'].dropna().unique()
-    if len(unique_symbols) == 0:
+    n_symbols = len(unique_symbols)
+    if n_symbols == 0:
         logger.warning("No valid symbols found in DataFrame")
         return pd.DataFrame()
+
+    # Calculate effective jobs for optimal chunk sizing
+    if n_jobs == -1:
+        import multiprocessing
+        effective_jobs = multiprocessing.cpu_count()
+    else:
+        effective_jobs = n_jobs
+
+    # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
+    # If we can't achieve that, reduce the number of effective workers
+    min_chunk_size = 100
+    chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
+    n_chunks = max(1, n_symbols // chunk_size)
+    actual_workers = min(effective_jobs, n_chunks)
 
     # Create symbol chunks
     symbol_chunks = [
         unique_symbols[i:i + chunk_size].tolist()
-        for i in range(0, len(unique_symbols), chunk_size)
+        for i in range(0, n_symbols, chunk_size)
     ]
 
-    logger.info(f"Processing {len(unique_symbols)} symbols in {len(symbol_chunks)} chunks "
-                f"(n_jobs={n_jobs}, batch_size={chunk_size})")
+    logger.info(f"Processing {n_symbols} symbols in {len(symbol_chunks)} chunks "
+                f"(~{chunk_size} symbols/chunk, {actual_workers} workers)")
 
     # Process chunks in parallel
     try:

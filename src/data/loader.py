@@ -171,18 +171,62 @@ def _sectors_from_universe(path: str, max_symbols: Optional[int] = None) -> Dict
     return dict(zip(out[sym_col], out[sec_col]))
 
 DEFAULT_ETFS = [
-    # Core market ETFs
-    "SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "HYG", "LQD",
-    # Sector ETFs (cap-weighted)
+    # Core market benchmarks
+    "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO",
+
+    # Fixed income
+    "TLT", "IEF", "SHY", "HYG", "LQD", "AGG", "BND",
+
+    # Sector cap-weighted (Select Sector SPDRs)
     "XLF", "XLK", "XLE", "XLY", "XLI", "XLP", "XLV", "XLU", "XLB", "XLC", "XLRE",
-    # Equal-weighted sector ETFs
+
+    # Sector equal-weight (Invesco)
     "RSP", "RYT", "RYF", "RYE", "RYH", "RYU", "RHS", "RTM", "EWRE",
-    # International and commodities
-    "EFA", "EEM", "GLD", "SLV", "USO", "UNG",
-    # Subsector ETFs (user-specified list)
-    "SMH", "KBE", "IBB", "ITA", "XRT", "XOP", "SKYY", "HACK", "KRE", "IHE", 
-    "IGV", "XTN", "XBI", "PJP", "XAR", "TAN", "ICLN", "URA", "LIT", "COPX", 
-    "XHB", "ITB"
+
+    # Technology subsectors
+    "SMH", "SOXX", "IGV", "SKYY", "HACK", "WCLD", "CLOU",
+
+    # Financial subsectors
+    "KBE", "KRE", "IAI", "KIE",
+
+    # Healthcare/Biotech subsectors
+    "IBB", "XBI", "IHE", "PJP",
+
+    # Industrial subsectors
+    "ITA", "XAR", "ITB", "XHB", "IYT", "XTN",
+
+    # Energy subsectors
+    "XOP", "OIH", "XES", "AMLP",
+
+    # Consumer subsectors
+    "XRT", "IBUY", "PBJ",
+
+    # Materials/Mining subsectors
+    "XME", "COPX", "GDX", "GDXJ", "SIL",
+
+    # Clean energy/Green subsectors
+    "TAN", "ICLN", "QCLN", "PBW", "FAN",
+
+    # Nuclear/Uranium
+    "URA", "URNM",
+
+    # Lithium/Battery/EV
+    "LIT", "DRIV", "IDRV",
+
+    # International
+    "EFA", "EEM", "VEU", "IEFA", "IEMG",
+
+    # Commodities
+    "GLD", "SLV", "USO", "UNG", "DBC", "PDBC",
+
+    # Volatility/Alternatives
+    "VXX", "VIXY",
+
+    # Currency
+    "UUP",  # Dollar index (for cross-asset features)
+
+    # Volatility Indices (VIX = S&P 500 implied vol, VXN = Nasdaq-100 implied vol)
+    "^VIX", "^VXN",
 ]
 
 
@@ -287,43 +331,85 @@ def load_etf_universe(etf_symbols: Optional[List[str]] = None,
                       etf_csv_path: Optional[str] = None,
                       update: bool = False,
                       rate_limit: float = 1.0,
-                      interval: str = "1d") -> Optional[Dict[str, pd.DataFrame]]:
+                      interval: str = "1d",
+                      incremental: bool = True) -> Optional[Dict[str, pd.DataFrame]]:
     """
     Load ETF OHLCV into dict of wide DataFrames. Caches to *_etf.parquet.
     Choose one of:
       - etf_symbols (list)
       - etf_csv_path (CSV with Symbol column)
       - default curated list (if both are None)
+
+    Args:
+        incremental: If True, only fetch missing ETFs and merge with existing cache.
+                    If False, re-fetch all ETFs. Default True.
     """
     # Cache path
     cache_parquet = (CACHE_FILE.with_name(CACHE_FILE.stem + "_etf.parquet")
                      if hasattr(CACHE_FILE, "with_name") else str(CACHE_FILE).replace(".pkl", "_etf.parquet"))
 
-    # Try cache
-    if not update and os.path.exists(cache_parquet):
-        print(f"💾 ETFs: loading cache {cache_parquet}")
-        cached = _load_long_parquet(cache_parquet)
-        if cached: return cached
-        print("⚠️  ETF cache empty/corrupt — fetching")
-
-    # Resolve ETF symbols
+    # Resolve target ETF symbols
     if etf_csv_path and os.path.exists(etf_csv_path):
         print(f"📈 ETF CSV: {etf_csv_path}")
-        symbols = _symbols_from_csv(etf_csv_path, max_symbols=None)
+        target_symbols = _symbols_from_csv(etf_csv_path, max_symbols=None)
     elif etf_symbols:
-        symbols = list(dict.fromkeys(etf_symbols))  # dedupe, keep order
-        print(f"📈 ETF list provided ({len(symbols)})")
+        target_symbols = list(dict.fromkeys(etf_symbols))  # dedupe, keep order
+        print(f"📈 ETF list provided ({len(target_symbols)})")
     else:
-        symbols = DEFAULT_ETFS
-        print(f"📈 ETF default set ({len(symbols)})")
+        target_symbols = DEFAULT_ETFS
+        print(f"📈 ETF default set ({len(target_symbols)})")
 
-    print(f"✅ ETFs queued: {len(symbols)}")
+    # Load existing cache
+    cached = None
+    if os.path.exists(cache_parquet):
+        print(f"💾 ETFs: loading cache {cache_parquet}")
+        cached = _load_long_parquet(cache_parquet)
 
-    # Fetch & cache
-    data = _fetch_symbols(symbols, interval=interval, rate_limit=rate_limit)
+    # If not updating and cache exists, return it (but check for missing symbols)
+    if not update and cached:
+        # Check which symbols are missing from cache
+        cached_symbols = set()
+        for metric_df in cached.values():
+            cached_symbols.update(metric_df.columns.tolist())
+
+        missing = [s for s in target_symbols if s not in cached_symbols]
+
+        if not missing:
+            print(f"✅ All {len(target_symbols)} ETFs found in cache")
+            return cached
+        elif incremental:
+            print(f"⏳ {len(missing)} ETFs missing from cache, fetching incrementally...")
+            print(f"   Missing: {missing}")
+            new_data = _fetch_symbols(missing, interval=interval, rate_limit=rate_limit)
+
+            if new_data:
+                # Merge with existing cache
+                for metric, new_df in new_data.items():
+                    if metric in cached:
+                        # Concat along columns (symbols), aligning on date index
+                        cached[metric] = pd.concat([cached[metric], new_df], axis=1).sort_index()
+                    else:
+                        cached[metric] = new_df
+
+                # Save updated cache
+                print(f"💾 ETFs: writing updated cache {cache_parquet}")
+                _save_long_parquet(cached, cache_parquet)
+
+            return cached
+        else:
+            print("⚠️  Missing ETFs but incremental=False, will re-fetch all")
+
+    # Full fetch (update=True or no valid cache)
+    print(f"✅ ETFs queued: {len(target_symbols)}")
+    data = _fetch_symbols(target_symbols, interval=interval, rate_limit=rate_limit)
     if not data:
-        print("❌ no ETF data fetched"); return None
+        print("❌ no ETF data fetched"); return cached  # Return cached if available
 
     print(f"💾 ETFs: writing {cache_parquet}")
     _save_long_parquet(data, cache_parquet)
     return data
+
+
+# Note: VIX/VXN should be downloaded via load_etf_universe() which includes
+# ^VIX and ^VXN in DEFAULT_ETFS. The RapidAPI yahoo-finance15 endpoint
+# supports these symbols. No yfinance fallback is needed.

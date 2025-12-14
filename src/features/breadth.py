@@ -36,13 +36,16 @@ def add_breadth_series(
 ) -> None:
     """
     Add market breadth features based on percentage of universe stocks above moving averages.
-    
+
     Features added to all symbols:
-    - pct_universe_above_ma20: Percentage of universe above 20-day MA
-    - pct_universe_above_ma50: Percentage of universe above 50-day MA  
-    - pct_universe_above_ma200: Percentage of universe above 200-day MA
-    - ad_line_universe: Cumulative advance/decline line for universe
-    
+    - pct_universe_above_ma20: Percentage of universe above 20-day MA (0-100)
+    - pct_universe_above_ma50: Percentage of universe above 50-day MA (0-100)
+    - pct_universe_above_ma200: Percentage of universe above 200-day MA (0-100)
+    - ad_ratio_universe: Daily advance/decline ratio (-1 to +1)
+    - ad_ratio_ema10: 10-day EMA of A/D ratio (smoothed)
+    - mcclellan_oscillator: 19-day EMA minus 39-day EMA of A/D ratio
+    - ad_thrust_10d: 10-day rolling sum of A/D ratio (sustained breadth)
+
     Args:
         indicators_by_symbol: Dictionary of symbol DataFrames (modified in place)
         universe_tickers: List of ticker symbols to include in breadth calculation
@@ -108,15 +111,31 @@ def add_breadth_series(
     pct50 = _pct(above50).rename("pct_universe_above_ma50")
     pct200 = _pct(above200).rename("pct_universe_above_ma200")
 
-    # Compute advance/decline line
+    # Compute advance/decline features (stationary, ML-friendly)
     ad_panel = pd.DataFrame(advdec)
+    n_stocks = ad_panel.count(axis=1)  # Number of stocks with data each day
+
+    # Daily A/D ratio: (advances - declines) / total = net / total
+    # Ranges from -1 (all decline) to +1 (all advance)
     ad_net = ad_panel.sum(axis=1, skipna=True)  # Net advances per day
-    ad_line = ad_net.cumsum().rename("ad_line_universe")  # Cumulative A/D line
+    ad_ratio = (ad_net / n_stocks.replace(0, np.nan)).rename("ad_ratio_universe")
+
+    # Smoothed A/D ratio (10-day EMA)
+    ad_ratio_ema10 = ad_ratio.ewm(span=10, min_periods=5).mean().rename("ad_ratio_ema10")
+
+    # McClellan Oscillator: 19-day EMA - 39-day EMA of A/D ratio
+    ema19 = ad_ratio.ewm(span=19, min_periods=10).mean()
+    ema39 = ad_ratio.ewm(span=39, min_periods=20).mean()
+    mcclellan = (ema19 - ema39).rename("mcclellan_oscillator")
+
+    # A/D thrust: 10-day sum of A/D ratio (measures sustained breadth)
+    ad_thrust = ad_ratio.rolling(10, min_periods=5).sum().rename("ad_thrust_10d")
 
     # Attach breadth features to ALL symbols
+    breadth_series = [pct20, pct50, pct200, ad_ratio, ad_ratio_ema10, mcclellan, ad_thrust]
     attached_count = 0
     for sym, df in indicators_by_symbol.items():
-        for s in [pct20, pct50, pct200, ad_line]:
+        for s in breadth_series:
             if len(s) > 0:
                 # Reindex to symbol's date range and convert to float32
                 df[s.name] = pd.to_numeric(s.reindex(df.index), errors='coerce').astype('float32')

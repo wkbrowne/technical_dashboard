@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 def _interpolate_single_symbol(symbol: str, df: pd.DataFrame) -> Tuple[str, pd.DataFrame, int]:
     """
     Interpolate internal NaN gaps for a single symbol's DataFrame.
-    
+
     Args:
         symbol: Symbol identifier
         df: DataFrame with features to interpolate
-        
+
     Returns:
         Tuple of (symbol, processed_dataframe, filled_count)
     """
@@ -36,6 +36,13 @@ def _interpolate_single_symbol(symbol: str, df: pd.DataFrame) -> Tuple[str, pd.D
 
         # Create a copy to avoid modifying original
         df_processed = df.copy()
+
+        # Handle duplicate columns - keep first occurrence only
+        # This can happen when features are merged multiple times
+        if df_processed.columns.duplicated().any():
+            dup_cols = df_processed.columns[df_processed.columns.duplicated()].unique().tolist()
+            logger.debug(f"{symbol}: Removing {len(dup_cols)} duplicate columns: {dup_cols[:5]}")
+            df_processed = df_processed.loc[:, ~df_processed.columns.duplicated()]
 
         # Ensure chronological order
         df_processed.sort_index(inplace=True)
@@ -51,20 +58,45 @@ def _interpolate_single_symbol(symbol: str, df: pd.DataFrame) -> Tuple[str, pd.D
 
         # Interpolate only gaps strictly inside observed values
         method = 'time' if np.issubdtype(df_processed.index.dtype, np.datetime64) else 'linear'
-        df_processed[num_cols] = df_processed[num_cols].interpolate(
-            method=method,
-            limit_area='inside',         # <-- only fill NaNs bounded by numbers
-            limit_direction='both'       # direction doesn't matter with 'inside', but harmless
-        )
+
+        # Use column-by-column interpolation to avoid assignment issues with column selection
+        for col in num_cols:
+            df_processed[col] = df_processed[col].interpolate(
+                method=method,
+                limit_area='inside',         # <-- only fill NaNs bounded by numbers
+                limit_direction='both'       # direction doesn't matter with 'inside', but harmless
+            )
 
         after_nans = df_processed[num_cols].isna().sum().sum()
         filled_count = int(before_nans - after_nans)
-        
+
         return symbol, df_processed, filled_count
 
     except Exception as e:
         logger.warning(f"Error interpolating {symbol}: {e}")
         return symbol, df, 0
+
+
+def _interpolate_batch(symbol_data_list: List[Tuple[str, pd.DataFrame]]) -> List[Tuple[str, pd.DataFrame, int]]:
+    """
+    Process a batch of symbols for NaN interpolation.
+
+    Args:
+        symbol_data_list: List of (symbol, dataframe) tuples to process
+
+    Returns:
+        List of (symbol, processed_dataframe, filled_count) tuples
+    """
+    results = []
+    for symbol, df in symbol_data_list:
+        result = _interpolate_single_symbol(symbol, df)
+        results.append(result)
+    return results
+
+
+def _chunk_list(items: List, chunk_size: int) -> List[List]:
+    """Split a list into chunks of specified size."""
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
 def interpolate_internal_gaps(
@@ -96,26 +128,22 @@ def interpolate_internal_gaps(
         - Uses 'time' interpolation for datetime indexes, 'linear' for others
         - Replaces inf/-inf with NaN before interpolation
         - Works only on numeric columns, preserves other column types
-        - Parallelized for improved performance with large symbol counts
+        - Parallelized with batching for improved performance with large symbol counts
     """
     # Use ParallelConfig if provided, otherwise fall back to legacy params
     if parallel_config is not None:
         n_jobs = parallel_config.n_jobs
-        batch_size = parallel_config.batch_size
         backend = parallel_config.backend
         verbose = parallel_config.verbose
         prefer = parallel_config.prefer
     else:
         backend = 'loky'
-        verbose = 1
+        verbose = 0
         prefer = 'processes'
 
     if not indicators_by_symbol:
         logger.info("No symbols to interpolate")
         return indicators_by_symbol
-
-    logger.info(f"Interpolating internal NaN gaps for {len(indicators_by_symbol)} symbols "
-               f"(n_jobs={n_jobs}, batch_size={batch_size})...")
 
     # Filter out empty/None DataFrames before processing
     valid_symbols = [(sym, df) for sym, df in indicators_by_symbol.items()
@@ -125,29 +153,54 @@ def interpolate_internal_gaps(
         logger.info("No valid symbols with data to interpolate")
         return indicators_by_symbol
 
-    logger.debug(f"Processing {len(valid_symbols)} valid symbols out of {len(indicators_by_symbol)} total")
+    n_symbols = len(valid_symbols)
+
+    # Calculate effective jobs for chunk sizing
+    if n_jobs == -1:
+        import multiprocessing
+        effective_jobs = multiprocessing.cpu_count()
+    else:
+        effective_jobs = n_jobs
+
+    # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
+    # If we can't achieve that, reduce the number of effective workers
+    min_chunk_size = 100
+    chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
+    n_chunks = max(1, n_symbols // chunk_size)
+    actual_workers = min(effective_jobs, n_chunks)
+
+    logger.info(f"Interpolating internal NaN gaps for {n_symbols} symbols...")
 
     # Use sequential processing if n_jobs=1 or small dataset
-    if n_jobs == 1 or len(valid_symbols) < 10:
+    if n_jobs == 1 or n_symbols < 10:
         logger.info("Using sequential processing for interpolation")
         results = []
         for symbol, df in valid_symbols:
             result = _interpolate_single_symbol(symbol, df)
             results.append(result)
     else:
-        # Parallel processing
-        logger.info(f"Using parallel processing with {n_jobs} jobs")
+        # Create batches for parallel processing
+        symbol_chunks = _chunk_list(valid_symbols, chunk_size)
+        n_chunks = len(symbol_chunks)
+
+        logger.info(f"Processing in {n_chunks} batches (~{chunk_size} symbols/batch, {actual_workers} workers)")
+
         try:
-            results = Parallel(
+            batch_results = Parallel(
                 n_jobs=n_jobs,
                 backend=backend,
-                batch_size=batch_size,
                 verbose=verbose,
                 prefer=prefer
             )(
-                delayed(_interpolate_single_symbol)(symbol, df)
-                for symbol, df in valid_symbols
+                delayed(_interpolate_batch)(chunk)
+                for chunk in symbol_chunks
             )
+
+            # Flatten batch results
+            results = []
+            for batch in batch_results:
+                results.extend(batch)
+
         except Exception as e:
             logger.warning(f"Parallel processing failed ({e}), falling back to sequential")
             results = []

@@ -45,23 +45,107 @@ def get_sp500_symbols() -> List[str]:
 
 
 def get_default_etfs() -> List[str]:
-    """Get default ETF list for benchmarks."""
+    """Get comprehensive ETF list including all sector and subsector ETFs."""
     return [
-        # Core benchmarks
-        "SPY", "QQQ", "IWM", "DIA",
+        # Core market benchmarks
+        "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO",
+
         # Fixed income
-        "TLT", "IEF", "HYG", "LQD",
-        # Sector cap-weighted
+        "TLT", "IEF", "SHY", "HYG", "LQD", "AGG", "BND",
+
+        # Sector cap-weighted (Select Sector SPDRs)
         "XLF", "XLK", "XLE", "XLY", "XLI", "XLP", "XLV", "XLU", "XLB", "XLC", "XLRE",
-        # Sector equal-weight
-        "RSP", "RYT", "RYF", "RYE", "RGI", "RHS", "RYH", "RYU",
+
+        # Sector equal-weight (Invesco)
+        "RSP",   # S&P 500 Equal Weight
+        "RYT",   # Technology Equal Weight
+        "RYF",   # Financial Equal Weight
+        "RYE",   # Energy Equal Weight
+        "RYH",   # Healthcare Equal Weight (note: maps to XLI equal weight in some configs)
+        "RYU",   # Utilities Equal Weight
+        "RHS",   # Consumer Staples Equal Weight
+        "RTM",   # Materials Equal Weight
+        "EWRE",  # Real Estate Equal Weight
+
+        # Technology subsectors
+        "SMH",   # VanEck Semiconductor ETF
+        "SOXX",  # iShares Semiconductor ETF
+        "IGV",   # iShares Expanded Tech-Software ETF
+        "SKYY",  # First Trust Cloud Computing ETF
+        "HACK",  # ETFMG Prime Cyber Security ETF
+        "WCLD",  # WisdomTree Cloud Computing ETF
+        "CLOU",  # Global X Cloud Computing ETF
+
+        # Financial subsectors
+        "KBE",   # SPDR S&P Bank ETF
+        "KRE",   # SPDR S&P Regional Banking ETF
+        "IAI",   # iShares U.S. Broker-Dealers & Securities Exchanges ETF
+        "KIE",   # SPDR S&P Insurance ETF
+
+        # Healthcare/Biotech subsectors
+        "IBB",   # iShares Biotechnology ETF
+        "XBI",   # SPDR S&P Biotech ETF
+        "IHE",   # iShares U.S. Pharmaceuticals ETF
+        "PJP",   # Invesco Dynamic Pharmaceuticals ETF
+        "XLV",   # Health Care Select Sector (also sector)
+
+        # Industrial subsectors
+        "ITA",   # iShares U.S. Aerospace & Defense ETF
+        "XAR",   # SPDR S&P Aerospace & Defense ETF
+        "ITB",   # iShares U.S. Home Construction ETF
+        "XHB",   # SPDR S&P Homebuilders ETF
+        "IYT",   # iShares U.S. Transportation ETF
+        "XTN",   # SPDR S&P Transportation ETF
+
+        # Energy subsectors
+        "XOP",   # SPDR S&P Oil & Gas Exploration & Production ETF
+        "OIH",   # VanEck Oil Services ETF
+        "XES",   # SPDR S&P Oil & Gas Equipment & Services ETF
+        "AMLP",  # Alerian MLP ETF (midstream)
+
+        # Consumer subsectors
+        "XRT",   # SPDR S&P Retail ETF
+        "XHB",   # SPDR S&P Homebuilders ETF (also construction)
+        "IBUY",  # Amplify Online Retail ETF
+        "PBJ",   # Invesco Food & Beverage ETF
+
+        # Materials/Mining subsectors
+        "XME",   # SPDR S&P Metals & Mining ETF
+        "COPX",  # Global X Copper Miners ETF
+        "GDX",   # VanEck Gold Miners ETF
+        "GDXJ",  # VanEck Junior Gold Miners ETF
+        "SIL",   # Global X Silver Miners ETF
+
+        # Clean energy/Green subsectors
+        "TAN",   # Invesco Solar ETF
+        "ICLN",  # iShares Global Clean Energy ETF
+        "QCLN",  # First Trust NASDAQ Clean Edge Green Energy ETF
+        "PBW",   # Invesco WilderHill Clean Energy ETF
+        "FAN",   # First Trust Global Wind Energy ETF
+
+        # Nuclear/Uranium
+        "URA",   # Global X Uranium ETF
+        "URNM",  # Sprott Uranium Miners ETF
+
+        # Lithium/Battery/EV
+        "LIT",   # Global X Lithium & Battery Tech ETF
+        "DRIV",  # Global X Autonomous & Electric Vehicles ETF
+        "IDRV",  # iShares Self-Driving EV and Tech ETF
+
         # International
-        "EFA", "EEM", "VEU",
+        "EFA", "EEM", "VEU", "IEFA", "IEMG",
+
         # Commodities
-        "GLD", "SLV", "USO", "UNG",
-        # Subsector ETFs
-        "SMH", "KBE", "KRE", "IBB", "XBI", "ITA", "XRT", "XHB",
-        "SOXX", "IGV", "ITB", "XME", "XOP", "OIH",
+        "GLD", "SLV", "USO", "UNG", "DBC", "PDBC",
+
+        # Volatility/Alternatives
+        "VXX", "VIXY",
+
+        # Currency
+        "UUP",  # Dollar index (for cross-asset features)
+
+        # Volatility Indices (VIX = S&P 500 implied vol, VXN = Nasdaq-100 implied vol)
+        "^VIX", "^VXN",
     ]
 
 

@@ -13,37 +13,125 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Direct ticker-to-subsector ETF mapping for well-known stocks
+# This is more reliable than keyword matching for major holdings
+TICKER_TO_SUBSECTOR = {
+    # SMH - Semiconductors (VanEck Semiconductor ETF major holdings + peers)
+    'NVDA': 'SMH', 'AMD': 'SMH', 'INTC': 'SMH', 'AVGO': 'SMH', 'QCOM': 'SMH',
+    'TXN': 'SMH', 'MU': 'SMH', 'AMAT': 'SMH', 'LRCX': 'SMH', 'KLAC': 'SMH',
+    'ADI': 'SMH', 'MRVL': 'SMH', 'NXPI': 'SMH', 'ON': 'SMH', 'MCHP': 'SMH',
+    'ASML': 'SMH', 'TSM': 'SMH', 'ARM': 'SMH', 'SNPS': 'SMH', 'CDNS': 'SMH',
+
+    # IGV - Software (iShares Expanded Tech-Software ETF)
+    # Also includes major tech companies with significant software/services
+    'MSFT': 'IGV', 'ORCL': 'IGV', 'CRM': 'IGV', 'ADBE': 'IGV', 'NOW': 'IGV',
+    'INTU': 'IGV', 'PANW': 'IGV', 'CRWD': 'IGV', 'WDAY': 'IGV', 'ADSK': 'IGV',
+    'FTNT': 'IGV', 'TEAM': 'IGV', 'DDOG': 'IGV', 'ZS': 'IGV', 'SNOW': 'IGV',
+    'PLTR': 'IGV', 'MDB': 'IGV', 'NET': 'IGV', 'HUBS': 'IGV', 'DOCU': 'IGV',
+    # Consumer tech with significant services/software revenue
+    'AAPL': 'IGV',  # Apple - major services business (App Store, Apple Music, iCloud)
+    'META': 'IGV',  # Meta - software/platforms company
+    'NFLX': 'IGV',  # Netflix - streaming software platform
+    'SPOT': 'IGV',  # Spotify - streaming software
+    'UBER': 'IGV',  # Uber - platform/software
+    'LYFT': 'IGV',  # Lyft - platform/software
+    'ABNB': 'IGV',  # Airbnb - platform/software
+    'SNAP': 'IGV',  # Snap - social software
+
+    # SKYY - Cloud Computing
+    'AMZN': 'SKYY', 'GOOGL': 'SKYY', 'GOOG': 'SKYY', 'ZM': 'SKYY', 'TWLO': 'SKYY',
+    'OKTA': 'SKYY', 'DBX': 'SKYY', 'BOX': 'SKYY', 'SPLK': 'SKYY', 'ESTC': 'SKYY',
+
+    # HACK - Cybersecurity
+    'CYBR': 'HACK', 'CHKP': 'HACK', 'QLYS': 'HACK', 'TENB': 'HACK', 'RPD': 'HACK',
+    'S': 'HACK', 'VRNS': 'HACK', 'SAIL': 'HACK',
+
+    # KBE - Banks (SPDR S&P Bank ETF)
+    'JPM': 'KBE', 'BAC': 'KBE', 'WFC': 'KBE', 'C': 'KBE', 'GS': 'KBE',
+    'MS': 'KBE', 'USB': 'KBE', 'PNC': 'KBE', 'TFC': 'KBE', 'COF': 'KBE',
+    'BK': 'KBE', 'STT': 'KBE', 'SCHW': 'KBE', 'FITB': 'KBE', 'MTB': 'KBE',
+
+    # KRE - Regional Banks
+    'ZION': 'KRE', 'RF': 'KRE', 'HBAN': 'KRE', 'CFG': 'KRE', 'KEY': 'KRE',
+    'CMA': 'KRE', 'FHN': 'KRE', 'ALLY': 'KRE', 'WAL': 'KRE', 'EWBC': 'KRE',
+
+    # IBB - Biotech (iShares Biotechnology ETF)
+    'AMGN': 'IBB', 'GILD': 'IBB', 'VRTX': 'IBB', 'REGN': 'IBB', 'BIIB': 'IBB',
+    'MRNA': 'IBB', 'SGEN': 'IBB', 'ILMN': 'IBB', 'ALNY': 'IBB', 'BMRN': 'IBB',
+    'INCY': 'IBB', 'EXEL': 'IBB', 'UTHR': 'IBB', 'SRPT': 'IBB', 'IONS': 'IBB',
+
+    # XBI - Small/Mid Biotech (SPDR S&P Biotech ETF) - more speculative names
+    'ACAD': 'XBI', 'RARE': 'XBI', 'NBIX': 'XBI', 'INSM': 'XBI', 'PCVX': 'XBI',
+    'RYTM': 'XBI', 'APLS': 'XBI', 'KRYS': 'XBI', 'DVAX': 'XBI', 'TGTX': 'XBI',
+
+    # IHE - Pharma (iShares U.S. Pharmaceuticals ETF)
+    'JNJ': 'IHE', 'PFE': 'IHE', 'MRK': 'IHE', 'LLY': 'IHE', 'ABBV': 'IHE',
+    'BMY': 'IHE', 'AZN': 'IHE', 'NVO': 'IHE', 'SNY': 'IHE', 'GSK': 'IHE',
+    'ZTS': 'IHE', 'VTRS': 'IHE', 'TAK': 'IHE', 'TEVA': 'IHE',
+
+    # ITA - Aerospace & Defense (iShares U.S. Aerospace & Defense ETF)
+    'BA': 'ITA', 'LMT': 'ITA', 'RTX': 'ITA', 'NOC': 'ITA', 'GD': 'ITA',
+    'GE': 'ITA', 'LHX': 'ITA', 'TDG': 'ITA', 'HII': 'ITA', 'TXT': 'ITA',
+    'HWM': 'ITA', 'AXON': 'ITA', 'LDOS': 'ITA', 'KTOS': 'ITA',
+
+    # XOP - Oil & Gas Exploration (SPDR S&P Oil & Gas Exploration ETF)
+    'XOM': 'XOP', 'CVX': 'XOP', 'COP': 'XOP', 'EOG': 'XOP', 'PXD': 'XOP',
+    'DVN': 'XOP', 'FANG': 'XOP', 'MRO': 'XOP', 'OXY': 'XOP', 'APA': 'XOP',
+    'HAL': 'XOP', 'SLB': 'XOP', 'BKR': 'XOP', 'HES': 'XOP',
+
+    # XRT - Retail (SPDR S&P Retail ETF)
+    'WMT': 'XRT', 'COST': 'XRT', 'TGT': 'XRT', 'HD': 'XRT', 'LOW': 'XRT',
+    'TJX': 'XRT', 'ROST': 'XRT', 'DG': 'XRT', 'DLTR': 'XRT', 'BBY': 'XRT',
+    'ORLY': 'XRT', 'AZO': 'XRT', 'TSCO': 'XRT', 'ULTA': 'XRT',
+
+    # ITB/XHB - Homebuilders
+    'DHI': 'ITB', 'LEN': 'ITB', 'PHM': 'ITB', 'NVR': 'ITB', 'TOL': 'ITB',
+    'KBH': 'ITB', 'MDC': 'ITB', 'TMHC': 'ITB', 'MTH': 'ITB', 'MHO': 'ITB',
+
+    # TAN - Solar
+    'ENPH': 'TAN', 'FSLR': 'TAN', 'SEDG': 'TAN', 'RUN': 'TAN', 'NOVA': 'TAN',
+    'ARRY': 'TAN', 'MAXN': 'TAN', 'SPWR': 'TAN',
+
+    # LIT - Lithium/Battery
+    'ALB': 'LIT', 'SQM': 'LIT', 'LTHM': 'LIT', 'LAC': 'LIT', 'PLL': 'LIT',
+    'RIVN': 'LIT', 'LCID': 'LIT',  # EV plays in lithium ETF
+
+    # URA - Uranium
+    'CCJ': 'URA', 'UEC': 'URA', 'DNN': 'URA', 'NXE': 'URA', 'UUUU': 'URA',
+}
+
 # Subsector ETF keywords for matching (user-specified 22 ETFs)
+# Used as fallback when ticker not in TICKER_TO_SUBSECTOR
 SUBSECTOR_ETF_KEYWORDS = {
     # Technology subsectors
     'SMH': ['semiconductor', 'chip', 'memory', 'processor', 'intel', 'nvidia', 'amd', 'micron', 'broadcom'],
     'SKYY': ['cloud', 'saas', 'software', 'platform', 'computing', 'salesforce', 'microsoft', 'amazon web'],
     'HACK': ['cyber', 'security', 'firewall', 'antivirus', 'palo alto', 'symantec', 'mcafee'],
     'IGV': ['software', 'application', 'enterprise', 'database', 'oracle', 'sap', 'adobe'],
-    
-    # Financial subsectors  
+
+    # Financial subsectors
     'KBE': ['bank', 'banking', 'jpmorgan', 'wells fargo', 'bank of america', 'citigroup'],
     'KRE': ['regional bank', 'community bank', 'zions', 'regions', 'fifth third', 'huntington'],
-    
+
     # Healthcare/Biotech subsectors
     'IBB': ['biotech', 'biotechnology', 'biogen', 'gilead', 'amgen', 'vertex', 'regeneron'],
     'IHE': ['pharma', 'pharmaceutical', 'drug', 'pfizer', 'merck', 'johnson', 'abbott'],
     'XBI': ['biotech', 'small biotech', 'emerging biotech', 'clinical', 'therapeutics'],
     'PJP': ['pharma', 'pharmaceutical', 'medicine', 'healthcare'],
-    
+
     # Industrial subsectors
     'ITA': ['aerospace', 'defense', 'aviation', 'boeing', 'lockheed', 'raytheon', 'northrop'],
     'XAR': ['aerospace', 'defense', 'military', 'contractor'],
     'ITB': ['homebuilder', 'construction', 'building', 'home depot', 'lowes', 'residential'],
     'XHB': ['homebuilder', 'housing', 'construction', 'building materials'],
-    
+
     # Energy subsectors
     'XOP': ['oil', 'exploration', 'production', 'drilling', 'petroleum', 'exxon', 'chevron'],
     'XTN': ['transportation', 'pipeline', 'midstream', 'energy infrastructure'],
-    
+
     # Consumer subsectors
     'XRT': ['retail', 'store', 'shopping', 'consumer', 'walmart', 'target', 'costco'],
-    
+
     # Clean energy/materials
     'TAN': ['solar', 'renewable', 'clean energy', 'photovoltaic', 'green energy'],
     'ICLN': ['clean energy', 'renewable', 'wind', 'solar', 'green', 'sustainable'],
@@ -105,7 +193,7 @@ def build_enhanced_sector_mappings(universe_csv: str, stock_data: Dict[str, pd.D
     Returns:
         Enhanced mapping dictionary with equal-weighted and subsector ETF assignments
     """
-    logger.info("Building enhanced sector/subsector mappings with keyword matching...")
+    logger.info("Building enhanced sector/subsector mappings (ticker lookup + keyword + correlation)...")
     
     # Load universe data with simplified field extraction
     universe_df = pd.read_csv(universe_csv)
@@ -143,10 +231,11 @@ def build_enhanced_sector_mappings(universe_csv: str, stock_data: Dict[str, pd.D
         
         # Get equal-weighted equivalent
         equal_weight_etf = EQUAL_WEIGHT_ETF_MAP.get(sector_etf)
-        
-        # Find best subsector ETF using keyword matching
-        subsector_etf = _find_best_subsector_etf_by_keywords(
-            symbol, symbol_info.get(symbol, {}), stock_data, etf_data
+
+        # Find best subsector ETF using multi-stage approach:
+        # 1. Direct ticker mapping, 2. Keyword matching, 3. Correlation-based discovery
+        subsector_etf = _find_best_subsector_etf(
+            symbol, symbol_info.get(symbol, {}), sector_etf, stock_data, etf_data
         )
         
         # Calculate correlations for validation
@@ -174,76 +263,138 @@ def build_enhanced_sector_mappings(universe_csv: str, stock_data: Dict[str, pd.D
     return enhanced_mappings
 
 
-def _find_best_subsector_etf_by_keywords(symbol: str, symbol_info: Dict, 
-                                        stock_data: Dict, etf_data: Dict) -> Optional[str]:
+def _find_best_subsector_by_correlation(
+    symbol: str,
+    sector_etf: str,
+    stock_data: Dict,
+    etf_data: Dict,
+    min_improvement: float = 0.03,
+    min_data_points: int = 100
+) -> Optional[str]:
     """
-    Find the best subsector ETF for a symbol using keyword matching across description and industry.
-    
+    Find the best subsector ETF by testing correlation improvement over sector ETF.
+
+    This function tests ALL available subsector ETFs and returns the one with the
+    highest correlation that also improves over the sector ETF correlation.
+
+    Args:
+        symbol: Stock symbol
+        sector_etf: The stock's assigned sector ETF
+        stock_data: Stock price data dict
+        etf_data: ETF price data dict
+        min_improvement: Minimum correlation improvement over sector required (default 0.03)
+        min_data_points: Minimum overlapping data points required (default 100)
+
+    Returns:
+        Best subsector ETF symbol if it improves over sector, else None
+    """
+    if symbol not in stock_data:
+        return None
+
+    stock_df = stock_data[symbol]
+    if 'adjclose' not in stock_df.columns:
+        return None
+
+    stock_returns = stock_df['adjclose'].pct_change().dropna()
+    if len(stock_returns) < min_data_points:
+        return None
+
+    # Calculate sector correlation as baseline
+    sector_corr = 0.0
+    if sector_etf in etf_data and 'adjclose' in etf_data[sector_etf].columns:
+        sector_returns = etf_data[sector_etf]['adjclose'].pct_change().dropna()
+        common_idx = stock_returns.index.intersection(sector_returns.index)
+        if len(common_idx) >= min_data_points:
+            try:
+                sector_corr = stock_returns.loc[common_idx].corr(sector_returns.loc[common_idx])
+            except:
+                pass
+
+    # Test all subsector ETFs
+    best_subsector = None
+    best_improvement = 0.0
+
+    all_subsector_etfs = set(SUBSECTOR_ETF_KEYWORDS.keys())
+
+    for subsector_etf in all_subsector_etfs:
+        if subsector_etf not in etf_data:
+            continue
+        if 'adjclose' not in etf_data[subsector_etf].columns:
+            continue
+
+        subsector_returns = etf_data[subsector_etf]['adjclose'].pct_change().dropna()
+        common_idx = stock_returns.index.intersection(subsector_returns.index)
+
+        if len(common_idx) < min_data_points:
+            continue
+
+        try:
+            subsector_corr = stock_returns.loc[common_idx].corr(subsector_returns.loc[common_idx])
+            improvement = subsector_corr - sector_corr
+
+            # Only consider if it improves over sector by at least min_improvement
+            if improvement >= min_improvement and improvement > best_improvement:
+                best_improvement = improvement
+                best_subsector = subsector_etf
+        except:
+            continue
+
+    return best_subsector
+
+
+def _find_best_subsector_etf(
+    symbol: str,
+    symbol_info: Dict,
+    sector_etf: str,
+    stock_data: Dict,
+    etf_data: Dict
+) -> Optional[str]:
+    """
+    Find the best subsector ETF using a multi-stage approach:
+    1. Direct ticker mapping (most reliable for well-known stocks)
+    2. Keyword matching from description/industry
+    3. Correlation-based discovery (tests all subsector ETFs for improvement over sector)
+
     Args:
         symbol: Stock symbol
         symbol_info: Symbol metadata (description, industry, etc.)
-        stock_data: Stock price data (for correlation tie-breaking)
-        etf_data: ETF price data (for correlation tie-breaking)
-        
+        sector_etf: The stock's assigned sector ETF
+        stock_data: Stock price data (for correlation analysis)
+        etf_data: ETF price data (for correlation analysis)
+
     Returns:
         Best matching subsector ETF symbol or None
     """
+    # Stage 1: Direct ticker-to-subsector mapping (most reliable)
+    if symbol in TICKER_TO_SUBSECTOR:
+        return TICKER_TO_SUBSECTOR[symbol]
+
+    # Stage 2: Keyword matching from description/industry
     description = symbol_info.get('description', '').lower()
     industry = symbol_info.get('industry', '').lower()
     combined_text = f"{description} {industry}".strip()
-    
-    if not combined_text:
-        return None
-    
-    # Score all subsector ETFs by keyword matching
-    candidates = []
-    for subsector_etf, keywords in SUBSECTOR_ETF_KEYWORDS.items():
-        keyword_score = sum(1 for keyword in keywords if keyword.lower() in combined_text)
-        if keyword_score > 0:
-            candidates.append((subsector_etf, keyword_score))
-    
-    if not candidates:
-        return None
-    
-    # Sort by score (highest first)
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    
-    # If single best match or clear winner, return it
-    if len(candidates) == 1 or candidates[0][1] > candidates[1][1]:
-        return candidates[0][0]
-    
-    # Multiple candidates with same score - use correlation for tie-breaking
-    best_candidates = [c for c in candidates if c[1] == candidates[0][1]]
-    
-    if symbol not in stock_data:
-        return best_candidates[0][0]  # Just return first if no price data
-    
-    stock_returns = stock_data[symbol].get('adjclose')
-    if stock_returns is None:
-        return best_candidates[0][0]
-    
-    stock_returns = stock_returns.pct_change().dropna()
-    best_subsector = None
-    best_correlation = -1
-    
-    for subsector_etf, _ in best_candidates:
-        if subsector_etf in etf_data and 'adjclose' in etf_data[subsector_etf].columns:
-            etf_returns = etf_data[subsector_etf]['adjclose'].pct_change().dropna()
-            
-            # Align time series
-            common_index = stock_returns.index.intersection(etf_returns.index)
-            if len(common_index) > 100:  # Need sufficient data
-                try:
-                    correlation = stock_returns.loc[common_index].corr(
-                        etf_returns.loc[common_index]
-                    )
-                    if correlation > best_correlation:
-                        best_correlation = correlation
-                        best_subsector = subsector_etf
-                except:
-                    continue
-    
-    return best_subsector or best_candidates[0][0]
+
+    if combined_text:
+        # Score all subsector ETFs by keyword matching
+        candidates = []
+        for subsector_etf, keywords in SUBSECTOR_ETF_KEYWORDS.items():
+            keyword_score = sum(1 for keyword in keywords if keyword.lower() in combined_text)
+            if keyword_score > 0:
+                candidates.append((subsector_etf, keyword_score))
+
+        if candidates:
+            # Sort by score (highest first)
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            # Return top keyword match
+            return candidates[0][0]
+
+    # Stage 3: Correlation-based discovery
+    # Test all subsector ETFs and find one that improves correlation over sector
+    return _find_best_subsector_by_correlation(
+        symbol, sector_etf, stock_data, etf_data,
+        min_improvement=0.03,  # Require at least 3% correlation improvement
+        min_data_points=100
+    )
 
 
 def _calculate_correlations(symbol: str, sector_etf: str, subsector_etf: Optional[str],

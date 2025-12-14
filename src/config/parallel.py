@@ -27,8 +27,8 @@ class ParallelConfig:
             1 = sequential processing (useful for debugging)
             N = use N workers
         batch_size: Number of symbols to process per batch.
+            'auto' = let joblib determine optimal size (recommended for large core counts)
             Larger batches reduce IPC overhead but increase memory usage.
-            Recommended: 8-32 for typical workloads.
         backend: joblib backend to use.
             'loky' = robust process-based (default, recommended)
             'multiprocessing' = standard multiprocessing
@@ -43,7 +43,7 @@ class ParallelConfig:
             None = let joblib decide
 
     Example:
-        >>> config = ParallelConfig(n_jobs=8, batch_size=16)
+        >>> config = ParallelConfig(n_jobs=8, batch_size='auto')
         >>> # Pass to pipeline
         >>> run_pipeline_v2(data, parallel_config=config)
 
@@ -54,7 +54,7 @@ class ParallelConfig:
         >>> config = ParallelConfig.sequential()
     """
     n_jobs: int = -1
-    batch_size: int = 16
+    batch_size: str = 'auto'  # Changed from int to str for 'auto' support
     backend: str = 'loky'
     verbose: int = 0
     prefer: Optional[str] = 'processes'
@@ -63,8 +63,11 @@ class ParallelConfig:
         """Validate configuration after initialization."""
         if self.n_jobs == 0:
             raise ValueError("n_jobs cannot be 0. Use -1 for all cores or 1 for sequential.")
-        if self.batch_size < 1:
-            raise ValueError("batch_size must be at least 1")
+        # batch_size can be 'auto' (str) or an int >= 1
+        if isinstance(self.batch_size, int) and self.batch_size < 1:
+            raise ValueError("batch_size must be at least 1 or 'auto'")
+        if isinstance(self.batch_size, str) and self.batch_size != 'auto':
+            raise ValueError("batch_size must be an integer or 'auto'")
         if self.backend not in ('loky', 'multiprocessing', 'threading'):
             raise ValueError(f"Unknown backend: {self.backend}")
 
@@ -73,7 +76,7 @@ class ParallelConfig:
         """Create default configuration using all available cores."""
         return cls(
             n_jobs=-1,
-            batch_size=16,
+            batch_size='auto',
             backend='loky',
             verbose=0,
             prefer='processes'
@@ -84,7 +87,7 @@ class ParallelConfig:
         """Create configuration for sequential processing (useful for debugging)."""
         return cls(
             n_jobs=1,
-            batch_size=1,
+            batch_size='auto',
             backend='loky',
             verbose=0,
             prefer=None
@@ -97,13 +100,15 @@ class ParallelConfig:
 
         Environment variables:
             PIPELINE_N_JOBS: Number of parallel jobs (default: -1)
-            PIPELINE_BATCH_SIZE: Batch size (default: 16)
+            PIPELINE_BATCH_SIZE: Batch size (default: 'auto', or an integer)
             PIPELINE_BACKEND: joblib backend (default: loky)
             PIPELINE_VERBOSE: Verbosity level (default: 0)
         """
+        batch_size_str = os.getenv('PIPELINE_BATCH_SIZE', 'auto')
+        batch_size = 'auto' if batch_size_str == 'auto' else int(batch_size_str)
         return cls(
             n_jobs=int(os.getenv('PIPELINE_N_JOBS', '-1')),
-            batch_size=int(os.getenv('PIPELINE_BATCH_SIZE', '16')),
+            batch_size=batch_size,
             backend=os.getenv('PIPELINE_BACKEND', 'loky'),
             verbose=int(os.getenv('PIPELINE_VERBOSE', '0')),
         )

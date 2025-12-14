@@ -133,7 +133,10 @@ def add_multiscale_vol_regime(
     # 8) Quiet-trend interaction (only if upstream trend exists)
     if "trend_score_granular" in out.columns and "vol_regime_ema10" in out.columns:
         # Emphasize trend in quiet regimes; suppress in turbulent regimes
-        quiet_gate = (out["vol_regime_ema10"] < 0).astype("float32")
+        # vol_regime_ema10 = log1p(rv_ratio_20_100), median is ~log1p(1.0) = 0.69
+        # "Quiet" = below median volatility regime (short-term vol < long-term vol)
+        vol_median = out["vol_regime_ema10"].rolling(252, min_periods=50).median()
+        quiet_gate = (out["vol_regime_ema10"] < vol_median).astype("float32")
         out["quiet_trend"] = (out["trend_score_granular"] * quiet_gate).astype("float32")
 
     logger.debug("Multi-scale volatility regime features completed")

@@ -6,12 +6,41 @@ with proper temporal semantics ensuring weekly lags respect week boundaries.
 """
 import logging
 import re
+import multiprocessing
 from typing import Dict, List, Set, Tuple
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 
 logger = logging.getLogger(__name__)
+
+
+def _chunk_list(items: List, chunk_size: int) -> List[List]:
+    """Split a list into chunks of specified size."""
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _apply_lags_batch(
+    items_batch: List[Tuple[str, pd.DataFrame]],
+    daily_lags: List[int],
+    weekly_lags: List[int]
+) -> List[Tuple[str, pd.DataFrame]]:
+    """
+    Process a batch of symbols for lag application to reduce IPC overhead.
+
+    Args:
+        items_batch: List of (symbol, dataframe) tuples
+        daily_lags: List of daily lag periods
+        weekly_lags: List of weekly lag periods
+
+    Returns:
+        List of (symbol, processed_dataframe) tuples
+    """
+    results = []
+    for symbol, df in items_batch:
+        result = _apply_lags_single_symbol(symbol, df, daily_lags, weekly_lags)
+        results.append(result)
+    return results
 
 
 def identify_daily_features(df: pd.DataFrame) -> List[str]:
@@ -248,25 +277,49 @@ def apply_configurable_lags(
         logger.info("No valid symbols for lag application")
         return indicators_by_symbol
     
+    # Calculate effective parallel processing parameters
+    n_symbols = len(valid_symbols)
+    if n_jobs == -1:
+        effective_jobs = multiprocessing.cpu_count()
+    else:
+        effective_jobs = n_jobs
+
+    # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
+    min_chunk_size = 100
+    chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
+    n_chunks = max(1, n_symbols // chunk_size)
+    actual_workers = min(effective_jobs, n_chunks)
+
+    logger.info(f"Processing lags for {n_symbols} symbols in {n_chunks} batches "
+                f"(~{chunk_size} symbols/batch, {actual_workers} workers)")
+
     # Apply lags (sequential or parallel)
-    if n_jobs == 1 or len(valid_symbols) < 10:
+    if actual_workers == 1 or n_symbols < 10:
         logger.info("Using sequential processing for lag application")
         results = []
         for symbol, df in valid_symbols:
             result = _apply_lags_single_symbol(symbol, df, daily_lags, weekly_lags)
             results.append(result)
     else:
-        logger.info(f"Using parallel processing with {n_jobs} jobs for lag application")
+        # Create batches for parallel processing
+        work_chunks = _chunk_list(valid_symbols, chunk_size)
+
         try:
-            results = Parallel(
-                n_jobs=n_jobs,
+            batch_results = Parallel(
+                n_jobs=actual_workers,
                 backend='loky',
-                batch_size=16,
-                verbose=1
+                verbose=0,
+                prefer='processes'
             )(
-                delayed(_apply_lags_single_symbol)(symbol, df, daily_lags, weekly_lags)
-                for symbol, df in valid_symbols
+                delayed(_apply_lags_batch)(chunk, daily_lags, weekly_lags)
+                for chunk in work_chunks
             )
+
+            # Flatten batch results
+            results = []
+            for batch in batch_results:
+                results.extend(batch)
+
         except Exception as e:
             logger.warning(f"Parallel processing failed ({e}), falling back to sequential")
             results = []

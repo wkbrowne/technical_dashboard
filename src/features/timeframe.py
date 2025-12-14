@@ -71,17 +71,46 @@ def _get_parallel_params(config: Union[ParallelConfig, TimeframeConfig, None]) -
         return {
             'n_jobs': config.n_jobs,
             'backend': config.backend,
-            'batch_size': config.batch_size,
             'verbose': config.verbose,
         }
 
     return {
         'n_jobs': config.n_jobs,
         'backend': config.backend,
-        'batch_size': config.batch_size,
         'verbose': config.verbose,
         'prefer': getattr(config, 'prefer', 'processes'),
     }
+
+
+def _chunk_list(items: List, chunk_size: int) -> List[List]:
+    """Split a list into chunks of specified size."""
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _get_effective_batch_params(n_items: int, config: Union[ParallelConfig, TimeframeConfig, None]) -> Tuple[int, int, int]:
+    """
+    Calculate effective parallel processing parameters with min 100 items per chunk.
+
+    Returns:
+        Tuple of (chunk_size, n_chunks, actual_workers)
+    """
+    if config is None:
+        config = ParallelConfig.default()
+
+    n_jobs = config.n_jobs
+    if n_jobs == -1:
+        import multiprocessing
+        effective_jobs = multiprocessing.cpu_count()
+    else:
+        effective_jobs = n_jobs
+
+    # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
+    min_chunk_size = 100
+    chunk_size = max(min_chunk_size, n_items // effective_jobs)
+    n_chunks = max(1, n_items // chunk_size)
+    actual_workers = min(effective_jobs, n_chunks)
+
+    return chunk_size, n_chunks, actual_workers
 
 
 class TimeframeResampler:
@@ -239,7 +268,7 @@ class TimeframeResampler:
         daily_data: Dict[str, pd.DataFrame],
         timeframe: TimeframeType
     ) -> Dict[str, pd.DataFrame]:
-        """Resample multiple symbols in parallel.
+        """Resample multiple symbols in parallel with batching.
 
         Args:
             daily_data: Dict mapping symbol -> daily DataFrame
@@ -251,16 +280,54 @@ class TimeframeResampler:
         if timeframe == TimeframeType.DAILY:
             return {sym: df.copy() for sym, df in daily_data.items()}
 
-        logger.info(f"Resampling {len(daily_data)} symbols to {timeframe.value}")
+        n_symbols = len(daily_data)
+        logger.info(f"Resampling {n_symbols} symbols to {timeframe.value}")
         start_time = time.time()
 
-        params = _get_parallel_params(self.parallel_config)
-
-        # Process in parallel
-        results = Parallel(**params)(
-            delayed(self._resample_symbol_safe)(symbol, df, timeframe)
-            for symbol, df in daily_data.items()
+        # Get batching parameters
+        chunk_size, n_chunks, actual_workers = _get_effective_batch_params(
+            n_symbols, self.parallel_config
         )
+
+        logger.info(f"Processing in {n_chunks} batches (~{chunk_size} symbols/batch, {actual_workers} workers)")
+
+        work_items = list(daily_data.items())
+
+        # Use sequential processing for small datasets
+        if n_symbols < 10 or actual_workers == 1:
+            results = []
+            for symbol, df in work_items:
+                result = self._resample_symbol_safe(symbol, df, timeframe)
+                results.append(result)
+        else:
+            # Batch processing
+            work_chunks = _chunk_list(work_items, chunk_size)
+
+            def _resample_batch(items_batch: List[Tuple[str, pd.DataFrame]]) -> List[Tuple[str, Optional[pd.DataFrame]]]:
+                batch_results = []
+                for symbol, df in items_batch:
+                    result = self._resample_symbol_safe(symbol, df, timeframe)
+                    batch_results.append(result)
+                return batch_results
+
+            params = _get_parallel_params(self.parallel_config)
+            params['n_jobs'] = actual_workers
+
+            try:
+                batch_results = Parallel(**params)(
+                    delayed(_resample_batch)(chunk)
+                    for chunk in work_chunks
+                )
+                # Flatten results
+                results = []
+                for batch in batch_results:
+                    results.extend(batch)
+            except Exception as e:
+                logger.warning(f"Parallel resampling failed ({e}), falling back to sequential")
+                results = []
+                for symbol, df in work_items:
+                    result = self._resample_symbol_safe(symbol, df, timeframe)
+                    results.append(result)
 
         # Collect results
         resampled_data = {}
@@ -351,6 +418,13 @@ class TimeframeResampler:
         if rename_map:
             merge_df = merge_df.rename(columns=rename_map)
 
+        # Drop columns that already exist in daily_df to avoid duplicates (_x/_y suffixes)
+        existing_cols = set(daily_df.columns)
+        cols_to_drop = [c for c in merge_df.columns if c in existing_cols and c != period_col]
+        if cols_to_drop:
+            logger.debug(f"Skipping {len(cols_to_drop)} columns that already exist in daily_df: {cols_to_drop[:5]}...")
+            merge_df = merge_df.drop(columns=cols_to_drop)
+
         # Ensure proper datetime types
         daily_sorted = daily_df.copy()
         daily_sorted['date'] = pd.to_datetime(daily_sorted['date'])
@@ -380,7 +454,7 @@ class TimeframeResampler:
         higher_tf_data: Dict[str, pd.DataFrame],
         timeframe: TimeframeType
     ) -> Dict[str, pd.DataFrame]:
-        """Merge higher timeframe features to daily data for multiple symbols (parallel).
+        """Merge higher timeframe features to daily data for multiple symbols (parallel with batching).
 
         Args:
             daily_data: Dict mapping symbol -> daily DataFrame
@@ -403,14 +477,51 @@ class TimeframeResampler:
             else:
                 symbols_without_higher_tf.append(symbol)
 
-        # Parallel merge
-        if merge_tasks:
-            params = _get_parallel_params(self.parallel_config)
-
-            results = Parallel(**params)(
-                delayed(_merge_single_symbol)(symbol, daily_df, htf_df, timeframe)
-                for symbol, daily_df, htf_df in merge_tasks
+        # Get batching parameters
+        n_tasks = len(merge_tasks)
+        if n_tasks > 0:
+            chunk_size, n_chunks, actual_workers = _get_effective_batch_params(
+                n_tasks, self.parallel_config
             )
+            logger.info(f"Merging in {n_chunks} batches (~{chunk_size} symbols/batch, {actual_workers} workers)")
+
+        # Process merge tasks
+        if merge_tasks:
+            # Sequential for small datasets
+            if n_tasks < 10 or actual_workers == 1:
+                results = []
+                for symbol, daily_df, htf_df in merge_tasks:
+                    result = _merge_single_symbol(symbol, daily_df, htf_df, timeframe)
+                    results.append(result)
+            else:
+                # Batch processing
+                work_chunks = _chunk_list(merge_tasks, chunk_size)
+
+                def _merge_batch(tasks_batch: List[Tuple[str, pd.DataFrame, pd.DataFrame]]) -> List[Tuple[str, pd.DataFrame]]:
+                    batch_results = []
+                    for symbol, daily_df, htf_df in tasks_batch:
+                        result = _merge_single_symbol(symbol, daily_df, htf_df, timeframe)
+                        batch_results.append(result)
+                    return batch_results
+
+                params = _get_parallel_params(self.parallel_config)
+                params['n_jobs'] = actual_workers
+
+                try:
+                    batch_results = Parallel(**params)(
+                        delayed(_merge_batch)(chunk)
+                        for chunk in work_chunks
+                    )
+                    # Flatten results
+                    results = []
+                    for batch in batch_results:
+                        results.extend(batch)
+                except Exception as e:
+                    logger.warning(f"Parallel merge failed ({e}), falling back to sequential")
+                    results = []
+                    for symbol, daily_df, htf_df in merge_tasks:
+                        result = _merge_single_symbol(symbol, daily_df, htf_df, timeframe)
+                        results.append(result)
 
             merged_data = dict(results)
         else:
@@ -489,10 +600,10 @@ def combine_to_long(
     """Combine symbol DataFrames back to long format.
 
     Args:
-        symbol_data: Dict mapping symbol -> DataFrame
+        symbol_data: Dict mapping symbol -> DataFrame (date can be index or column)
 
     Returns:
-        Combined long-format DataFrame
+        Combined long-format DataFrame with 'date' and 'symbol' columns
     """
     if not symbol_data:
         return pd.DataFrame()
@@ -500,12 +611,33 @@ def combine_to_long(
     frames = []
     for symbol, df in symbol_data.items():
         frame = df.copy()
+
+        # Handle date as index - convert to column
+        if 'date' not in frame.columns and frame.index.name in ('date', None):
+            frame = frame.reset_index()
+            # If index was unnamed, try to identify the date column
+            if 'index' in frame.columns:
+                # Check if it looks like dates
+                if pd.api.types.is_datetime64_any_dtype(frame['index']):
+                    frame = frame.rename(columns={'index': 'date'})
+                else:
+                    frame = frame.drop(columns=['index'])
+
+        # Remove duplicate columns (keep first occurrence)
+        if frame.columns.duplicated().any():
+            frame = frame.loc[:, ~frame.columns.duplicated()]
+
         if 'symbol' not in frame.columns:
             frame['symbol'] = symbol
         frames.append(frame)
 
     combined = pd.concat(frames, ignore_index=True)
-    return combined.sort_values(['symbol', 'date']).reset_index(drop=True)
+
+    # Sort if date column exists
+    if 'date' in combined.columns:
+        return combined.sort_values(['symbol', 'date']).reset_index(drop=True)
+    else:
+        return combined.sort_values(['symbol']).reset_index(drop=True)
 
 
 def compute_features_at_timeframe(
@@ -515,7 +647,7 @@ def compute_features_at_timeframe(
     config: Union[ParallelConfig, TimeframeConfig, None] = None,
     **feature_kwargs
 ) -> Dict[str, pd.DataFrame]:
-    """Compute features for all symbols at a given timeframe.
+    """Compute features for all symbols at a given timeframe (with batching).
 
     Args:
         data_dict: Dict mapping symbol -> DataFrame at target timeframe
@@ -530,7 +662,8 @@ def compute_features_at_timeframe(
     if config is None:
         config = ParallelConfig.default()
 
-    logger.info(f"Computing features for {len(data_dict)} symbols at {timeframe.value}")
+    n_symbols = len(data_dict)
+    logger.info(f"Computing features for {n_symbols} symbols at {timeframe.value}")
     start_time = time.time()
 
     def process_symbol(symbol: str, df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
@@ -541,12 +674,41 @@ def compute_features_at_timeframe(
             logger.warning(f"Feature computation failed for {symbol}: {e}")
             return symbol, df
 
-    params = _get_parallel_params(config)
+    # Get batching parameters
+    chunk_size, n_chunks, actual_workers = _get_effective_batch_params(n_symbols, config)
+    logger.info(f"Processing in {n_chunks} batches (~{chunk_size} symbols/batch, {actual_workers} workers)")
 
-    results = Parallel(**params)(
-        delayed(process_symbol)(symbol, df)
-        for symbol, df in data_dict.items()
-    )
+    work_items = list(data_dict.items())
+
+    # Sequential for small datasets
+    if n_symbols < 10 or actual_workers == 1:
+        results = [process_symbol(symbol, df) for symbol, df in work_items]
+    else:
+        # Batch processing
+        work_chunks = _chunk_list(work_items, chunk_size)
+
+        def _process_batch(items_batch: List[Tuple[str, pd.DataFrame]]) -> List[Tuple[str, pd.DataFrame]]:
+            batch_results = []
+            for symbol, df in items_batch:
+                result = process_symbol(symbol, df)
+                batch_results.append(result)
+            return batch_results
+
+        params = _get_parallel_params(config)
+        params['n_jobs'] = actual_workers
+
+        try:
+            batch_results = Parallel(**params)(
+                delayed(_process_batch)(chunk)
+                for chunk in work_chunks
+            )
+            # Flatten results
+            results = []
+            for batch in batch_results:
+                results.extend(batch)
+        except Exception as e:
+            logger.warning(f"Parallel feature computation failed ({e}), falling back to sequential")
+            results = [process_symbol(symbol, df) for symbol, df in work_items]
 
     # Collect results
     feature_data = dict(results)

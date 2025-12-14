@@ -17,6 +17,7 @@ try:
     from .distance import add_distance_to_ma_features
     from .range_breakout import add_range_breakout_features
     from .volume import add_volume_features, add_volume_shock_features
+    from .liquidity import add_liquidity_features
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.trend import add_trend_features, add_rsi_features, add_macd_features
@@ -24,6 +25,7 @@ except ImportError:
     from src.features.distance import add_distance_to_ma_features
     from src.features.range_breakout import add_range_breakout_features
     from src.features.volume import add_volume_features, add_volume_shock_features
+    from src.features.liquidity import add_liquidity_features
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +172,10 @@ def compute_single_stock_features(
         ema_span=10,
         prefix="volshock"
     )
+
+    # 9) Liquidity and microstructure features
+    logger.debug("Adding liquidity features")
+    out = add_liquidity_features(out, windows=(5, 10, 20))
 
     logger.debug("Single-stock feature computation completed")
     return out
