@@ -128,43 +128,39 @@ def render_ticker_analysis():
     """Render the ticker analysis page."""
     st.header("🎯 Ticker Analysis")
 
-    # Load data
+    # Load model first (fast)
     model, metadata = load_model()
-    features_df = load_features()
-    predictions_df = load_predictions()
 
     if model is None:
         st.error("Model not found. Run `python run_training.py` first.")
         return
 
+    feature_names = metadata.get('features', [])
+
+    # Load heavy data with spinner
+    with st.spinner("Loading feature data..."):
+        features_df = load_features()
+        predictions_df = load_predictions()
+
     if features_df is None:
         st.error("Features not found. Run feature computation first.")
         return
 
-    feature_names = metadata.get('features', [])
-
     # Get available symbols
     available_symbols = sorted(features_df['symbol'].unique())
 
-    # Input section
-    col1, col2, col3 = st.columns([2, 1, 1])
+    # Input section - just ticker (ATR multiples are fixed from training)
+    ticker = st.text_input(
+        "Enter Ticker Symbol",
+        value="AAPL",
+        max_chars=10,
+        help="Enter a stock ticker symbol"
+    ).upper().strip()
 
-    with col1:
-        # Ticker input with autocomplete
-        ticker = st.text_input(
-            "Enter Ticker Symbol",
-            value="AAPL",
-            max_chars=10,
-            help="Enter a stock ticker symbol"
-        ).upper().strip()
-
-    with col2:
-        # ATR multiplier for target
-        up_mult = st.number_input("Target ATR Multiple", value=3.0, min_value=1.0, max_value=10.0, step=0.5)
-
-    with col3:
-        # ATR multiplier for stop
-        dn_mult = st.number_input("Stop ATR Multiple", value=1.5, min_value=0.5, max_value=5.0, step=0.25)
+    # Fixed barrier parameters from training (displayed for reference)
+    # These match the triple barrier targets the model was trained on
+    UP_MULT = 3.0  # Target = entry + 3 * ATR
+    DN_MULT = 1.5  # Stop = entry - 1.5 * ATR
 
     if ticker not in available_symbols:
         st.warning(f"Symbol '{ticker}' not found in data. Available: {len(available_symbols)} symbols")
@@ -175,14 +171,26 @@ def render_ticker_analysis():
             st.info(f"Did you mean: {', '.join(matches)}")
         return
 
-    # Get latest data for ticker
+    # Get latest data for ticker with valid close price
     ticker_data = features_df[features_df['symbol'] == ticker].copy()
     if 'date' in ticker_data.columns:
         ticker_data['date'] = pd.to_datetime(ticker_data['date'])
         ticker_data = ticker_data.sort_values('date')
 
-    latest = ticker_data.iloc[-1:].copy()
+    # Filter to rows with valid close price
+    valid_data = ticker_data[ticker_data['close'].notna()]
+    if len(valid_data) == 0:
+        st.error(f"No valid price data for {ticker}")
+        return
+
+    latest = valid_data.iloc[-1:].copy()
     latest_date = latest['date'].iloc[0] if 'date' in latest.columns else "N/A"
+
+    # Check if data is stale
+    max_date = ticker_data['date'].max() if 'date' in ticker_data.columns else None
+    if max_date and latest_date < max_date:
+        days_stale = (max_date - latest_date).days
+        st.warning(f"⚠️ Data is {days_stale} days stale. Latest valid: {latest_date.date()}")
 
     # Calculate prediction
     available_features = [f for f in feature_names if f in latest.columns]
@@ -194,12 +202,13 @@ def render_ticker_analysis():
 
     probability = model.predict_proba(X.values)[:, 1][0]
 
-    # Calculate target and stop
+    # Calculate target and stop using fixed training parameters
     close_price = latest['close'].iloc[0]
-    atr_pct = latest.get('atr_percent', pd.Series([2.0])).iloc[0] / 100
+    # atr_percent is already in decimal form (e.g., 0.02 = 2%)
+    atr_pct = latest['atr_percent'].iloc[0] if 'atr_percent' in latest.columns and pd.notna(latest['atr_percent'].iloc[0]) else 0.02
 
-    target_price = close_price * (1 + up_mult * atr_pct)
-    stop_price = close_price * (1 - dn_mult * atr_pct)
+    target_price = close_price * (1 + UP_MULT * atr_pct)
+    stop_price = close_price * (1 - DN_MULT * atr_pct)
     target_pct = (target_price / close_price - 1) * 100
     stop_pct = (1 - stop_price / close_price) * 100
     reward_risk = target_pct / max(stop_pct, 0.1)
@@ -241,6 +250,7 @@ def render_ticker_analysis():
 
     # Price info
     st.markdown(f"**Current Price:** ${close_price:.2f} | **Date:** {latest_date} | **ATR%:** {atr_pct*100:.2f}%")
+    st.caption(f"Barriers: Target = Entry + {UP_MULT}×ATR, Stop = Entry - {DN_MULT}×ATR (fixed from training)")
 
     # SHAP Waterfall
     st.markdown("---")
@@ -346,15 +356,23 @@ def render_top_candidates():
     """Render the top candidates page."""
     st.header("🏆 Top Momentum Candidates")
 
+    # Load model first (fast)
     model, metadata = load_model()
-    features_df = load_features()
-    predictions_df = load_predictions()
 
-    if model is None or features_df is None:
-        st.error("Model or features not found. Run training first.")
+    if model is None:
+        st.error("Model not found. Run training first.")
         return
 
     feature_names = metadata.get('features', [])
+
+    # Load heavy data with spinner
+    with st.spinner("Loading data..."):
+        features_df = load_features()
+        predictions_df = load_predictions()
+
+    if features_df is None:
+        st.error("Features not found. Run feature computation first.")
+        return
 
     # Generate predictions if not available
     if predictions_df is None:
@@ -466,16 +484,15 @@ def render_monitoring():
     """Render the model monitoring page."""
     st.header("📊 Model Monitoring")
 
+    # Load model first (fast)
     model, metadata = load_model()
-    features_df = load_features()
-    targets_df = load_targets()
     feature_importance = load_feature_importance()
 
     if model is None:
         st.error("Model not found.")
         return
 
-    # Model info
+    # Model info (show immediately, before heavy data load)
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -515,6 +532,11 @@ def render_monitoring():
     # Historical performance (if we have predictions with outcomes)
     st.markdown("---")
     st.subheader("📈 Historical Performance")
+
+    # Load heavy data for historical analysis with spinner
+    with st.spinner("Loading historical data (cached after first load)..."):
+        features_df = load_features()
+        targets_df = load_targets()
 
     if targets_df is not None and features_df is not None:
         feature_names = metadata.get('features', [])
@@ -806,6 +828,66 @@ def check_model_health(metadata, rolling_metrics_df=None, baseline_importance=No
     return alerts
 
 
+@st.cache_data(ttl=3600)  # 1 hour cache for heavy computation
+def compute_rolling_auc_metrics(_model, features_df, targets_df, feature_names):
+    """Compute rolling AUC metrics (cached to avoid blocking UI)."""
+    from sklearn.metrics import roc_auc_score
+
+    if targets_df is None or features_df is None:
+        return None
+
+    targets_df = targets_df.copy()
+    features_df = features_df.copy()
+    targets_df['date'] = pd.to_datetime(targets_df['date'])
+    features_df['date'] = pd.to_datetime(features_df['date'])
+
+    merged = features_df.merge(
+        targets_df[['symbol', 'date', 'hit']],
+        on=['symbol', 'date'],
+        how='inner'
+    )
+    merged = merged[merged['hit'] != 0].copy()
+
+    if len(merged) == 0:
+        return None
+
+    merged['target'] = (merged['hit'] == 1).astype(int)
+    merged = merged.sort_values('date')
+
+    available_features = [f for f in feature_names if f in merged.columns]
+    if len(available_features) == 0:
+        return None
+
+    X = merged[available_features].fillna(0).replace([np.inf, -np.inf], 0)
+    for f in feature_names:
+        if f not in X.columns:
+            X[f] = 0
+    X = X[feature_names]
+
+    merged['pred_prob'] = _model.predict_proba(X.values)[:, 1]
+
+    dates = sorted(merged['date'].unique())
+    rolling_window = 63
+    rolling_metrics = []
+
+    for i, end_date in enumerate(dates):
+        if i < rolling_window:
+            continue
+        start_date = dates[i - rolling_window]
+        window_data = merged[(merged['date'] >= start_date) & (merged['date'] <= end_date)]
+
+        if len(window_data) > 100 and window_data['target'].nunique() == 2:
+            try:
+                auc = roc_auc_score(window_data['target'], window_data['pred_prob'])
+                rolling_metrics.append({'date': end_date, 'auc': auc})
+            except:
+                pass
+
+    if rolling_metrics:
+        return pd.DataFrame(rolling_metrics)
+    return None
+
+
 def render_alerts():
     """Render the alerts page."""
     st.header("🚨 Model Health Alerts")
@@ -826,55 +908,13 @@ def render_alerts():
         st.error("Model not found. Run `python run_training.py` first.")
         return
 
-    # Calculate rolling metrics for AUC check
-    rolling_metrics_df = None
+    # Calculate rolling metrics for AUC check (cached)
     feature_names = metadata.get('features', [])
 
-    if targets_df is not None and features_df is not None:
-        targets_df['date'] = pd.to_datetime(targets_df['date'])
-        features_df['date'] = pd.to_datetime(features_df['date'])
-
-        merged = features_df.merge(
-            targets_df[['symbol', 'date', 'hit']],
-            on=['symbol', 'date'],
-            how='inner'
+    with st.spinner("Computing rolling AUC metrics (cached after first load)..."):
+        rolling_metrics_df = compute_rolling_auc_metrics(
+            model, features_df, targets_df, feature_names
         )
-        merged = merged[merged['hit'] != 0].copy()
-
-        if len(merged) > 0:
-            merged['target'] = (merged['hit'] == 1).astype(int)
-            merged = merged.sort_values('date')
-
-            available_features = [f for f in feature_names if f in merged.columns]
-            if len(available_features) > 0:
-                X = merged[available_features].fillna(0).replace([np.inf, -np.inf], 0)
-                for f in feature_names:
-                    if f not in X.columns:
-                        X[f] = 0
-                X = X[feature_names]
-
-                merged['pred_prob'] = model.predict_proba(X.values)[:, 1]
-
-                from sklearn.metrics import roc_auc_score
-                dates = sorted(merged['date'].unique())
-                rolling_window = 63
-                rolling_metrics = []
-
-                for i, end_date in enumerate(dates):
-                    if i < rolling_window:
-                        continue
-                    start_date = dates[i - rolling_window]
-                    window_data = merged[(merged['date'] >= start_date) & (merged['date'] <= end_date)]
-
-                    if len(window_data) > 100 and window_data['target'].nunique() == 2:
-                        try:
-                            auc = roc_auc_score(window_data['target'], window_data['pred_prob'])
-                            rolling_metrics.append({'date': end_date, 'auc': auc})
-                        except:
-                            pass
-
-                if rolling_metrics:
-                    rolling_metrics_df = pd.DataFrame(rolling_metrics)
 
     # Run health checks
     alerts = check_model_health(
