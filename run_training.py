@@ -111,8 +111,13 @@ def load_training_data(
     targets = pd.read_parquet('artifacts/targets_triple_barrier.parquet')
     print(f"  Targets shape: {targets.shape}")
 
-    # Merge
-    targets = targets.rename(columns={'t0': 'date'})
+    # Rename columns to standard names
+    targets = targets.rename(columns={
+        't0': 'date',
+        'top': 'target_price',
+        'bot': 'stop_price',
+        'entry_px': 'close'
+    })
 
     # Filter symbols with enough samples
     symbol_counts = targets.groupby('symbol').size()
