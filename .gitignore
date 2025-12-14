@@ -156,3 +156,13 @@ artifacts/
 
 # Generated files from refactoring cleanup
 =*
+
+# Temporary scripts (profiling, assessment, ad-hoc tests)
+assess_features*.py
+profile_*.py
+test_*.py
+
+# Experimental notebooks
+notebooks/Feature_Dashboard.ipynb
+notebooks/Feature_Explorer.ipynb
+notebooks/ML_Training.ipynb
