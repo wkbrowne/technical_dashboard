@@ -57,15 +57,49 @@ def load_model(model_dir: Path = Path('artifacts/models')) -> tuple[lgb.LGBMClas
     return model, metadata
 
 
+def find_latest_valid_date(
+    features: pd.DataFrame,
+    min_coverage: float = 0.8,
+    required_col: str = 'close'
+) -> pd.Timestamp:
+    """Find the most recent date with sufficient valid data.
+
+    Args:
+        features: Features DataFrame with 'date' column
+        min_coverage: Minimum fraction of symbols with valid required_col (default 80%)
+        required_col: Column that must be non-null (default 'close')
+
+    Returns:
+        Most recent date with sufficient coverage
+    """
+    # Calculate coverage by date
+    coverage = features.groupby('date')[required_col].apply(
+        lambda x: x.notna().sum() / len(x)
+    )
+
+    # Find dates with sufficient coverage
+    valid_dates = coverage[coverage >= min_coverage]
+
+    if len(valid_dates) == 0:
+        # Fall back to date with best coverage
+        best_date = coverage.idxmax()
+        print(f"  Warning: No date has {min_coverage:.0%} coverage. Using best: {best_date.date()} ({coverage[best_date]:.1%})")
+        return best_date
+
+    return valid_dates.index.max()
+
+
 def load_latest_features(
     feature_names: list[str],
-    target_date: str = None
+    target_date: str = None,
+    min_coverage: float = 0.8
 ) -> pd.DataFrame:
     """Load features for the latest available date or specified date.
 
     Args:
         feature_names: List of required feature names
-        target_date: Specific date to load (YYYY-MM-DD) or None for latest
+        target_date: Specific date to load (YYYY-MM-DD) or None for latest with valid data
+        min_coverage: Minimum data coverage required (default 80%)
 
     Returns:
         DataFrame with features for the target date
@@ -80,10 +114,18 @@ def load_latest_features(
     # Get target date
     if target_date:
         target_dt = pd.to_datetime(target_date)
+        print(f"  Requested date: {target_dt.date()}")
     else:
-        target_dt = features['date'].max()
+        # Find most recent date with valid data
+        target_dt = find_latest_valid_date(features, min_coverage=min_coverage)
+        max_date = features['date'].max()
+        if target_dt < max_date:
+            days_stale = (max_date - target_dt).days
+            print(f"  WARNING: Data is {days_stale} days stale!")
+            print(f"  Latest date in file: {max_date.date()}")
+            print(f"  Latest date with valid data: {target_dt.date()}")
 
-    print(f"  Target date: {target_dt.date()}")
+    print(f"  Using date: {target_dt.date()}")
 
     # Filter to target date
     df = features[features['date'] == target_dt].copy()
@@ -94,6 +136,14 @@ def load_latest_features(
         nearest = min(available_dates, key=lambda x: abs(x - target_dt))
         print(f"  Warning: No data for {target_dt.date()}, using {nearest.date()}")
         df = features[features['date'] == nearest].copy()
+
+    # Filter to symbols with valid close prices
+    valid_close = df['close'].notna()
+    n_valid = valid_close.sum()
+    n_total = len(df)
+    if n_valid < n_total:
+        print(f"  Filtering: {n_valid}/{n_total} symbols have valid close price")
+        df = df[valid_close].copy()
 
     print(f"  Symbols available: {len(df)}")
 
@@ -125,9 +175,9 @@ def calculate_targets_and_stops(
     """
     df = df.copy()
 
-    # ATR as percentage
+    # ATR as decimal (e.g., 0.02 = 2%)
     if atr_col in df.columns:
-        atr_pct = df[atr_col] / 100  # Convert from percentage
+        atr_pct = df[atr_col]  # Already in decimal form
     else:
         # Fallback: estimate from recent volatility
         atr_pct = 0.02  # Default 2%
