@@ -4,12 +4,21 @@ Enhanced sector and subsector ETF mapping with correlation validation.
 This module automatically maps stock symbols to appropriate sector and subsector ETFs
 using a combination of sector information from the universe CSV and correlation analysis
 for validation and improvement.
+
+Uses parallel processing (200 stocks per worker) for correlation-based subsector discovery.
 """
 import logging
+import warnings
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 from pathlib import Path
+
+# Import parallel config for stocks_per_worker based parallelism
+try:
+    from ..config.parallel import calculate_workers_from_items, DEFAULT_STOCKS_PER_WORKER
+except ImportError:
+    from src.config.parallel import calculate_workers_from_items, DEFAULT_STOCKS_PER_WORKER
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +165,7 @@ EQUAL_WEIGHT_ETF_MAP = {
 # Standard sector ETF mapping (enhanced from orchestrator.py)
 SECTOR_ETF_MAP = {
     "technology services": "XLK",
-    "electronic technology": "XLK", 
+    "electronic technology": "XLK",
     "finance": "XLF",
     "retail trade": "XLY",
     "health technology": "XLV",
@@ -170,7 +179,7 @@ SECTOR_ETF_MAP = {
     "industrial services": "XLI",
     "transportation": "IYT",
     "commercial services": "XLC",
-    "process industries": "XLB", 
+    "process industries": "XLB",
     "communications": "XLC",
     "health services": "XLV",
     "distribution services": "XLI",
@@ -178,33 +187,92 @@ SECTOR_ETF_MAP = {
 }
 
 
-def build_enhanced_sector_mappings(universe_csv: str, stock_data: Dict[str, pd.DataFrame], 
-                                 etf_data: Dict[str, pd.DataFrame], 
-                                 base_sectors: Dict[str, str]) -> Dict[str, Dict]:
+def _process_symbol_mapping_batch(
+    work_items: List[Tuple[str, Dict, str]],
+    stock_data: Dict[str, pd.DataFrame],
+    etf_data: Dict[str, pd.DataFrame]
+) -> List[Tuple[str, Dict]]:
+    """
+    Process a batch of symbols for sector/subsector mapping.
+
+    Args:
+        work_items: List of (symbol, symbol_info, base_sector) tuples
+        stock_data: Stock price data dict (shared across batch)
+        etf_data: ETF price data dict (shared across batch)
+
+    Returns:
+        List of (symbol, mapping_dict) tuples
+    """
+    results = []
+    for symbol, symbol_info, base_sector in work_items:
+        sector_name = base_sector.lower()
+        sector_etf = SECTOR_ETF_MAP.get(sector_name, "SPY")
+
+        # Get equal-weighted equivalent
+        equal_weight_etf = EQUAL_WEIGHT_ETF_MAP.get(sector_etf)
+
+        # Find best subsector ETF using multi-stage approach
+        subsector_etf = _find_best_subsector_etf(
+            symbol, symbol_info, sector_etf, stock_data, etf_data
+        )
+
+        # Calculate correlations for validation
+        correlations = _calculate_correlations(
+            symbol, sector_etf, subsector_etf,
+            stock_data, etf_data, equal_weight_etf
+        )
+
+        # Determine confidence level
+        confidence = _assess_mapping_confidence(correlations, sector_etf, subsector_etf)
+
+        mapping = {
+            'csv_sector': base_sector,
+            'sector_etf': sector_etf,
+            'equal_weight_etf': equal_weight_etf,
+            'subsector_etf': subsector_etf,
+            'correlations': correlations,
+            'confidence': confidence,
+            'market_cap': symbol_info.get('market_cap', 0)
+        }
+
+        results.append((symbol, mapping))
+
+    return results
+
+
+def build_enhanced_sector_mappings(universe_csv: str, stock_data: Dict[str, pd.DataFrame],
+                                   etf_data: Dict[str, pd.DataFrame],
+                                   base_sectors: Dict[str, str],
+                                   n_jobs: int = -1) -> Dict[str, Dict]:
     """
     Create comprehensive sector/subsector mappings with keyword matching and correlation validation.
-    
+
+    Uses parallel processing (200 stocks per worker) for correlation-based subsector discovery.
+
     Args:
         universe_csv: Path to universe CSV with sector and industry information
         stock_data: Dictionary of stock price DataFrames {symbol: df}
         etf_data: Dictionary of ETF price DataFrames {etf: df}
         base_sectors: Base sector mapping from universe CSV {symbol: sector}
-        
+        n_jobs: Number of parallel jobs (-1 for all cores)
+
     Returns:
         Enhanced mapping dictionary with equal-weighted and subsector ETF assignments
     """
+    from joblib import Parallel, delayed
+
     logger.info("Building enhanced sector/subsector mappings (ticker lookup + keyword + correlation)...")
-    
+
     # Load universe data with simplified field extraction
     universe_df = pd.read_csv(universe_csv)
     universe_df['Symbol'] = universe_df['Symbol'].astype(str)
-    
+
     # Extract fields with exact matching (log errors if not found)
     required_fields = ['Description', 'Industry', 'Market capitalization', 'Sector']
     missing_fields = [f for f in required_fields if f not in universe_df.columns]
     if missing_fields:
         logger.error(f"Missing required fields in universe CSV: {missing_fields}")
-    
+
     # Create symbol info lookup with simplified field access
     symbol_info = {}
     for _, row in universe_df.iterrows():
@@ -218,48 +286,59 @@ def build_enhanced_sector_mappings(universe_csv: str, stock_data: Dict[str, pd.D
             logger.error(f"Error processing row for {row.get('Symbol', 'unknown')}: {e}")
             continue
         symbol_info[row['Symbol']] = info
-    
-    enhanced_mappings = {}
-    symbols_processed = 0
-    
+
+    # Build work items: (symbol, symbol_info, base_sector) tuples
+    work_items = []
     for symbol in stock_data.keys():
         if symbol not in base_sectors:
             continue
-            
-        sector_name = base_sectors[symbol].lower()
-        sector_etf = SECTOR_ETF_MAP.get(sector_name, "SPY")
-        
-        # Get equal-weighted equivalent
-        equal_weight_etf = EQUAL_WEIGHT_ETF_MAP.get(sector_etf)
+        work_items.append((symbol, symbol_info.get(symbol, {}), base_sectors[symbol]))
 
-        # Find best subsector ETF using multi-stage approach:
-        # 1. Direct ticker mapping, 2. Keyword matching, 3. Correlation-based discovery
-        subsector_etf = _find_best_subsector_etf(
-            symbol, symbol_info.get(symbol, {}), sector_etf, stock_data, etf_data
-        )
-        
-        # Calculate correlations for validation
-        correlations = _calculate_correlations(symbol, sector_etf, subsector_etf, 
-                                            stock_data, etf_data, equal_weight_etf)
-        
-        # Determine confidence level
-        confidence = _assess_mapping_confidence(correlations, sector_etf, subsector_etf)
-        
-        enhanced_mappings[symbol] = {
-            'csv_sector': base_sectors[symbol],
-            'sector_etf': sector_etf,
-            'equal_weight_etf': equal_weight_etf,
-            'subsector_etf': subsector_etf,
-            'correlations': correlations,
-            'confidence': confidence,
-            'market_cap': symbol_info.get(symbol, {}).get('market_cap', 0)
-        }
-        
-        symbols_processed += 1
-    
+    n_symbols = len(work_items)
+    logger.info(f"Processing {n_symbols} symbols for sector/subsector mapping")
+
+    # Calculate workers based on stocks_per_worker (200 stocks/worker default)
+    chunk_size = DEFAULT_STOCKS_PER_WORKER
+    n_workers = calculate_workers_from_items(n_symbols, items_per_worker=chunk_size)
+
+    # Sequential for small datasets
+    if n_symbols < 20 or n_jobs == 1 or n_workers == 1:
+        all_results = _process_symbol_mapping_batch(work_items, stock_data, etf_data)
+    else:
+        # Parallel with batching
+        chunks = [work_items[i:i + chunk_size] for i in range(0, n_symbols, chunk_size)]
+        logger.info(f"Parallel sector mapping: {len(chunks)} batches, {n_workers} workers")
+
+        try:
+            batch_results = Parallel(
+                n_jobs=n_workers,
+                backend='loky',
+                verbose=0
+            )(
+                delayed(_process_symbol_mapping_batch)(chunk, stock_data, etf_data)
+                for chunk in chunks
+            )
+
+            # Flatten results
+            all_results = []
+            for batch in batch_results:
+                all_results.extend(batch)
+
+        except Exception as e:
+            logger.warning(f"Parallel sector mapping failed ({e}), falling back to sequential")
+            all_results = _process_symbol_mapping_batch(work_items, stock_data, etf_data)
+
+    # Aggregate results into dict
+    enhanced_mappings = {}
+    for symbol, mapping in all_results:
+        enhanced_mappings[symbol] = mapping
+
+    symbols_processed = len(enhanced_mappings)
     logger.info(f"Enhanced mapping completed for {symbols_processed} symbols")
-    logger.info(f"Equal-weight coverage: {sum(1 for m in enhanced_mappings.values() if m['equal_weight_etf']) / len(enhanced_mappings):.1%}")
-    logger.info(f"Subsector coverage: {sum(1 for m in enhanced_mappings.values() if m['subsector_etf']) / len(enhanced_mappings):.1%}")
+    if symbols_processed > 0:
+        logger.info(f"Equal-weight coverage: {sum(1 for m in enhanced_mappings.values() if m['equal_weight_etf']) / symbols_processed:.1%}")
+        logger.info(f"Subsector coverage: {sum(1 for m in enhanced_mappings.values() if m['subsector_etf']) / symbols_processed:.1%}")
+
     return enhanced_mappings
 
 
@@ -295,18 +374,20 @@ def _find_best_subsector_by_correlation(
     if 'adjclose' not in stock_df.columns:
         return None
 
-    stock_returns = stock_df['adjclose'].pct_change().dropna()
+    stock_returns = stock_df['adjclose'].pct_change(fill_method=None).dropna()
     if len(stock_returns) < min_data_points:
         return None
 
     # Calculate sector correlation as baseline
     sector_corr = 0.0
     if sector_etf in etf_data and 'adjclose' in etf_data[sector_etf].columns:
-        sector_returns = etf_data[sector_etf]['adjclose'].pct_change().dropna()
+        sector_returns = etf_data[sector_etf]['adjclose'].pct_change(fill_method=None).dropna()
         common_idx = stock_returns.index.intersection(sector_returns.index)
         if len(common_idx) >= min_data_points:
             try:
-                sector_corr = stock_returns.loc[common_idx].corr(sector_returns.loc[common_idx])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    sector_corr = stock_returns.loc[common_idx].corr(sector_returns.loc[common_idx])
             except:
                 pass
 
@@ -322,14 +403,16 @@ def _find_best_subsector_by_correlation(
         if 'adjclose' not in etf_data[subsector_etf].columns:
             continue
 
-        subsector_returns = etf_data[subsector_etf]['adjclose'].pct_change().dropna()
+        subsector_returns = etf_data[subsector_etf]['adjclose'].pct_change(fill_method=None).dropna()
         common_idx = stock_returns.index.intersection(subsector_returns.index)
 
         if len(common_idx) < min_data_points:
             continue
 
         try:
-            subsector_corr = stock_returns.loc[common_idx].corr(subsector_returns.loc[common_idx])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                subsector_corr = stock_returns.loc[common_idx].corr(subsector_returns.loc[common_idx])
             improvement = subsector_corr - sector_corr
 
             # Only consider if it improves over sector by at least min_improvement
@@ -410,65 +493,75 @@ def _calculate_correlations(symbol: str, sector_etf: str, subsector_etf: Optiona
     if symbol not in stock_data or 'adjclose' not in stock_data[symbol].columns:
         return correlations
     
-    stock_returns = stock_data[symbol]['adjclose'].pct_change().dropna()
+    stock_returns = stock_data[symbol]['adjclose'].pct_change(fill_method=None).dropna()
     
     # Market correlation (SPY)
     if 'SPY' in etf_data and 'adjclose' in etf_data['SPY'].columns:
-        spy_returns = etf_data['SPY']['adjclose'].pct_change().dropna()
+        spy_returns = etf_data['SPY']['adjclose'].pct_change(fill_method=None).dropna()
         common_index = stock_returns.index.intersection(spy_returns.index)
         if len(common_index) > 100:
             try:
-                correlations['market'] = stock_returns.loc[common_index].corr(
-                    spy_returns.loc[common_index]
-                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    correlations['market'] = stock_returns.loc[common_index].corr(
+                        spy_returns.loc[common_index]
+                    )
             except:
                 pass
-    
+
     # Equal-weighted market correlation (RSP)
     if 'RSP' in etf_data and 'adjclose' in etf_data['RSP'].columns:
-        rsp_returns = etf_data['RSP']['adjclose'].pct_change().dropna()
+        rsp_returns = etf_data['RSP']['adjclose'].pct_change(fill_method=None).dropna()
         common_index = stock_returns.index.intersection(rsp_returns.index)
         if len(common_index) > 100:
             try:
-                correlations['market_ew'] = stock_returns.loc[common_index].corr(
-                    rsp_returns.loc[common_index]
-                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    correlations['market_ew'] = stock_returns.loc[common_index].corr(
+                        rsp_returns.loc[common_index]
+                    )
             except:
                 pass
-    
+
     # Sector correlation (cap-weighted)
     if sector_etf in etf_data and 'adjclose' in etf_data[sector_etf].columns:
-        sector_returns = etf_data[sector_etf]['adjclose'].pct_change().dropna()
+        sector_returns = etf_data[sector_etf]['adjclose'].pct_change(fill_method=None).dropna()
         common_index = stock_returns.index.intersection(sector_returns.index)
         if len(common_index) > 100:
             try:
-                correlations['sector'] = stock_returns.loc[common_index].corr(
-                    sector_returns.loc[common_index]
-                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    correlations['sector'] = stock_returns.loc[common_index].corr(
+                        sector_returns.loc[common_index]
+                    )
             except:
                 pass
-    
+
     # Equal-weighted sector correlation
     if equal_weight_etf and equal_weight_etf in etf_data and 'adjclose' in etf_data[equal_weight_etf].columns:
-        ew_sector_returns = etf_data[equal_weight_etf]['adjclose'].pct_change().dropna()
+        ew_sector_returns = etf_data[equal_weight_etf]['adjclose'].pct_change(fill_method=None).dropna()
         common_index = stock_returns.index.intersection(ew_sector_returns.index)
         if len(common_index) > 100:
             try:
-                correlations['sector_ew'] = stock_returns.loc[common_index].corr(
-                    ew_sector_returns.loc[common_index]
-                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    correlations['sector_ew'] = stock_returns.loc[common_index].corr(
+                        ew_sector_returns.loc[common_index]
+                    )
             except:
                 pass
-    
+
     # Subsector correlation
     if subsector_etf and subsector_etf in etf_data and 'adjclose' in etf_data[subsector_etf].columns:
-        subsector_returns = etf_data[subsector_etf]['adjclose'].pct_change().dropna()
+        subsector_returns = etf_data[subsector_etf]['adjclose'].pct_change(fill_method=None).dropna()
         common_index = stock_returns.index.intersection(subsector_returns.index)
         if len(common_index) > 100:
             try:
-                correlations['subsector'] = stock_returns.loc[common_index].corr(
-                    subsector_returns.loc[common_index]
-                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    correlations['subsector'] = stock_returns.loc[common_index].corr(
+                        subsector_returns.loc[common_index]
+                    )
             except:
                 pass
     

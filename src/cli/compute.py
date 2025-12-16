@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,15 +23,42 @@ from typing import Optional, List, Dict
 
 import pandas as pd
 
+# Force unbuffered output for progress visibility (especially when piped to tee/file)
+# This ensures print() and logger output is flushed immediately
+if not sys.stdout.line_buffering:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except AttributeError:
+        # Python < 3.7 fallback
+        sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+        sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
+
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Load environment variables from .env file if present
+# This allows storing API keys (FRED_API_KEY, RAPIDAPI_KEY) in .env
+try:
+    from dotenv import load_dotenv
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+except ImportError:
+    pass  # python-dotenv not installed, use environment variables directly
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    force=True  # Ensure handler is reconfigured with line buffering
 )
 logger = logging.getLogger(__name__)
+
+# Ensure all logging handlers flush immediately
+for handler in logging.root.handlers:
+    if hasattr(handler, 'stream'):
+        handler.stream = sys.stderr  # Use line-buffered stderr
 
 
 def load_cached_data(cache_dir: Path) -> dict:
@@ -46,20 +74,31 @@ def load_cached_data(cache_dir: Path) -> dict:
 
     data = {}
 
-    # Load stock data
-    stock_file = cache_dir / "stock_data_universe.parquet"
-    if stock_file.exists():
-        data['stocks'] = pd.read_parquet(stock_file)
-        logger.info(f"Loaded {len(data['stocks'])} stock records")
-    else:
-        # Try combined file
-        combined_file = cache_dir / "stock_data_combined.parquet"
-        if combined_file.exists():
-            data['stocks'] = pd.read_parquet(combined_file)
-            logger.info(f"Loaded {len(data['stocks'])} stock records from combined file")
+    # Load stock data - prefer newer file (combined vs universe)
+    combined_file = cache_dir / "stock_data_combined.parquet"
+    universe_file = cache_dir / "stock_data_universe.parquet"
+
+    # Determine which file to use based on modification time
+    stock_file = None
+    if combined_file.exists() and universe_file.exists():
+        # Prefer whichever is newer
+        if combined_file.stat().st_mtime > universe_file.stat().st_mtime:
+            stock_file = combined_file
+            logger.info(f"Using combined cache (newer than universe)")
         else:
-            logger.warning("No stock data found in cache")
-            data['stocks'] = pd.DataFrame()
+            stock_file = universe_file
+            logger.info(f"Using universe cache (newer than combined)")
+    elif combined_file.exists():
+        stock_file = combined_file
+    elif universe_file.exists():
+        stock_file = universe_file
+
+    if stock_file and stock_file.exists():
+        data['stocks'] = pd.read_parquet(stock_file)
+        logger.info(f"Loaded {len(data['stocks'])} stock records from {stock_file.name}")
+    else:
+        logger.warning("No stock data found in cache")
+        data['stocks'] = pd.DataFrame()
 
     # Load ETF data (includes VIX/VXN if downloaded via load_etf_universe)
     etf_file = cache_dir / "stock_data_etf.parquet"
@@ -410,6 +449,18 @@ def run_feature_pipeline(
         print("=" * 50)
         print(f"Symbols processed:  {features_df['symbol'].nunique()}")
         print(f"Total rows:         {len(features_df):,}")
+
+        # Get date range from features DataFrame
+        if 'date' in features_df.columns:
+            date_min = features_df['date'].min()
+            date_max = features_df['date'].max()
+            print(f"Date range:         {date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}")
+        elif features_df.index.name == 'date' or hasattr(features_df.index, 'min'):
+            date_min = features_df.index.min()
+            date_max = features_df.index.max()
+            if hasattr(date_min, 'strftime'):
+                print(f"Date range:         {date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}")
+
         print(f"Daily features:     {len(daily_features)}")
         if weekly_features:
             print(f"Weekly features:    {len(weekly_features)}")

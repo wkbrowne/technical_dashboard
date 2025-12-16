@@ -141,14 +141,19 @@ def download_fred_series(
     series_ids: Optional[List[str]] = None,
     start_date: str = '2010-01-01',
     cache_path: Optional[Path] = None,
+    force_refresh: bool = False,
 ) -> pd.DataFrame:
     """
     Download FRED series and return as DataFrame.
+
+    By default, uses cached data if available without checking staleness.
+    Use force_refresh=True to update stale cache (requires FRED_API_KEY).
 
     Args:
         series_ids: List of FRED series IDs (default: all defined series)
         start_date: Start date for data
         cache_path: Path to cache the data (optional)
+        force_refresh: If True, refresh cache even if it exists (default False)
 
     Returns:
         DataFrame with date index and series as columns
@@ -156,15 +161,13 @@ def download_fred_series(
     if series_ids is None:
         series_ids = list(FRED_SERIES.keys())
 
-    # Check cache first
-    if cache_path and cache_path.exists():
+    # Check cache first - prefer cached data unless force_refresh is True
+    if cache_path and cache_path.exists() and not force_refresh:
         logger.info(f"Loading FRED data from cache: {cache_path}")
         df = pd.read_parquet(cache_path)
-        # Check if we need to update (data older than 1 day)
-        if df.index.max() >= pd.Timestamp.now() - pd.Timedelta(days=2):
-            return df
-        logger.info("Cache is stale, refreshing...")
+        return df
 
+    # If force_refresh or no cache, try to download
     fred = get_fred_api()
 
     all_series = {}
@@ -183,6 +186,10 @@ def download_fred_series(
     df = pd.DataFrame(all_series)
     df.index = pd.to_datetime(df.index)
     df = df.sort_index()
+
+    # Ensure all columns are numeric (FRED API sometimes returns object types)
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
 
     # Forward-fill for weekly/monthly series (carry forward last value)
     df = df.ffill()
@@ -322,8 +329,10 @@ def add_fred_features(
     # Compute features with publication lag
     fred_features = compute_fred_features(fred_df, additional_lag_days=additional_lag_days)
 
-    # Attach to each symbol
+    # Attach to each symbol using pd.concat to avoid fragmentation
     attached = 0
+    fred_cols = list(fred_features.columns)
+
     for sym, df in indicators_by_symbol.items():
         if df.empty:
             continue
@@ -331,9 +340,11 @@ def add_fred_features(
         # Reindex FRED features to symbol's dates
         symbol_fred = fred_features.reindex(df.index)
 
-        # Concatenate
-        for col in symbol_fred.columns:
-            df[col] = symbol_fred[col].values
+        # Use pd.concat to add all columns at once (avoids DataFrame fragmentation)
+        # Only add columns that don't already exist
+        new_cols = [c for c in fred_cols if c not in df.columns]
+        if new_cols:
+            indicators_by_symbol[sym] = pd.concat([df, symbol_fred[new_cols]], axis=1)
 
         attached += 1
 

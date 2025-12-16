@@ -12,12 +12,18 @@ Pipeline Structure:
 5. Hill-climbing / pair swapping (local improvement)
 6. Final cleanup pass
 7. Select best subset seen anywhere
+
+Checkpointing:
+- Automatically saves state after each stage to artifacts/feature_selection/checkpoint.pkl
+- Resume with: pipeline.resume_from_checkpoint(X, y, checkpoint_path)
 """
 
 import gc
 import logging
+import pickle
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
@@ -47,6 +53,10 @@ class LooseTightConfig:
     """Configuration for the loose-then-tight pipeline.
 
     Attributes:
+        # Base feature elimination
+        run_base_elimination: Whether to run reverse elimination on base features
+        epsilon_remove_base: Tolerance for removal during base elimination
+
         # Loose forward selection
         epsilon_add_loose: Minimum mean improvement to add (very small for high recall)
         min_fold_improvement_ratio_loose: Fraction of folds that must improve
@@ -67,6 +77,10 @@ class LooseTightConfig:
         # Parallelization
         n_jobs: Number of parallel workers
     """
+    # Base feature elimination (quick pruning of BASE_FEATURES)
+    run_base_elimination: bool = False  # Disabled by default
+    epsilon_remove_base: float = 0.0005  # Slightly more lenient than strict elimination
+
     # Loose forward selection (high recall)
     epsilon_add_loose: float = 0.0002  # Very small - allow weak features
     min_fold_improvement_ratio_loose: float = 0.6  # 60% of folds must improve
@@ -324,6 +338,232 @@ class LooseTightPipeline:
         self._X: Optional[pd.DataFrame] = None
         self._y: Optional[pd.Series] = None
 
+        # Checkpointing
+        self._checkpoint_dir = Path('artifacts/feature_selection')
+        self._checkpoint_file = self._checkpoint_dir / 'checkpoint.pkl'
+        self._current_features: Optional[Set[str]] = None
+        self._completed_stages: List[str] = []
+
+    def _save_checkpoint(self, stage: str, current_features: Set[str], result: 'SubsetResult'):
+        """Save checkpoint after completing a stage."""
+        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint = {
+            'stage': stage,
+            'current_features': list(current_features),
+            'completed_stages': self._completed_stages.copy(),
+            'snapshots': self.snapshots.copy(),
+            'best_snapshot': self.best_snapshot,
+            'result_metric_main': result.metric_main,
+            'result_metric_std': result.metric_std,
+            'result_fold_metrics': result.fold_metrics.copy() if result.fold_metrics else [],
+            'config': self.config,
+            'model_config': self.model_config,
+            'cv_config': self.cv_config,
+            'metric_config': self.metric_config,
+            'search_config': self.search_config,
+            'timestamp': time.time(),
+        }
+
+        # Save to temp file first, then rename (atomic)
+        temp_file = self._checkpoint_file.with_suffix('.tmp')
+        with open(temp_file, 'wb') as f:
+            pickle.dump(checkpoint, f)
+        temp_file.rename(self._checkpoint_file)
+
+        logger.info(f"Checkpoint saved: stage={stage}, features={len(current_features)}")
+
+    @classmethod
+    def load_checkpoint(cls, checkpoint_path: str = None) -> Optional[dict]:
+        """Load checkpoint from file.
+
+        Args:
+            checkpoint_path: Path to checkpoint file. If None, uses default location.
+
+        Returns:
+            Checkpoint dict or None if not found.
+        """
+        if checkpoint_path is None:
+            checkpoint_path = Path('artifacts/feature_selection/checkpoint.pkl')
+        else:
+            checkpoint_path = Path(checkpoint_path)
+
+        if not checkpoint_path.exists():
+            return None
+
+        with open(checkpoint_path, 'rb') as f:
+            return pickle.load(f)
+
+    @classmethod
+    def has_checkpoint(cls, checkpoint_path: str = None) -> bool:
+        """Check if a checkpoint exists."""
+        if checkpoint_path is None:
+            checkpoint_path = Path('artifacts/feature_selection/checkpoint.pkl')
+        else:
+            checkpoint_path = Path(checkpoint_path)
+        return checkpoint_path.exists()
+
+    @classmethod
+    def checkpoint_info(cls, checkpoint_path: str = None) -> Optional[str]:
+        """Get human-readable info about a checkpoint."""
+        checkpoint = cls.load_checkpoint(checkpoint_path)
+        if checkpoint is None:
+            return None
+
+        from datetime import datetime
+        ts = datetime.fromtimestamp(checkpoint['timestamp'])
+        return (
+            f"Stage: {checkpoint['stage']}\n"
+            f"Features: {len(checkpoint['current_features'])}\n"
+            f"Metric: {checkpoint['result_metric_main']:.4f} ± {checkpoint['result_metric_std']:.4f}\n"
+            f"Completed: {', '.join(checkpoint['completed_stages'])}\n"
+            f"Saved: {ts.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    def resume_from_checkpoint(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        checkpoint_path: str = None,
+        verbose: bool = True,
+    ) -> 'LooseTightPipeline':
+        """Resume pipeline from a saved checkpoint.
+
+        Args:
+            X: Feature DataFrame (must have same columns as original)
+            y: Target Series
+            checkpoint_path: Path to checkpoint. If None, uses default.
+            verbose: Print progress
+
+        Returns:
+            self for chaining
+        """
+        checkpoint = self.load_checkpoint(checkpoint_path)
+        if checkpoint is None:
+            raise FileNotFoundError(f"No checkpoint found at {checkpoint_path or 'default location'}")
+
+        # Restore state
+        self._completed_stages = checkpoint['completed_stages']
+        self.snapshots = checkpoint['snapshots']
+        self.best_snapshot = checkpoint['best_snapshot']
+        self._current_features = set(checkpoint['current_features'])
+
+        # Restore configs
+        self.config = checkpoint['config']
+        self.model_config = checkpoint['model_config']
+        self.cv_config = checkpoint['cv_config']
+        self.metric_config = checkpoint['metric_config']
+        self.search_config = checkpoint['search_config']
+
+        # Set data references
+        self._X = X
+        self._y = y
+        self._verbose = verbose
+
+        last_stage = checkpoint['stage']
+
+        if verbose:
+            print(f"\n{'='*70}")
+            print("RESUMING FROM CHECKPOINT")
+            print(f"{'='*70}")
+            print(f"Last completed stage: {last_stage}")
+            print(f"Features at checkpoint: {len(self._current_features)}")
+            print(f"Metric at checkpoint: {checkpoint['result_metric_main']:.4f}")
+            print(f"Completed stages: {', '.join(self._completed_stages)}")
+            print()
+
+        # Determine which stages to run
+        all_stages = [
+            '1_base_features',
+            '1b_base_elimination',
+            '2_loose_forward',
+            '3_strict_backward',
+            '4_interactions',
+            '5_swapping',
+            '6_final_cleanup',
+        ]
+
+        # Find where to resume from
+        try:
+            resume_idx = all_stages.index(last_stage) + 1
+        except ValueError:
+            resume_idx = 0
+
+        # Get expansion candidates
+        all_expansion = [f for f in get_expansion_candidates(flat=True) if f in X.columns]
+
+        # Create a dummy result for continuation
+        from .config import SubsetResult
+        last_result = SubsetResult(
+            features=list(self._current_features),
+            metric_main=checkpoint['result_metric_main'],
+            metric_std=checkpoint['result_metric_std'],
+            fold_metrics=checkpoint['result_fold_metrics'],
+        )
+
+        current_features = self._current_features
+
+        # Run remaining stages
+        for stage_name in all_stages[resume_idx:]:
+            if stage_name == '1b_base_elimination':
+                if self.config.run_base_elimination:
+                    current_features, last_result = self._base_feature_elimination(
+                        current_features
+                    )
+                    self._completed_stages.append(stage_name)
+                    self._record_snapshot(stage_name, current_features, last_result)
+                    self._save_checkpoint(stage_name, current_features, last_result)
+
+            elif stage_name == '2_loose_forward':
+                current_features, last_result = self._loose_forward_selection(
+                    current_features, all_expansion
+                )
+                self._completed_stages.append(stage_name)
+                self._record_snapshot(stage_name, current_features, last_result)
+                self._save_checkpoint(stage_name, current_features, last_result)
+
+            elif stage_name == '3_strict_backward':
+                current_features, last_result = self._strict_backward_elimination(current_features)
+                self._completed_stages.append(stage_name)
+                self._record_snapshot(stage_name, current_features, last_result)
+                self._save_checkpoint(stage_name, current_features, last_result)
+
+            elif stage_name == '4_interactions':
+                if self.config.run_interactions:
+                    current_features, last_result = self._light_interaction_pass(
+                        current_features, all_expansion
+                    )
+                    self._completed_stages.append(stage_name)
+                    self._record_snapshot(stage_name, current_features, last_result)
+                    self._save_checkpoint(stage_name, current_features, last_result)
+
+            elif stage_name == '5_swapping':
+                current_features, last_result = self._hill_climbing_swapping(
+                    current_features, all_expansion
+                )
+                self._completed_stages.append(stage_name)
+                self._record_snapshot(stage_name, current_features, last_result)
+                self._save_checkpoint(stage_name, current_features, last_result)
+
+            elif stage_name == '6_final_cleanup':
+                current_features, last_result = self._final_cleanup(current_features)
+                self._completed_stages.append(stage_name)
+                self._record_snapshot(stage_name, current_features, last_result)
+                self._save_checkpoint(stage_name, current_features, last_result)
+
+        # Final best selection
+        self._select_best_subset()
+
+        if verbose:
+            print(f"\n{'='*70}")
+            print("PIPELINE COMPLETE (resumed)")
+            print(f"{'='*70}")
+            print(f"\nBest subset found at stage: {self.best_snapshot.stage}")
+            print(f"Features: {len(self.best_snapshot.features)}")
+            print(f"Metric: {self.best_snapshot.metric_mean:.4f} ± {self.best_snapshot.metric_std:.4f}")
+
+        return self
+
     def run(
         self,
         X: pd.DataFrame,
@@ -359,40 +599,72 @@ class LooseTightPipeline:
         # STEP 1: Start with base features (use all cores since no parallelism here)
         current_features = set(base_features)
         baseline_result = self._evaluate_subset(list(current_features), use_all_cores=True)
+        self._completed_stages.append("1_base_features")
         self._record_snapshot("1_base_features", current_features, baseline_result)
+        self._save_checkpoint("1_base_features", current_features, baseline_result)
 
         if verbose:
             print(f"STEP 1: Base Features")
             print(f"  Features: {len(current_features)}")
             print(f"  Metric: {baseline_result.metric_main:.4f} ± {baseline_result.metric_std:.4f}")
+            print(f"  [Checkpoint saved]")
             print()
+
+        # STEP 1b: Optional base feature elimination (quick pruning)
+        if self.config.run_base_elimination:
+            current_features, result = self._base_feature_elimination(current_features)
+            self._completed_stages.append("1b_base_elimination")
+            self._record_snapshot("1b_base_elimination", current_features, result)
+            self._save_checkpoint("1b_base_elimination", current_features, result)
+            if verbose:
+                print(f"  [Checkpoint saved]")
 
         # STEP 2: Loose forward selection
         current_features, result = self._loose_forward_selection(
             current_features, all_expansion
         )
+        self._completed_stages.append("2_loose_forward")
         self._record_snapshot("2_loose_forward", current_features, result)
+        self._save_checkpoint("2_loose_forward", current_features, result)
+        if verbose:
+            print(f"  [Checkpoint saved]")
 
         # STEP 3: Strict backward elimination
         current_features, result = self._strict_backward_elimination(current_features)
+        self._completed_stages.append("3_strict_backward")
         self._record_snapshot("3_strict_backward", current_features, result)
+        self._save_checkpoint("3_strict_backward", current_features, result)
+        if verbose:
+            print(f"  [Checkpoint saved]")
 
         # STEP 4: Light interaction pass (optional)
         if self.config.run_interactions:
             current_features, result = self._light_interaction_pass(
                 current_features, all_expansion
             )
+            self._completed_stages.append("4_interactions")
             self._record_snapshot("4_interactions", current_features, result)
+            self._save_checkpoint("4_interactions", current_features, result)
+            if verbose:
+                print(f"  [Checkpoint saved]")
 
         # STEP 5: Hill climbing / swapping
         current_features, result = self._hill_climbing_swapping(
             current_features, all_expansion
         )
+        self._completed_stages.append("5_swapping")
         self._record_snapshot("5_swapping", current_features, result)
+        self._save_checkpoint("5_swapping", current_features, result)
+        if verbose:
+            print(f"  [Checkpoint saved]")
 
         # STEP 6: Final cleanup pass
         current_features, result = self._final_cleanup(current_features)
+        self._completed_stages.append("6_final_cleanup")
         self._record_snapshot("6_final_cleanup", current_features, result)
+        self._save_checkpoint("6_final_cleanup", current_features, result)
+        if verbose:
+            print(f"  [Checkpoint saved]")
 
         # STEP 7: Select best subset seen anywhere
         self._select_best_subset()
@@ -409,6 +681,104 @@ class LooseTightPipeline:
                 print(f"  {i:2d}. {f}")
 
         return self
+
+    # =========================================================================
+    # STEP 1b: Base Feature Elimination (Optional)
+    # =========================================================================
+
+    def _base_feature_elimination(
+        self,
+        features: Set[str],
+    ) -> Tuple[Set[str], SubsetResult]:
+        """
+        STEP 1b: Quick reverse elimination on base features.
+
+        This is a single-pass backward elimination that runs once over all base
+        features to quickly prune any that don't contribute. Uses a slightly
+        more lenient epsilon than strict elimination to avoid being too aggressive.
+
+        Args:
+            features: Set of base features to evaluate.
+
+        Returns:
+            Tuple of (pruned feature set, result after pruning)
+        """
+        if self._verbose:
+            print(f"STEP 1b: Base Feature Elimination")
+            print(f"  epsilon_remove_base={self.config.epsilon_remove_base}")
+            print(f"  (single-pass quick pruning)")
+            print("-" * 50)
+
+        current_set = set(features)
+        best_result = self._evaluate_subset(list(current_set))
+        best_score = best_result.metric_main
+
+        # Parallel evaluation of all removals
+        features_list = list(current_set)
+        results = Parallel(n_jobs=self.config.n_jobs, backend='loky', verbose=0)(
+            delayed(_evaluate_removal_joblib)(
+                self._X, self._y, features_list, f,
+                self.model_config, self.cv_config,
+                self.metric_config, self.search_config
+            )
+            for f in features_list
+        )
+
+        # Find features that can be removed (don't hurt beyond epsilon)
+        removable = []
+        for f_name, result in results:
+            if result is None:
+                continue
+            # Remove if: improves OR doesn't hurt beyond epsilon
+            if result.metric_main >= best_score - self.config.epsilon_remove_base:
+                improvement = result.metric_main - best_score
+                removable.append((f_name, result, improvement))
+
+        if not removable:
+            if self._verbose:
+                print(f"  No removable features found")
+                print(f"  Final: {len(current_set)} features, {best_score:.4f}")
+                print()
+            return current_set, best_result
+
+        # Sort by improvement (best removals first)
+        removable.sort(key=lambda x: x[2], reverse=True)
+
+        if self._verbose:
+            print(f"  Found {len(removable)} potentially removable features:")
+
+        # Remove features one at a time, re-evaluating after each
+        removed_features = []
+        for f_name, _, _ in removable:
+            if f_name not in current_set:
+                continue
+            if len(current_set) <= 5:  # Keep at least 5 base features
+                if self._verbose:
+                    print(f"    Stopping: minimum feature count reached")
+                break
+
+            # Re-evaluate removal
+            test_set = current_set - {f_name}
+            result = self._evaluate_subset(list(test_set))
+
+            if result.metric_main >= best_score - self.config.epsilon_remove_base:
+                current_set = test_set
+                improvement = result.metric_main - best_score
+                best_score = result.metric_main
+                best_result = result
+                removed_features.append(f_name)
+
+                if self._verbose:
+                    sign = "+" if improvement >= 0 else ""
+                    print(f"    -{f_name}: {best_score:.4f} ({sign}{improvement:.4f})")
+
+        if self._verbose:
+            print(f"\n  Removed {len(removed_features)} base features")
+            print(f"  Final: {len(current_set)} features, {best_score:.4f}")
+            print()
+
+        gc.collect()
+        return current_set, best_result
 
     # =========================================================================
     # STEP 2: Loose Forward Selection

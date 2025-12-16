@@ -156,33 +156,41 @@ KEY INSIGHTS:
 """
 
 # Core momentum features for forward selection starting point
+# Updated based on feature selection results (52 features, 0.6932 AUC)
 BASE_FEATURES = [
-    # === TREND DIRECTION (4) ===
+    # === TREND DIRECTION (3) ===
     "rsi_14",                    # Daily momentum oscillator
     "w_rsi_14",                  # Weekly momentum (slower, filters noise)
-    "macd_histogram",            # Daily momentum acceleration
     "w_macd_histogram",          # Weekly momentum trend
 
-    # === TREND STRENGTH (5) ===
+    # === TREND STRENGTH (8) ===
     "trend_score_sign",          # Multi-MA alignment (+1/-1 per MA)
     "trend_score_slope",         # Trend slope composite
     "trend_persist_ema",         # Consecutive up/down days
     "pct_slope_ma_20",           # Short-term trend direction
+    "pct_slope_ma_100",          # Medium-term trend direction
     "w_pct_slope_ma_20",         # Weekly trend direction
+    "w_rv60_slope_norm",         # Realized vol slope (60d)
+    "w_rv100_slope_norm",        # Realized vol slope (100d)
 
-    # === PRICE POSITION (6) ===
+    # === PRICE POSITION (8) ===
     "pct_dist_ma_20",            # Mean reversion signal
     "pct_dist_ma_50",            # Trend distance
     "w_pct_dist_ma_20",          # Weekly mean reversion
+    "w_pct_dist_ma_100_z",       # Weekly distance to 100d MA z-score
     "pos_in_20d_range",          # Position in recent range (0-1)
+    "w_pos_in_5d_range",         # Weekly position in 5d range
     "vwap_dist_20d_zscore",      # Z-scored distance from 20d VWAP
     "w_vwap_dist_20d_zscore",    # Weekly VWAP distance (smoother)
 
-    # === VOLATILITY REGIME (4) ===
+    # === VOLATILITY REGIME (6) ===
     "vol_regime",                # Stock-specific vol regime
     "vol_regime_ema10",          # Smoothed vol regime
     "atr_percent",               # Normalized volatility
     "vix_regime",                # Market-wide fear/greed
+    "w_vix_ma4_ratio",           # VIX vs 4-week MA ratio
+    "w_vix_vxn_spread",          # VIX-VXN spread (equity vs tech vol)
+    "w_alpha_mom_qqq_spread_60_ema10",  # Weekly QQQ-SPY alpha spread (growth vs value)
 
     # === RELATIVE PERFORMANCE (7) ===
     "alpha_mom_spy_20_ema10",    # Alpha vs market
@@ -193,60 +201,198 @@ BASE_FEATURES = [
     "w_alpha_mom_spy_20_ema10",  # Weekly alpha
     "w_beta_spy",                # Weekly market beta
 
-    # === MACRO/INTERMARKET (3) ===
+    # === MACRO/INTERMARKET (15) ===
     "copper_gold_ratio",         # Economic growth indicator
     "copper_gold_zscore",        # Copper/gold z-score
+    "gold_spy_ratio",            # Gold vs SPY (risk-off indicator)
     "fred_ccsa_z52w",            # Continued claims z-score (labor market)
+    "fred_dgs2_chg20d",          # 2-year Treasury rate change
+    "fred_icsa_chg4w",           # Initial claims 4-week change
+    "w_copper_gold_ratio",       # Weekly copper/gold
+    "w_gold_spy_ratio",          # Weekly gold/SPY
+    "w_gold_spy_ratio_zscore",   # Weekly gold/SPY z-score
+    "w_dollar_momentum_20d",     # Dollar momentum
+    "w_equity_bond_corr_60d",    # Stock-bond correlation
+    "w_financials_utilities_ratio", # Risk-on/off sector ratio
+    "w_fred_bamlh0a0hym2_pct252", # High yield spread percentile
+    "w_fred_bamlh0a0hym2_z60",   # High yield spread z-score
+    "w_fred_icsa_chg4w",         # Weekly initial claims change
+    "w_fred_nfci_chg4w",         # Financial conditions change
+
+    # === MARKET BREADTH (1) ===
+    "w_ad_ratio_universe",       # Advance-decline ratio
+
+    # === VOLUME/LIQUIDITY (2) ===
+    "upper_shadow_ratio",        # Selling pressure candlestick
+    "w_volshock_ema",            # Volume shock indicator
 
     # === BREAKOUT (1) ===
     "breakout_up_20d",           # 20-day high breakout
 ]
 
-# Feature categories for reference
+# Feature categories for reference (updated to match config/features.yaml)
+# Categories align with src/config/features.py FeatureCategory enum
 FEATURE_CATEGORIES = {
-    "trend_direction": [
+    # === SINGLE-STOCK FEATURES ===
+    "trend": [
+        "trend_score_sign",
+        "trend_score_granular",
+        "trend_score_slope",
+        "trend_persist_ema",
+        "pct_slope_ma_20",
+        "pct_slope_ma_100",
+        "w_pct_slope_ma_20",
+    ],
+    "momentum": [
         "rsi_14",
         "w_rsi_14",
         "macd_histogram",
         "w_macd_histogram",
+        "macd_hist_deriv_ema3",
     ],
-    "trend_strength": [
-        "trend_score_sign",
-        "trend_score_slope",
-        "trend_persist_ema",
-        "pct_slope_ma_20",
-        "w_pct_slope_ma_20",
+    "volatility": [
+        "vol_regime",
+        "vol_regime_ema10",
+        "atr_percent",
+        "rv_z_60",
+        "rvol_20",
+        "w_rv60_slope_norm",
+        "w_rv100_slope_norm",
     ],
     "price_position": [
         "pct_dist_ma_20",
         "pct_dist_ma_50",
+        "pct_dist_ma_100_z",
         "w_pct_dist_ma_20",
+        "w_pct_dist_ma_100_z",
+        "min_pct_dist_ma",
+        "relative_dist_20_50_z",
+    ],
+    "range_breakout": [
+        "atr_percent",
+        "pos_in_5d_range",
+        "pos_in_10d_range",
         "pos_in_20d_range",
+        "w_pos_in_5d_range",
+        "breakout_up_5d",
+        "breakout_up_10d",
+        "breakout_up_20d",
+        "range_expansion_20d",
+    ],
+    "volume": [
+        "obv_z_60",
+        "rdollar_vol_20",
+        "volshock_z",
+        "volshock_ema",
+        "w_volshock_ema",
+    ],
+    "liquidity": [
+        "hl_spread_proxy",
+        "cs_spread_est",
+        "roll_spread_est",
+        "overnight_ratio",
+        "range_efficiency",
+        "upper_shadow_ratio",
+        "lower_shadow_ratio",
         "vwap_dist_20d_zscore",
         "w_vwap_dist_20d_zscore",
+        "amihud_illiq",
+        "illiquidity_score",
     ],
-    "volatility_regime": [
-        "vol_regime",
-        "vol_regime_ema10",
-        "atr_percent",
-        "vix_regime",
-    ],
-    "relative_performance": [
-        "alpha_mom_spy_20_ema10",
-        "alpha_mom_sector_20_ema10",
-        "beta_spy",
-        "rel_strength_sector",
+
+    # === CROSS-SECTIONAL FEATURES ===
+    "cross_sectional": [
+        "vol_regime_cs_median",
+        "vol_regime_rel",
+        "xsec_mom_5d_z",
         "xsec_mom_20d_z",
-        "w_alpha_mom_spy_20_ema10",
-        "w_beta_spy",
+        "xsec_mom_60d_z",
+        "xsec_pct_20d",
+        "w_xsec_mom_4w_z",
     ],
-    "macro_intermarket": [
+    "alpha": [
+        "beta_spy",
+        "beta_qqq",
+        "beta_sector",
+        "w_beta_spy",
+        "alpha_mom_spy_20_ema10",
+        "alpha_mom_spy_60_ema10",
+        "alpha_mom_qqq_20_ema10",
+        "alpha_mom_sector_20_ema10",
+        "alpha_resid_spy",
+        "alpha_qqq_vs_spy",
+        "w_alpha_mom_spy_20_ema10",
+        # Factor regression
+        "beta_market",
+        "beta_bestmatch",
+        "residual_cumret",
+        "residual_vol",
+    ],
+    "relative_strength": [
+        "rel_strength_spy",
+        "rel_strength_spy_zscore",
+        "rel_strength_qqq",
+        "rel_strength_qqq_zscore",
+        "rel_strength_sector",
+        "rel_strength_sector_zscore",
+        "w_rel_strength_spy",
+        "w_rel_strength_sector",
+    ],
+    "breadth": [
+        "ad_ratio_ema10",
+        "ad_ratio_universe",
+        "ad_thrust_10d",
+        "mcclellan_oscillator",
+        "pct_universe_above_ma20",
+        "pct_universe_above_ma50",
+        "w_ad_ratio_universe",
+    ],
+
+    # === MACRO/INTERMARKET FEATURES ===
+    "macro": [
+        # VIX regime
+        "vix_regime",
+        "vix_percentile_252d",
+        "vix_zscore_60d",
+        "vix_ma20_ratio",
+        "vix_vxn_spread",
+        "w_vix_ma4_ratio",
+        "w_vix_vxn_spread",
+        "w_vix_percentile_52w",
+        # FRED data
+        "fred_dgs10_chg20d",
+        "fred_dgs2_chg20d",
+        "fred_t10y2y_z60",
+        "fred_bamlh0a0hym2_z60",
+        "fred_bamlh0a0hym2_pct252",
+        "fred_icsa_chg4w",
+        "fred_icsa_z52w",
+        "fred_ccsa_z52w",
+        "fred_nfci_chg4w",
+        "w_fred_bamlh0a0hym2_z60",
+        "w_fred_icsa_chg4w",
+        "w_fred_nfci_chg4w",
+    ],
+    "intermarket": [
         "copper_gold_ratio",
         "copper_gold_zscore",
-        "fred_ccsa_z52w",
-    ],
-    "breakout": [
-        "breakout_up_20d",
+        "gold_spy_ratio",
+        "gold_spy_ratio_zscore",
+        "dollar_momentum_20d",
+        "dollar_percentile_252d",
+        "oil_momentum_20d",
+        "cyclical_defensive_ratio",
+        "financials_utilities_ratio",
+        "tech_spy_ratio",
+        "equity_bond_corr_60d",
+        "credit_spread_zscore",
+        "yield_curve_zscore",
+        "w_copper_gold_ratio",
+        "w_gold_spy_ratio",
+        "w_gold_spy_ratio_zscore",
+        "w_dollar_momentum_20d",
+        "w_financials_utilities_ratio",
+        "w_equity_bond_corr_60d",
     ],
 }
 
@@ -479,46 +625,64 @@ EXPANSION_CANDIDATES = {
     ],
 
     # --- Alpha momentum & Beta ---
+    # NOTE: Weekly alpha_mom features (w_alpha_*) are NOT implemented except specific BASE_FEATURES.
+    # Alpha is computed on daily data; weekly alpha needs separate cross-sectional computation.
     "alpha_momentum": [
-        # Market beta (CAPM)
+        # Market beta (CAPM) - daily only implemented
         "beta_spy",
+        "beta_qqq",
         "beta_sector",
-        "w_beta_spy",
-        "w_beta_sector",
-        # SPY alpha (different lookbacks)
+        # SPY alpha (different lookbacks - all implemented)
         "alpha_mom_spy_ema10",
+        "alpha_mom_spy_20_ema10",
         "alpha_mom_spy_60_ema10",
         "alpha_mom_spy_120_ema10",
-        "alpha_resid_spy",
-        # Sector alpha
+        # QQQ alpha (all implemented)
+        "alpha_mom_qqq_ema10",
+        "alpha_mom_qqq_20_ema10",
+        "alpha_mom_qqq_60_ema10",
+        "alpha_mom_qqq_120_ema10",
+        # QQQ vs SPY spread (all implemented)
+        "alpha_mom_qqq_spread_ema10",
+        "alpha_mom_qqq_spread_20_ema10",
+        "alpha_mom_qqq_spread_60_ema10",
+        "alpha_mom_qqq_spread_120_ema10",
+        # Sector alpha (all implemented)
         "alpha_mom_sector_ema10",
+        "alpha_mom_sector_20_ema10",
         "alpha_mom_sector_60_ema10",
         "alpha_mom_sector_120_ema10",
-        "alpha_resid_sector",
-        # Combo alpha
+        # Combo alpha (all implemented)
         "alpha_mom_combo_ema10",
         "alpha_mom_combo_20_ema10",
         "alpha_mom_combo_60_ema10",
         "alpha_mom_combo_120_ema10",
-        # Weekly
-        "w_alpha_mom_spy_ema10",
-        "w_alpha_mom_spy_60_ema10",
-        "w_alpha_mom_spy_120_ema10",
-        "w_alpha_resid_spy",
-        "w_alpha_mom_sector_20_ema10",
-        "w_alpha_mom_sector_ema10",
-        "w_alpha_mom_sector_60_ema10",
-        "w_alpha_mom_sector_120_ema10",
-        "w_alpha_resid_sector",
-        "w_alpha_mom_combo_ema10",
-        "w_alpha_mom_combo_20_ema10",
-        "w_alpha_mom_combo_60_ema10",
-        "w_alpha_mom_combo_120_ema10",
+        # Weekly (only specific BASE_FEATURES implemented)
+        "w_alpha_mom_spy_20_ema10",
+        "w_alpha_mom_qqq_spread_60_ema10",
+    ],
+
+    # --- Joint Factor Regression (from factor_regression.py) ---
+    # NOTE: Weekly joint_factor features (w_*) are NOT fully implemented.
+    # Factor regression is computed on daily data; weekly needs separate implementation.
+    "joint_factor": [
+        # Daily factor betas (from joint regression - implemented)
+        "beta_market",           # SPY beta (joint regression)
+        "beta_bestmatch",        # Best-match sector/subsector ETF beta
+        "beta_breadth",          # RSP-SPY spread beta (concentration factor)
+        # Daily residual statistics (implemented)
+        "residual_cumret",       # Cumulative residual (alpha signal)
+        "residual_vol",          # Idiosyncratic volatility
+        # Weekly (only w_beta_breadth implemented via weekly cross-sectional)
+        "w_beta_breadth",        # Weekly breadth beta
     ],
 
     # --- Relative strength ---
+    # NOTE: Weekly relative_strength features (w_rel_strength_*) are NOT implemented.
+    # RS is a cross-sectional feature computed on daily data only.
+    # The weekly resampling doesn't currently support cross-sectional recomputation.
     "relative_strength": [
-        # vs SPY
+        # vs SPY (all implemented)
         "rel_strength_spy",
         "rel_strength_spy_norm",
         "rel_strength_spy_zscore",
@@ -526,14 +690,26 @@ EXPANSION_CANDIDATES = {
         "rel_strength_spy_macd",
         "rel_strength_spy_macd_hist",
         "rel_strength_spy_macd_signal",
-        # vs RSP (equal weight)
+        # vs QQQ (growth/tech benchmark - all implemented)
+        "rel_strength_qqq",
+        "rel_strength_qqq_norm",
+        "rel_strength_qqq_zscore",
+        "rel_strength_qqq_rsi",
+        "rel_strength_qqq_macd",
+        "rel_strength_qqq_macd_hist",
+        "rel_strength_qqq_macd_signal",
+        # QQQ vs SPY spread (implemented)
+        "rel_strength_qqq_spy_spread",
+        "rel_strength_qqq_spy_spread_norm",
+        # vs RSP (equal weight - all implemented)
         "rel_strength_rsp",
         "rel_strength_rsp_norm",
         "rel_strength_rsp_zscore",
         "rel_strength_rsp_rsi",
         "rel_strength_rsp_macd",
         "rel_strength_rsp_macd_hist",
-        # vs Sector
+        # vs Sector (all implemented)
+        "rel_strength_sector",
         "rel_strength_sector_norm",
         "rel_strength_sector_zscore",
         "rel_strength_sector_rsi",
@@ -542,98 +718,46 @@ EXPANSION_CANDIDATES = {
         "rel_strength_sector_macd_signal",
         "rel_strength_sector_vs_market",
         "rel_strength_sector_vs_market_norm",
-        # vs Sector EW (Equal-Weighted sector ETF - avoids mega-cap dominance in cap-weighted sector ETFs)
+        # vs Sector EW (Equal-Weighted - all implemented)
         "rel_strength_sector_ew",
         "rel_strength_sector_ew_norm",
         "rel_strength_sector_ew_zscore",
         "rel_strength_sector_ew_rsi",
         "rel_strength_sector_ew_macd",
         "rel_strength_sector_ew_macd_hist",
-        # vs Subsector
-        "rel_strength_subsector",
-        "rel_strength_subsector_norm",
-        "rel_strength_subsector_zscore",
-        "rel_strength_subsector_rsi",
-        "rel_strength_subsector_macd",
-        "rel_strength_subsector_macd_hist",
-        # Weekly variants
-        "w_rel_strength_spy",
-        "w_rel_strength_spy_norm",
-        "w_rel_strength_spy_zscore",
-        "w_rel_strength_spy_rsi",
-        "w_rel_strength_spy_macd",
-        "w_rel_strength_spy_macd_hist",
-        "w_rel_strength_spy_macd_signal",
-        "w_rel_strength_rsp",
-        "w_rel_strength_rsp_norm",
-        "w_rel_strength_rsp_zscore",
-        "w_rel_strength_rsp_rsi",
-        "w_rel_strength_rsp_macd",
-        "w_rel_strength_rsp_macd_hist",
-        "w_rel_strength_sector",
-        "w_rel_strength_sector_norm",
-        "w_rel_strength_sector_zscore",
-        "w_rel_strength_sector_rsi",
-        "w_rel_strength_sector_macd",
-        "w_rel_strength_sector_macd_hist",
-        "w_rel_strength_sector_macd_signal",
-        "w_rel_strength_sector_vs_market",
-        "w_rel_strength_sector_vs_market_norm",
-        "w_rel_strength_sector_ew",
-        "w_rel_strength_sector_ew_norm",
-        "w_rel_strength_sector_ew_zscore",
-        "w_rel_strength_sector_ew_rsi",
-        "w_rel_strength_sector_ew_macd",
-        "w_rel_strength_sector_ew_macd_hist",
-        "w_rel_strength_subsector",
-        "w_rel_strength_subsector_norm",
-        "w_rel_strength_subsector_zscore",
-        "w_rel_strength_subsector_rsi",
-        "w_rel_strength_subsector_macd",
-        "w_rel_strength_subsector_macd_hist",
+        # NOTE: Subsector features REMOVED (had 40-48% NaN due to unstable correlation-based discovery)
     ],
 
     # --- Cross-sectional momentum ---
+    # NOTE: Weekly xsec features ARE implemented via weekly cross-sectional computation
     "cross_sectional_momentum": [
-        # Daily z-scores
+        # Daily z-scores (all implemented)
         "xsec_mom_5d_z",
         "xsec_mom_5d_sect_neutral_z",
         "xsec_mom_20d_sect_neutral_z",
         "xsec_mom_60d_z",
         "xsec_mom_60d_sect_neutral_z",
-        # Daily percentiles
+        # Daily percentiles (all implemented)
         "xsec_pct_5d",
         "xsec_pct_5d_sect",
         "xsec_pct_20d",
         "xsec_pct_20d_sect",
         "xsec_pct_60d",
         "xsec_pct_60d_sect",
-        # Weekly z-scores
+        # Weekly z-scores (implemented via weekly cross-sectional stage)
         "w_xsec_mom_1w_z",
         "w_xsec_mom_1w_sect_neutral_z",
         "w_xsec_mom_4w_z",
         "w_xsec_mom_4w_sect_neutral_z",
-        "w_xsec_mom_5d_z",
-        "w_xsec_mom_5d_sect_neutral_z",
         "w_xsec_mom_13w_z",
         "w_xsec_mom_13w_sect_neutral_z",
-        "w_xsec_mom_20d_z",
-        "w_xsec_mom_20d_sect_neutral_z",
-        "w_xsec_mom_60d_z",
-        "w_xsec_mom_60d_sect_neutral_z",
-        # Weekly percentiles
+        # Weekly percentiles (implemented)
         "w_xsec_pct_1w",
         "w_xsec_pct_1w_sect",
         "w_xsec_pct_4w",
         "w_xsec_pct_4w_sect",
-        "w_xsec_pct_5d",
-        "w_xsec_pct_5d_sect",
         "w_xsec_pct_13w",
         "w_xsec_pct_13w_sect",
-        "w_xsec_pct_20d",
-        "w_xsec_pct_20d_sect",
-        "w_xsec_pct_60d",
-        "w_xsec_pct_60d_sect",
     ],
 
     # --- Liquidity & Microstructure ---
@@ -690,21 +814,15 @@ EXPANSION_CANDIDATES = {
     ],
 
     # --- Market breadth ---
+    # NOTE: Weekly breadth features (w_*) are NOT implemented except w_ad_ratio_universe.
+    # Breadth is computed on daily data; weekly breadth needs separate implementation.
     "market_breadth": [
+        # Daily breadth (implemented)
         "ad_ratio_ema10",
         "ad_ratio_universe",
-        "ad_thrust_10d",
         "mcclellan_oscillator",
-        "pct_universe_above_ma20",
-        "pct_universe_above_ma50",
-        "pct_universe_above_ma200",
-        "w_ad_ratio_ema10",
+        # Weekly breadth (only w_ad_ratio_universe implemented)
         "w_ad_ratio_universe",
-        "w_ad_thrust_10d",
-        "w_mcclellan_oscillator",
-        "w_pct_universe_above_ma20",
-        "w_pct_universe_above_ma50",
-        "w_pct_universe_above_ma200",
     ],
 
     # --- Intermarket ratios ---

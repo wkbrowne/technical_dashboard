@@ -12,9 +12,9 @@ from joblib import Parallel, delayed
 
 # Import ParallelConfig - with fallback for different import contexts
 try:
-    from ..config.parallel import ParallelConfig
+    from ..config.parallel import ParallelConfig, calculate_workers_from_items, DEFAULT_STOCKS_PER_WORKER
 except ImportError:
-    from src.config.parallel import ParallelConfig
+    from src.config.parallel import ParallelConfig, calculate_workers_from_items, DEFAULT_STOCKS_PER_WORKER
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,14 @@ def _interpolate_single_symbol(symbol: str, df: pd.DataFrame) -> Tuple[str, pd.D
 
         # Create a copy to avoid modifying original
         df_processed = df.copy()
+
+        # Drop rows where index is NaN (can't interpolate with NaN dates)
+        if df_processed.index.isna().any():
+            nan_idx_count = df_processed.index.isna().sum()
+            logger.debug(f"{symbol}: Dropping {nan_idx_count} rows with NaN index values")
+            df_processed = df_processed[~df_processed.index.isna()]
+            if df_processed.empty:
+                return symbol, df_processed, 0
 
         # Handle duplicate columns - keep first occurrence only
         # This can happen when features are merged multiple times
@@ -155,24 +163,14 @@ def interpolate_internal_gaps(
 
     n_symbols = len(valid_symbols)
 
-    # Calculate effective jobs for chunk sizing
-    if n_jobs == -1:
-        import multiprocessing
-        effective_jobs = multiprocessing.cpu_count()
-    else:
-        effective_jobs = n_jobs
-
-    # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
-    # If we can't achieve that, reduce the number of effective workers
-    min_chunk_size = 100
-    chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
-    n_chunks = max(1, n_symbols // chunk_size)
-    actual_workers = min(effective_jobs, n_chunks)
+    # Calculate workers based on stocks_per_worker (100 stocks/worker by default)
+    chunk_size = DEFAULT_STOCKS_PER_WORKER
+    n_workers = calculate_workers_from_items(n_symbols, items_per_worker=chunk_size)
 
     logger.info(f"Interpolating internal NaN gaps for {n_symbols} symbols...")
 
     # Use sequential processing if n_jobs=1 or small dataset
-    if n_jobs == 1 or n_symbols < 10:
+    if n_jobs == 1 or n_symbols < 10 or n_workers == 1:
         logger.info("Using sequential processing for interpolation")
         results = []
         for symbol, df in valid_symbols:
@@ -183,11 +181,11 @@ def interpolate_internal_gaps(
         symbol_chunks = _chunk_list(valid_symbols, chunk_size)
         n_chunks = len(symbol_chunks)
 
-        logger.info(f"Processing in {n_chunks} batches (~{chunk_size} symbols/batch, {actual_workers} workers)")
+        logger.info(f"Processing in {n_chunks} batches ({chunk_size} stocks/worker, {n_workers} workers)")
 
         try:
             batch_results = Parallel(
-                n_jobs=n_jobs,
+                n_jobs=n_workers,
                 backend=backend,
                 verbose=verbose,
                 prefer=prefer

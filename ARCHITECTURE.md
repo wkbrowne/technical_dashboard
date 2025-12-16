@@ -235,6 +235,50 @@ Track rolling metrics continuously. Only re-tune when there's evidence of degrad
 ### 5. Conservative Feature Selection
 Use simple, regularized models for feature selection. This finds features with strong, robust signals rather than features that only work with specific configurations.
 
+### 6. No Class Balancing by Default
+
+We train on imbalanced data (approximately 25% positive, 75% negative) **without** class weighting by default. Reasoning:
+
+1. **Reflects reality**: The imbalanced ratio reflects actual market conditions. About 1 in 4 setups hits the target before the stop - this is the real distribution we need the model to learn.
+
+2. **Calibrated probabilities**: Without class weighting, predicted probabilities approximate true frequencies. A 30% predicted probability means ~30% of similar setups historically hit target. This is critical for position sizing and risk management.
+
+3. **Break-even calculation**: Our asymmetric barriers (3× ATR target, 1.5× ATR stop) create a 2:1 reward/risk ratio. The break-even probability is 33.3%. With properly calibrated probabilities, we can directly compare predictions to this threshold.
+
+4. **Threshold flexibility**: Unweighted models allow choosing decision thresholds post-training. Want higher precision? Raise the threshold. Want more trades? Lower it. Weighted models bake in a specific operating point.
+
+**When to use balanced training** (`--balanced` flag):
+- When AUC matters more than calibration
+- When the minority class is very rare (<10%)
+- When you'll use fixed thresholds rather than probability-based decisions
+
+All scripts support `--balanced` for class-weighted training via `scale_pos_weight`.
+
+### 7. Symbol Filtering (Automatic)
+
+The data loader automatically filters out untradeable securities before they enter the pipeline:
+
+**Filtered by symbol pattern:**
+- Warrants: `.W`, `/W`, `-W` suffixes
+- Units: `.U`, `/U`, `-U` suffixes
+- Rights: `.R`, `/R`, `-R` suffixes
+- Preferred shares: `.PR`, `-P` patterns
+- Foreign shares: `.F`, `/F` suffixes
+
+**Filtered by description:**
+- SPACs: "Acquisition Corp/Inc/Company" in name
+- ADRs: "ADR", "American Depositary", "Depositary Share/Receipt"
+- Blank check companies
+
+This filtering is enabled by default in `src/data/loader.py` and removes ~40 securities from a typical 3000-stock universe. To disable:
+
+```python
+from src.data.loader import _symbols_from_csv
+symbols = _symbols_from_csv(csv_path, filter_untradeable=False)
+```
+
+**Rationale**: SPACs and ADRs have fundamentally different price dynamics (merger arbitrage, currency effects) that don't fit the momentum-based signals this pipeline is designed to capture.
+
 ---
 
 ## Directory Structure

@@ -21,7 +21,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
-from joblib.externals.loky import get_reusable_executor
 
 
 # Feature module imports with fallback for both relative and absolute imports
@@ -29,7 +28,7 @@ try:
     # Try relative imports first (when run as module)
     from ..features.assemble import assemble_indicators_from_wide
     from ..features.single_stock import compute_single_stock_features
-    from ..features.cross_sectional import compute_cross_sectional_features
+    from ..features.cross_sectional import compute_cross_sectional_features, compute_weekly_cross_sectional_features
     from ..features.postprocessing import interpolate_internal_gaps, drop_rows_with_excessive_nans
     from ..features.ohlc_adjustment import adjust_ohlc_to_adjclose
     from ..features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
@@ -43,12 +42,15 @@ try:
     )
     # Config system
     from ..config.features import FeatureConfig, FeatureSpec, Timeframe
-    from ..config.parallel import ParallelConfig
+    from ..config.parallel import (
+        ParallelConfig, setup_loky_executor, shutdown_loky_workers,
+        parallel_stage, get_memory_mb, calculate_workers_from_items
+    )
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.assemble import assemble_indicators_from_wide
     from src.features.single_stock import compute_single_stock_features
-    from src.features.cross_sectional import compute_cross_sectional_features
+    from src.features.cross_sectional import compute_cross_sectional_features, compute_weekly_cross_sectional_features
     from src.features.postprocessing import interpolate_internal_gaps, drop_rows_with_excessive_nans
     from src.features.ohlc_adjustment import adjust_ohlc_to_adjclose
     from src.features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
@@ -62,7 +64,10 @@ except ImportError:
     )
     # Config system
     from src.config.features import FeatureConfig, FeatureSpec, Timeframe
-    from src.config.parallel import ParallelConfig
+    from src.config.parallel import (
+        ParallelConfig, setup_loky_executor, shutdown_loky_workers,
+        parallel_stage, get_memory_mb, calculate_workers_from_items
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +80,10 @@ _profiling_enabled = True
 def profile_stage(stage_name: str):
     """
     Context manager for timing pipeline stages.
-    
+
     Args:
         stage_name: Name of the pipeline stage for logging and reporting
-        
+
     Yields:
         None (context manager)
     """
@@ -86,18 +91,21 @@ def profile_stage(stage_name: str):
         # Just yield without timing if profiling is disabled
         yield
         return
-        
+
     start_time = time.time()
     start_timestamp = datetime.now()
-    logger.info(f"⏱️  Starting {stage_name}...")
-    
+    # Use print for immediate visibility (logger may be buffered)
+    print(f"\n>>> [{stage_name}] Starting...", flush=True)
+    logger.info(f"Starting {stage_name}...")
+
     try:
         yield
     finally:
         elapsed = time.time() - start_time
         end_timestamp = datetime.now()
-        logger.info(f"✅ Completed {stage_name} in {elapsed:.2f}s")
-        
+        print(f"<<< [{stage_name}] Completed in {elapsed:.1f}s", flush=True)
+        logger.info(f"Completed {stage_name} in {elapsed:.2f}s")
+
         # Store timing data for summary
         _pipeline_timings.append({
             'stage': stage_name,
@@ -138,21 +146,6 @@ def _set_profiling_enabled(enabled: bool):
     """Set global profiling enabled state."""
     global _profiling_enabled
     _profiling_enabled = enabled
-
-
-def shutdown_loky_workers():
-    """
-    Shut down the loky worker pool to free memory.
-
-    Should be called at the end of pipeline execution to release
-    worker processes that would otherwise sit idle consuming memory.
-    """
-    try:
-        executor = get_reusable_executor()
-        executor.shutdown(wait=True)
-        logger.info("Loky worker pool shut down")
-    except Exception as e:
-        logger.debug(f"Loky shutdown: {e}")
 
 
 def _feature_worker(sym: str, df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
@@ -394,6 +387,8 @@ def build_feature_universe(
         logger.info(f"Core features completed for {len(indicators_by_symbol)} symbols")
 
     # 4) Cross-sectional features (all computed together)
+    # Note: Best-match ETF mappings are computed internally using R²-based selection
+    # This replaces the broken subsector discovery with stable behavioral matching
     with profile_stage("Cross-Sectional Features"):
         compute_cross_sectional_features(
             indicators_by_symbol,
@@ -401,7 +396,6 @@ def build_feature_universe(
             sector_to_etf=sector_to_etf,
             market_symbol=spy_symbol,
             sp500_tickers=sp500_tickers,
-            enhanced_mappings=enhanced_mappings,
             beta_win=60,
             alpha_windows=(20, 60, 120),
             alpha_ema_span=10,
@@ -577,7 +571,8 @@ def _compute_higher_tf_for_symbol(
         # Handle DatetimeIndex: convert to 'date' column for merge_to_daily
         had_datetime_index = isinstance(daily_df.index, pd.DatetimeIndex) and 'date' not in daily_df.columns
         if had_datetime_index:
-            daily_df = daily_df.reset_index()
+            # Use copy() to defragment before reset_index to avoid PerformanceWarning
+            daily_df = daily_df.copy().reset_index()
             # The index might be named 'date' or unnamed
             if 'index' in daily_df.columns:
                 daily_df = daily_df.rename(columns={'index': 'date'})
@@ -594,37 +589,89 @@ def _compute_higher_tf_for_symbol(
                 daily_df = daily_df.set_index('date')
             return symbol, daily_df
 
-        # Step 2: Compute features at higher timeframe
-        close = pd.to_numeric(resampled['close'], errors='coerce')
+        # Step 2: Compute FULL feature stack at higher timeframe
+        # Prepare resampled data for compute_single_stock_features
+        # The resampler creates lowercase columns; single_stock expects 'adjclose'
+        if 'close' in resampled.columns and 'adjclose' not in resampled.columns:
+            resampled['adjclose'] = resampled['close']
 
-        if len(close.dropna()) < 10:
+        # Need DatetimeIndex for single_stock features
+        # TimeframeResampler returns week_end/month_end columns, not 'date'
+        period_col = 'week_end' if timeframe == TimeframeType.WEEKLY else 'month_end'
+        if period_col in resampled.columns and not isinstance(resampled.index, pd.DatetimeIndex):
+            resampled_indexed = resampled.set_index(period_col)
+        elif 'date' in resampled.columns and not isinstance(resampled.index, pd.DatetimeIndex):
+            resampled_indexed = resampled.set_index('date')
+        else:
+            resampled_indexed = resampled
+
+        # Check minimum data requirement
+        if len(resampled_indexed) < 30:  # Need at least 30 bars for most features
             if had_datetime_index:
                 daily_df = daily_df.set_index('date')
             return symbol, daily_df
 
-        # RSI
+        # Compute full single-stock feature stack on higher timeframe data
         try:
-            import pandas_ta as ta
-            for period in [14, 21]:
-                rsi = ta.rsi(close, length=period)
-                if rsi is not None:
-                    resampled[f'rsi_{period}'] = rsi.astype('float32')
-        except Exception:
-            pass
-
-        # SMAs and distance
-        for period in [20, 50]:
-            sma = close.rolling(period, min_periods=period//2).mean()
-            resampled[f'sma{period}'] = sma.astype('float32')
-            if sma is not None:
-                dist = (close - sma) / sma
-                resampled[f'dist_sma{period}'] = dist.astype('float32')
-
-        # Trend slope
-        for period in [20]:
-            if f'sma{period}' in resampled.columns:
-                slope = resampled[f'sma{period}'].diff(4) / resampled[f'sma{period}'].shift(4)
-                resampled[f'sma{period}_slope'] = slope.astype('float32')
+            cols_before = set(resampled_indexed.columns)
+            resampled_with_features = compute_single_stock_features(
+                resampled_indexed,
+                price_col='adjclose',
+                ret_col='ret',
+                vol_col='volume',
+                ensure_returns=True
+            )
+            cols_after = set(resampled_with_features.columns)
+            # Reset index back to column for merge
+            # The index was set to week_end/month_end, need to preserve it for merge_to_daily
+            if isinstance(resampled_with_features.index, pd.DatetimeIndex):
+                resampled = resampled_with_features.reset_index()
+                # The first column after reset_index is the former index (week_end/month_end)
+                index_col_name = resampled.columns[0]
+                # Ensure the period column exists for merge_to_daily
+                if index_col_name not in [period_col, 'date']:
+                    # Index had a different name, rename to period_col
+                    resampled = resampled.rename(columns={index_col_name: period_col})
+                elif index_col_name == 'date':
+                    # Index was named 'date', also create period_col for merge
+                    resampled[period_col] = resampled['date']
+                # If index_col_name == period_col, it's already correct
+            else:
+                resampled = resampled_with_features
+                # Ensure period_col exists
+                if period_col not in resampled.columns and 'date' in resampled.columns:
+                    resampled[period_col] = resampled['date']
+        except Exception as e:
+            logger.debug(f"Full feature computation failed for {symbol} at {prefix}, using minimal: {e}")
+            # Fall back to minimal features if full computation fails
+            # Check for close column availability
+            if 'close' not in resampled.columns and 'adjclose' in resampled.columns:
+                close = pd.to_numeric(resampled['adjclose'], errors='coerce')
+            elif 'close' in resampled.columns:
+                close = pd.to_numeric(resampled['close'], errors='coerce')
+            else:
+                logger.warning(f"No close/adjclose column in resampled for {symbol}")
+                if had_datetime_index:
+                    daily_df = daily_df.set_index('date')
+                return symbol, daily_df
+            new_features = {}
+            try:
+                import pandas_ta as ta
+                for period in [14, 21]:
+                    rsi = ta.rsi(close, length=period)
+                    if rsi is not None:
+                        new_features[f'rsi_{period}'] = rsi.astype('float32')
+            except Exception:
+                pass
+            for period in [20, 50]:
+                sma = close.rolling(period, min_periods=period//2).mean()
+                new_features[f'sma{period}'] = sma.astype('float32')
+                if sma is not None:
+                    dist = (close - sma) / sma
+                    new_features[f'dist_sma{period}'] = dist.astype('float32')
+            if new_features:
+                new_cols_df = pd.DataFrame(new_features, index=resampled.index)
+                resampled = pd.concat([resampled, new_cols_df], axis=1)
 
         # Step 3: Add prefix to feature columns
         resampled = add_prefix_to_features(resampled, prefix)
@@ -748,31 +795,26 @@ def compute_higher_timeframe_features_dict(
     logger.info(f"Computing higher timeframe features (dict-based): {timeframes}")
 
     n_symbols = len(daily_by_symbol)
-    effective_jobs = parallel_config.effective_n_jobs
+
+    # Calculate workers based on stocks_per_worker setting
+    n_workers = parallel_config.get_workers_for_items(n_symbols)
+    chunk_size = parallel_config.stocks_per_worker
 
     start_time = time.time()
-
-    # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
-    min_chunk_size = 100
-    chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
-    n_chunks = max(1, n_symbols // chunk_size)
-
-    # Adjust workers if we have fewer chunks than cores
-    actual_workers = min(effective_jobs, n_chunks)
 
     # Create batches
     symbol_chunks = _chunk_dict(daily_by_symbol, chunk_size)
     n_chunks = len(symbol_chunks)
 
     logger.info(f"Processing {n_symbols} symbols for timeframes {timeframes} in {n_chunks} batches "
-                f"(~{chunk_size} symbols/batch, {actual_workers} workers)")
+                f"({chunk_size} stocks/worker, {n_workers} workers)")
 
     # Single parallel job that computes ALL timeframes for each symbol batch
+    # NOTE: Don't call setup_loky_executor() here - it corrupts executor state in joblib 1.5+
     batch_results = Parallel(
-        n_jobs=parallel_config.n_jobs,
-        backend=parallel_config.backend,
+        n_jobs=n_workers,
+        backend='loky',
         verbose=parallel_config.verbose,
-        prefer=parallel_config.prefer
     )(
         delayed(_compute_all_higher_tf_batch)(chunk, timeframes)
         for chunk in symbol_chunks
@@ -896,6 +938,25 @@ def run_pipeline_v2(
     if timeframes is None:
         timeframes = ['D', 'W']
 
+    # Get date range from indicators
+    date_min, date_max = None, None
+    for sym, df in indicators_by_symbol.items():
+        if df is not None and not df.empty and hasattr(df.index, 'min'):
+            sym_min, sym_max = df.index.min(), df.index.max()
+            if date_min is None or sym_min < date_min:
+                date_min = sym_min
+            if date_max is None or sym_max > date_max:
+                date_max = sym_max
+
+    # Print pipeline start info for visibility
+    print(f"\n{'='*60}", flush=True)
+    print(f"PIPELINE V2: Processing {len(indicators_by_symbol)} symbols", flush=True)
+    print(f"Timeframes: {timeframes}", flush=True)
+    print(f"Workers: {parallel_config.effective_n_jobs}", flush=True)
+    if date_min and date_max:
+        print(f"Date range: {date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}", flush=True)
+    print(f"{'='*60}", flush=True)
+
     logger.info(f"Running pipeline v2 with {len(indicators_by_symbol)} symbols")
     logger.info(f"Timeframes: {timeframes}")
     logger.info(f"Parallel config: {parallel_config.summary()}")
@@ -911,30 +972,26 @@ def run_pipeline_v2(
     # Step 1: Compute daily single-stock features (parallel with batching)
     with profile_stage("Daily Single-Stock Features"):
         n_symbols = len(indicators_by_symbol)
-        effective_jobs = parallel_config.effective_n_jobs
 
-        # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
-        # If we can't achieve that, reduce the number of effective workers
-        min_chunk_size = 100
-        chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
-        n_chunks = max(1, n_symbols // chunk_size)
-
-        # Adjust workers if we have fewer chunks than cores
-        actual_workers = min(effective_jobs, n_chunks)
+        # Calculate workers based on stocks_per_worker setting
+        # e.g., 3000 stocks with 100/worker = 30 workers, 100 stocks = 1 worker
+        n_workers = parallel_config.get_workers_for_items(n_symbols)
+        chunk_size = parallel_config.stocks_per_worker
 
         # Create batches of symbols
         symbol_chunks = _chunk_dict(indicators_by_symbol, chunk_size)
         n_chunks = len(symbol_chunks)
 
         logger.info(f"Processing {n_symbols} symbols in {n_chunks} batches "
-                   f"(~{chunk_size} symbols/batch, {actual_workers} workers)")
+                   f"({chunk_size} stocks/worker, {n_workers} workers)")
 
-        # Process batches in parallel - each worker processes multiple symbols
+        # Process batches in parallel
+        # NOTE: Don't call setup_loky_executor() here - it corrupts executor state in joblib 1.5+
+        # Let Parallel manage its own executor lifecycle
         batch_results = Parallel(
-            n_jobs=parallel_config.n_jobs,
-            backend=parallel_config.backend,
+            n_jobs=n_workers,
+            backend='loky',
             verbose=parallel_config.verbose,
-            prefer=parallel_config.prefer
         )(
             delayed(_feature_worker_batch)(chunk)
             for chunk in symbol_chunks
@@ -946,7 +1003,11 @@ def run_pipeline_v2(
             for sym, df in batch:
                 indicators_by_symbol[sym] = df
 
+        # Explicitly shut down loky workers to free memory immediately
+        shutdown_loky_workers()
+
     # Step 2: Compute cross-sectional features (per-symbol features parallelized)
+    # Note: Best-match ETF mappings are computed internally using R²-based selection
     if enabled_cs:
         with profile_stage("Cross-Sectional Features"):
             compute_cross_sectional_features(
@@ -955,9 +1016,10 @@ def run_pipeline_v2(
                 sector_to_etf=sector_to_etf,
                 market_symbol=spy_symbol,
                 sp500_tickers=sp500_tickers,
-                enhanced_mappings=enhanced_mappings,
                 n_jobs=parallel_config.n_jobs
             )
+            # Shut down loky workers after cross-sectional to free memory
+            shutdown_loky_workers()
 
     # Step 3: Add higher timeframe features (W/M) - compute alongside daily features
     higher_tfs = [tf for tf in timeframes if tf in ['W', 'M']]
@@ -969,6 +1031,24 @@ def run_pipeline_v2(
                 timeframes=higher_tfs,
                 parallel_config=parallel_config
             )
+            # Shut down loky workers after timeframe processing to free memory
+            shutdown_loky_workers()
+
+    # Step 3b: Add weekly cross-sectional features (alpha, beta, cross-asset, FRED, breadth, relative strength)
+    # These are computed on weekly-resampled data and merged back to daily
+    if 'W' in higher_tfs:
+        with profile_stage("Weekly Cross-Sectional Features"):
+            compute_weekly_cross_sectional_features(
+                indicators_by_symbol,
+                market_symbol=spy_symbol,
+                qqq_symbol="QQQ",
+                sp500_tickers=sp500_tickers,
+                prefix="w_",
+                sectors=sectors,
+                sector_to_etf=sector_to_etf,
+            )
+            # Shut down loky workers after weekly CS features to free memory
+            shutdown_loky_workers()
 
     # Step 4: Interpolate NaNs (applies to daily AND higher TF features)
     with profile_stage("NaN Interpolation"):
@@ -976,6 +1056,8 @@ def run_pipeline_v2(
             indicators_by_symbol,
             parallel_config=parallel_config
         )
+        # Shut down loky workers after interpolation to free memory
+        shutdown_loky_workers()
 
     # Step 5: Generate targets (after all features computed and interpolated)
     targets_df = None
@@ -986,12 +1068,25 @@ def run_pipeline_v2(
                 triple_barrier_config,
                 parallel_config=parallel_config
             )
+            # Shut down loky workers after target generation to free memory
+            shutdown_loky_workers()
 
-    # Step 6: Convert to final long format
+    # Step 6: Convert to final long format (sequential operation - ensure workers are shut down)
+    shutdown_loky_workers()  # Ensure all parallel workers are terminated before sequential work
+    print(f"\n>>> [Final Assembly] Converting to long format...", flush=True)
     daily_df = combine_to_long(indicators_by_symbol)
+    print(f"<<< [Final Assembly] Done: {len(daily_df):,} rows, {len(daily_df.columns)} columns", flush=True)
 
     # Step 7: Shut down loky workers to free memory
     shutdown_loky_workers()
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"PIPELINE V2 COMPLETE", flush=True)
+    print(f"  Rows: {len(daily_df):,}", flush=True)
+    print(f"  Columns: {len(daily_df.columns)}", flush=True)
+    if targets_df is not None:
+        print(f"  Targets: {len(targets_df):,}", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     logger.info(f"Pipeline v2 completed: {len(daily_df)} rows, {len(daily_df.columns)} columns")
 

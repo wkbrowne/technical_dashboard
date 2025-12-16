@@ -94,7 +94,8 @@ def compute_single_stock_features(
             raise ValueError(f"Price column '{price_col}' not found in DataFrame")
 
         logger.debug(f"Calculating returns from {price_col}")
-        out[ret_col] = np.log(pd.to_numeric(out[price_col], errors="coerce")).diff()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            out[ret_col] = np.log(pd.to_numeric(out[price_col], errors="coerce")).diff()
 
     # Validate required columns exist
     if price_col not in out.columns:

@@ -55,6 +55,22 @@ from src.feature_selection import (
 )
 
 
+def compute_scale_pos_weight(y: pd.Series) -> float:
+    """Compute scale_pos_weight for LightGBM class balancing.
+
+    scale_pos_weight = n_negative / n_positive
+
+    Args:
+        y: Binary target series (0/1)
+
+    Returns:
+        scale_pos_weight value for LightGBM
+    """
+    n_positive = (y == 1).sum()
+    n_negative = (y == 0).sum()
+    return n_negative / n_positive
+
+
 def load_and_prepare_data(
     max_symbols: int = 200,
     binary_target: bool = True,
@@ -185,12 +201,15 @@ def run_feature_selection(
     features: list[str],
     regime: pd.Series = None,
     n_folds: int = 5,
-    n_jobs: int = 8
+    n_jobs: int = 8,
+    scale_pos_weight: float = None,
+    prune_base: bool = False
 ) -> LooseTightPipeline:
     """Run the LOOSE-THEN-TIGHT feature selection pipeline.
 
     Pipeline steps:
     1. Base features (seed, not forced)
+    1b. (Optional) Base feature elimination - quick prune of base features
     2. Loose forward selection (high recall)
     3. Strict backward elimination (all features removable)
     4. Light interaction pass
@@ -205,6 +224,9 @@ def run_feature_selection(
         regime: Optional regime labels (unused in loose-tight).
         n_folds: Number of CV folds.
         n_jobs: Number of parallel jobs.
+        scale_pos_weight: LightGBM class weight (n_neg/n_pos). None for no weighting.
+        prune_base: If True, run quick reverse elimination on BASE_FEATURES before
+                   forward selection to prune weak base features early.
 
     Returns:
         Fitted LooseTightPipeline object.
@@ -216,6 +238,8 @@ def run_feature_selection(
     print(f"Samples: {len(X)}")
     print(f"CV Folds: {n_folds}")
     print(f"Parallel Jobs: {n_jobs}")
+    if scale_pos_weight is not None:
+        print(f"Class Balancing: scale_pos_weight={scale_pos_weight:.3f}")
     print()
 
     # Validate base features
@@ -235,19 +259,25 @@ def run_feature_selection(
 
     # Configure model for LightGBM classification
     # With 64 cores: 8 parallel candidate evaluations × 8 threads per model = 64 total
+    model_params = {
+        'learning_rate': 0.05,
+        'max_depth': 6,
+        'num_leaves': 31,
+        'min_child_samples': 50,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,
+        'reg_lambda': 0.1,
+    }
+
+    # Add class weighting if specified
+    if scale_pos_weight is not None:
+        model_params['scale_pos_weight'] = scale_pos_weight
+
     model_config = ModelConfig(
         model_type=ModelType.LIGHTGBM,
         task_type=TaskType.CLASSIFICATION,
-        params={
-            'learning_rate': 0.05,
-            'max_depth': 6,
-            'num_leaves': 31,
-            'min_child_samples': 50,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'reg_alpha': 0.1,
-            'reg_lambda': 0.1,
-        },
+        params=model_params,
         num_threads=8,  # 8 threads per model (8 jobs × 8 threads = 64 cores)
         early_stopping_rounds=50,
         num_boost_round=300,
@@ -278,6 +308,10 @@ def run_feature_selection(
 
     # Configure the loose-then-tight pipeline
     pipeline_config = LooseTightConfig(
+        # Base feature elimination (optional quick pruning)
+        run_base_elimination=prune_base,
+        epsilon_remove_base=0.0005,  # Slightly more lenient than strict
+
         # LOOSE forward selection (high recall)
         epsilon_add_loose=0.0002,  # Very permissive - allow weak features
         min_fold_improvement_ratio_loose=0.6,  # 60% of folds must improve
@@ -322,17 +356,61 @@ def run_feature_selection(
 
 def main():
     """Main entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='LOOSE-THEN-TIGHT Feature Selection')
+    parser.add_argument('--balanced', action='store_true',
+                        help='Use class weights (scale_pos_weight) for balanced training')
+    parser.add_argument('--max-symbols', type=int, default=5000,
+                        help='Maximum number of symbols to include')
+    parser.add_argument('--n-jobs', type=int, default=8,
+                        help='Number of parallel jobs')
+    parser.add_argument('--n-folds', type=int, default=5,
+                        help='Number of CV folds')
+    parser.add_argument('--prune-base', action='store_true',
+                        help='Run quick reverse elimination on BASE_FEATURES before forward selection')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume from last checkpoint if available')
+    parser.add_argument('--checkpoint-info', action='store_true',
+                        help='Show checkpoint info and exit')
+    args = parser.parse_args()
+
+    # Handle checkpoint info request
+    if args.checkpoint_info:
+        info = LooseTightPipeline.checkpoint_info()
+        if info:
+            print("Checkpoint found:")
+            print(info)
+        else:
+            print("No checkpoint found.")
+        return None
+
     print("="*60)
     print("LOOSE-THEN-TIGHT Feature Selection")
+    if args.balanced:
+        print("  MODE: BALANCED (using class weights)")
+    else:
+        print("  MODE: IMBALANCED (no class weights)")
+    if args.prune_base:
+        print("  BASE FEATURE PRUNING: ENABLED")
     print("="*60)
     print()
 
     # Load and prepare data - use all symbols
     X, y, regime = load_and_prepare_data(
-        max_symbols=5000,  # Use all ~2900 symbols
+        max_symbols=args.max_symbols,
         binary_target=True,
         min_samples_per_symbol=5
     )
+
+    # Compute scale_pos_weight if balanced mode
+    scale_pos_weight = None
+    if args.balanced:
+        scale_pos_weight = compute_scale_pos_weight(y)
+        print(f"\nClass balancing enabled:")
+        print(f"  Positive samples: {(y == 1).sum():,}")
+        print(f"  Negative samples: {(y == 0).sum():,}")
+        print(f"  scale_pos_weight: {scale_pos_weight:.3f}")
 
     # Validate data
     is_valid, issues = validate_data(X, y, min_samples=1000)
@@ -346,14 +424,32 @@ def main():
     # Pre-filter features
     valid_features = prefilter_features(X, max_nan_rate=0.3, correlation_threshold=0.95)
 
-    # Run loose-then-tight feature selection
-    pipeline = run_feature_selection(
-        X, y,
-        features=valid_features,
-        regime=regime,
-        n_folds=5,
-        n_jobs=8  # Parallel workers for loose-tight pipeline
-    )
+    # Check for resume
+    if args.resume and LooseTightPipeline.has_checkpoint():
+        print("\n" + "="*60)
+        print("RESUMING FROM CHECKPOINT")
+        print("="*60)
+        info = LooseTightPipeline.checkpoint_info()
+        print(info)
+        print()
+
+        # Create pipeline and resume
+        pipeline = LooseTightPipeline()
+        pipeline.resume_from_checkpoint(X, y, verbose=True)
+    else:
+        if args.resume:
+            print("\nNo checkpoint found, starting fresh...")
+
+        # Run loose-then-tight feature selection
+        pipeline = run_feature_selection(
+            X, y,
+            features=valid_features,
+            regime=regime,
+            n_folds=args.n_folds,
+            n_jobs=args.n_jobs,
+            scale_pos_weight=scale_pos_weight,
+            prune_base=args.prune_base
+        )
 
     # Print results
     print("\n" + "="*60)

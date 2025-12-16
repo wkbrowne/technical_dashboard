@@ -33,6 +33,17 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# OHLCV aggregation functions (defined at module level for pickling in parallel)
+def _agg_first(x):
+    """Get first value in resample group."""
+    return x.iloc[0] if len(x) > 0 else np.nan
+
+
+def _agg_last(x):
+    """Get last value in resample group."""
+    return x.iloc[-1] if len(x) > 0 else np.nan
+
+
 class TimeframeType(str, Enum):
     """Supported timeframes."""
     DAILY = "D"
@@ -130,12 +141,13 @@ class TimeframeResampler:
     }
 
     # Standard OHLCV aggregation rules
+    # Note: Use module-level functions to avoid pandas version conflicts with 'first'/'last' strings
     OHLCV_AGG = {
-        'open': 'first',
+        'open': _agg_first,
         'high': 'max',
         'low': 'min',
-        'close': 'last',
-        'adjclose': 'last',
+        'close': _agg_last,
+        'adjclose': _agg_last,
         'volume': 'sum',
     }
 
@@ -199,34 +211,55 @@ class TimeframeResampler:
         elif not isinstance(df_work.index, pd.DatetimeIndex):
             raise ValueError("DataFrame must have DatetimeIndex or 'date' column")
 
-        # Build aggregation rules for all columns
+        # Build aggregation rules - only aggregate OHLCV columns
+        # For higher timeframe feature computation, we resample OHLCV and compute fresh features
+        # (aggregating all feature columns doesn't make sense and is error-prone)
         agg_rules = {}
+        ohlcv_keys = list(cls.OHLCV_AGG.keys())
         for col in df_work.columns:
             if col in cls.OHLCV_AGG:
                 agg_rules[col] = cls.OHLCV_AGG[col]
-            elif col in ['symbol']:
-                agg_rules[col] = 'first'
-            elif pd.api.types.is_numeric_dtype(df_work[col]):
-                agg_rules[col] = 'last'
 
-        # Perform resampling
-        resampled = df_work.resample(rule).agg(agg_rules)
-        resampled = resampled.dropna(subset=['close'])
+        # If no OHLCV columns found, return empty
+        if not agg_rules:
+            logger.warning("No OHLCV columns found for resampling")
+            return pd.DataFrame()
+
+        # Select only OHLCV columns for resampling (avoid aggregating feature columns)
+        ohlcv_cols = [c for c in df_work.columns if c in agg_rules]
+        df_ohlcv = df_work[ohlcv_cols]
+
+        # Perform resampling on OHLCV subset only
+        resampled = df_ohlcv.resample(rule).agg(agg_rules)
+
+        # Drop rows where close is NaN (use different method depending on result type)
+        if isinstance(resampled, pd.Series):
+            resampled = resampled.dropna().to_frame()
+        elif 'close' in resampled.columns:
+            resampled = resampled.dropna(subset=['close'])
 
         if resampled.empty:
             return pd.DataFrame()
 
-        # Add metadata
+        # Add metadata and returns - accumulate to add all at once (avoid fragmentation)
         period_col = 'week_end' if timeframe == TimeframeType.WEEKLY else 'month_end'
-        resampled[period_col] = resampled.index
-        if symbol:
-            resampled['symbol'] = symbol
-
-        # Calculate returns at this timeframe
         ret_col = f'{cls.PREFIXES[timeframe]}ret'
-        resampled[ret_col] = np.log(
-            pd.to_numeric(resampled['close'], errors='coerce')
-        ).diff()
+
+        new_cols = {period_col: resampled.index}
+        # Only add symbol if not already in resampled columns (avoid duplicates)
+        if symbol and 'symbol' not in resampled.columns:
+            new_cols['symbol'] = symbol
+        # Compute returns if close column exists
+        price_col = 'close' if 'close' in resampled.columns else 'adjclose' if 'adjclose' in resampled.columns else None
+        if price_col:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                new_cols[ret_col] = np.log(
+                    pd.to_numeric(resampled[price_col], errors='coerce')
+                ).diff()
+
+        # Add all new columns at once using pd.concat
+        new_cols_df = pd.DataFrame(new_cols, index=resampled.index)
+        resampled = pd.concat([resampled, new_cols_df], axis=1)
 
         # Reset index
         result = resampled.reset_index(drop=True)
@@ -246,22 +279,26 @@ class TimeframeResampler:
         Returns:
             DataFrame with optimized dtypes
         """
-        result = df.copy()
+        # Build dtype conversion map to apply all at once (avoids fragmentation)
+        dtype_map = {}
 
         # float64 -> float32
-        float_cols = result.select_dtypes(include=['float64']).columns
+        float_cols = df.select_dtypes(include=['float64']).columns
         for col in float_cols:
-            result[col] = result[col].astype('float32')
+            dtype_map[col] = 'float32'
 
         # int64 -> int32 where safe
-        int_cols = result.select_dtypes(include=['int64']).columns
+        int_cols = df.select_dtypes(include=['int64']).columns
         for col in int_cols:
-            col_min, col_max = result[col].min(), result[col].max()
+            col_min, col_max = df[col].min(), df[col].max()
             if pd.notna(col_min) and pd.notna(col_max):
                 if col_min >= -2**31 and col_max < 2**31:
-                    result[col] = result[col].astype('int32')
+                    dtype_map[col] = 'int32'
 
-        return result
+        # Apply all dtype conversions at once
+        if dtype_map:
+            return df.astype(dtype_map)
+        return df.copy()
 
     def resample_symbols(
         self,
@@ -429,6 +466,12 @@ class TimeframeResampler:
         daily_sorted = daily_df.copy()
         daily_sorted['date'] = pd.to_datetime(daily_sorted['date'])
         merge_df[period_col] = pd.to_datetime(merge_df[period_col])
+
+        # Drop rows with null dates (merge_asof requires non-null merge keys)
+        null_date_mask = daily_sorted['date'].isna()
+        if null_date_mask.any():
+            logger.debug(f"Dropping {null_date_mask.sum()} rows with null dates before merge")
+            daily_sorted = daily_sorted[~null_date_mask]
 
         daily_sorted = daily_sorted.sort_values('date')
         merge_df = merge_df.sort_values(period_col)

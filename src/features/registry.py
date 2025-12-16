@@ -3,6 +3,20 @@ Feature registry and factory for creating feature instances.
 
 This module provides a centralized registry of all available features
 and a factory function to create feature instances from configuration.
+
+NOTE: This registry is primarily for EXTENSIBILITY and future use.
+The main pipeline (orchestrator.py, single_stock.py) calls feature
+functions DIRECTLY rather than going through the registry.
+
+If you're adding new features, see CLAUDE.md for the recommended workflow:
+1. Create feature function in src/features/
+2. Call it from single_stock.py or cross_sectional.py
+3. Add to BASE_FEATURES in base_features.py if selected by model
+
+The registry pattern is preserved for:
+- Dynamic feature discovery
+- Configuration-driven feature selection
+- Potential future plugin architecture
 """
 
 from typing import Dict, List, Type, Optional, Any, Callable

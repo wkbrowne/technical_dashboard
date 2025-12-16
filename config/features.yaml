@@ -1,7 +1,11 @@
 # Feature Pipeline Configuration
 # ===============================
 # This file defines all available features, their parameters, and whether they are enabled.
-# Modify this file to toggle features on/off or adjust parameters.
+# Updated to match actual pipeline implementation in orchestrator.py, single_stock.py,
+# and cross_sectional.py.
+#
+# Note: Currently features are hardcoded in the pipeline. This config serves as documentation
+# and future reference for when config-driven feature selection is implemented.
 
 # Global settings
 nan_handling: preserve  # Options: preserve, interpolate_inside, drop
@@ -11,14 +15,23 @@ min_valid_ratio: 0.5    # Minimum ratio of valid values to keep a row
 features:
 
   # ============================================================================
-  # SINGLE-STOCK FEATURES (computed per symbol independently)
+  # SINGLE-STOCK FEATURES (computed in single_stock.py)
   # ============================================================================
 
+  # --- Trend & Momentum ---
   trend_ma:
     category: trend
-    timeframes: [D, W, M]
+    timeframes: [D, W]
     enabled: true
-    description: "Moving average slopes, agreement, trend scores"
+    description: "Moving average slopes, sign, agreement, trend scores"
+    output_features:
+      - ma_{10,20,30,50,75,100,150,200}  # Raw MAs (excluded from selection)
+      - sign_ma_{10,20,30,50,75,100,150,200}  # Price above/below MA
+      - pct_slope_ma_{10,20,30,50,75,100,150,200}  # Normalized MA slopes
+      - trend_score_sign  # Multi-MA alignment
+      - trend_score_granular  # Weighted MA alignment
+      - trend_score_slope  # Trend slope composite
+      - trend_persist_ema  # Consecutive up/down days
     params:
       ma_periods: [10, 20, 30, 50, 75, 100, 150, 200]
       slope_window: 20
@@ -29,6 +42,8 @@ features:
     timeframes: [D, W]
     enabled: true
     description: "RSI momentum oscillator at multiple periods"
+    output_features:
+      - rsi_{14,21,30}
     params:
       periods: [14, 21, 30]
 
@@ -37,17 +52,31 @@ features:
     timeframes: [D, W]
     enabled: true
     description: "MACD histogram and derivative EMA"
+    output_features:
+      - macd_histogram
+      - macd_hist_deriv_ema3
     params:
       fast: 12
       slow: 26
       signal: 9
       derivative_ema_span: 3
 
+  # --- Volatility ---
   volatility:
     category: volatility
-    timeframes: [D]
+    timeframes: [D, W]
     enabled: true
-    description: "Multi-scale volatility regime features"
+    description: "Multi-scale volatility regime features (single-stock)"
+    output_features:
+      - rv_{10,20,60,100}  # Realized volatility (excluded from selection)
+      - rv_ratio_{10_60,20_100}  # RV ratios
+      - rv_z_60  # RV z-score
+      - rvol_{20,50}  # Relative volatility
+      - rv{60,100}_slope_norm  # Normalized RV slopes
+      - vol_regime  # Discrete regime classification
+      - vol_regime_ema10  # Smoothed regime
+      - vol_z_{20,60}  # Volatility z-scores
+      - vol_of_vol_20d  # Volatility of volatility
     params:
       short_windows: [10, 20]
       long_windows: [60, 100]
@@ -55,43 +84,108 @@ features:
       ema_span: 10
       slope_win: 20
 
+  # --- Price Position ---
   distance_ma:
-    category: distance
+    category: price_position
     timeframes: [D, W]
     enabled: true
     description: "Distance to moving averages with z-scores"
+    output_features:
+      - pct_dist_ma_{20,50,100,200}  # Percent distance to MA
+      - pct_dist_ma_{20,50,100,200}_z  # Z-scored distance
+      - min_pct_dist_ma  # Distance to nearest MA
+      - relative_dist_20_50  # Relative positioning
+      - relative_dist_20_50_z
     params:
       ma_lengths: [20, 50, 100, 200]
       z_window: 60
 
+  # --- Range & Breakout ---
   range_breakout:
-    category: range
-    timeframes: [D]
+    category: range_breakout
+    timeframes: [D, W]
     enabled: true
-    description: "Range, breakout, and ATR features"
+    description: "Range, breakout, ATR, and position features"
+    output_features:
+      - atr14  # 14-day ATR (raw, used for targets)
+      - atr_percent  # Normalized ATR
+      - gap_atr_ratio  # Gap relative to ATR
+      - "{5,10,20}d_{high,low,range}"  # Raw ranges (excluded)
+      - "{5,10,20}d_range_pct_close"  # Normalized ranges
+      - hl_range_pct_close, tr_pct_close  # Daily ranges
+      - pos_in_{5,10,20}d_range  # Position in range (0-1)
+      - breakout_{up,dn}_{5,10,20}d  # Breakout signals
+      - range_expansion_{5,10,20}d  # Range expansion
+      - range_z_{5,10,20}d  # Range z-scores
+      - range_x_rvol20  # Range * volatility interaction
+      - gap_pct  # Gap percentage
     params:
       win_list: [5, 10, 20]
 
+  # --- Volume ---
   volume:
     category: volume
     timeframes: [D]
     enabled: true
-    description: "Volume ratios and patterns"
+    description: "Volume ratios, OBV, and dollar volume"
+    output_features:
+      - dollar_vol_ma_20  # Dollar volume MA (raw)
+      - rdollar_vol_20  # Relative dollar volume
+      - obv  # On-balance volume (raw)
+      - obv_z_60  # OBV z-score
     params: {}
 
   volume_shock:
     category: volume
-    timeframes: [D]
+    timeframes: [D, W]
     enabled: true
     description: "Volume shock and price alignment features"
+    output_features:
+      - volshock_z  # Volume shock z-score
+      - volshock_ema  # Smoothed volume shock
+      - volshock_dir  # Shock direction
     params:
       lookback: 20
       ema_span: 10
 
+  # --- Liquidity & Microstructure ---
+  liquidity:
+    category: liquidity
+    timeframes: [D, W]
+    enabled: true
+    description: "Spread proxies, VWAP, Amihud illiquidity"
+    output_features:
+      # Spread proxies
+      - hl_spread_proxy  # High-low spread proxy
+      - cs_spread_est  # Corwin-Schultz spread
+      - roll_spread_est  # Roll spread estimator
+      # Intraday patterns
+      - overnight_ratio  # Overnight vs intraday move ratio
+      - range_efficiency  # Open-close vs high-low range
+      - upper_shadow_ratio  # Selling pressure
+      - lower_shadow_ratio  # Buying pressure
+      # VWAP
+      - vwap_dist_{5,10,20}d  # Distance from VWAP
+      - vwap_dist_{5,10,20}d_zscore  # Z-scored VWAP distance
+      # Volume-price relationships
+      - volume_direction  # Volume * price direction
+      - rel_volume_{5,10,20}d  # Relative volume
+      - volume_trend_10d  # Volume trend
+      - pv_divergence_5d  # Price-volume divergence
+      # Illiquidity
+      - amihud_illiq  # Amihud illiquidity
+      - amihud_illiq_ratio  # Relative illiquidity
+      - zero_vol_pct_20d  # Zero volume days
+      - illiquidity_score  # Composite score
+      - liquidity_regime  # Discrete regime
+    params:
+      windows: [5, 10, 20]
+
   # ============================================================================
-  # CROSS-SECTIONAL FEATURES (require data from multiple stocks)
+  # CROSS-SECTIONAL FEATURES (computed in cross_sectional.py)
   # ============================================================================
 
+  # --- Volatility Cross-Sectional ---
   volatility_cs:
     category: cross_sectional
     timeframes: [D]
@@ -99,40 +193,246 @@ features:
     requires_cross_sectional: true
     depends_on: [volatility]
     description: "Cross-sectional volatility regime context"
+    output_features:
+      - vol_regime_cs_median  # Median vol regime across universe
+      - vol_regime_rel  # Stock vol regime vs universe median
     params: {}
 
+  # --- Alpha & Beta ---
   alpha:
     category: alpha
-    timeframes: [D]
+    timeframes: [D, W]
     enabled: true
     requires_cross_sectional: true
-    description: "Alpha-momentum vs market and sectors"
+    description: "Alpha-momentum vs market (SPY), growth (QQQ), and sector"
+    output_features:
+      # Betas
+      - beta_spy  # CAPM beta vs SPY
+      - beta_qqq  # Beta vs QQQ (growth exposure)
+      - beta_sector  # Beta vs sector ETF
+      # SPY alpha momentum
+      - alpha_mom_spy_{ema10,20_ema10,60_ema10,120_ema10}
+      - alpha_resid_spy  # Residual from SPY regression
+      # QQQ alpha momentum (growth factor)
+      - alpha_mom_qqq_{ema10,20_ema10,60_ema10,120_ema10}
+      - alpha_resid_qqq
+      - alpha_qqq_vs_spy  # QQQ alpha minus SPY alpha
+      - alpha_mom_qqq_spread_{ema10,20_ema10,60_ema10,120_ema10}
+      # Sector alpha momentum
+      - alpha_mom_sector_{ema10,20_ema10,60_ema10,120_ema10}
+      - alpha_resid_sector
+      # Combo alpha
+      - alpha_mom_combo_{ema10,20_ema10,60_ema10,120_ema10}
     params:
       beta_win: 60
       windows: [20, 60, 120]
       ema_span: 10
 
+  # --- Joint Factor Regression ---
+  factor_regression:
+    category: alpha
+    timeframes: [D, W]
+    enabled: true
+    requires_cross_sectional: true
+    description: "Multi-factor regression (SPY, QQQ, best-match ETF, breadth)"
+    output_features:
+      - beta_market  # SPY beta (joint regression)
+      - beta_qqq  # QQQ beta (joint)
+      - beta_bestmatch  # Best-match ETF beta
+      - beta_breadth  # RSP-SPY spread beta
+      - residual_mean  # Mean idiosyncratic return
+      - residual_cumret  # Cumulative residual (alpha)
+      - residual_vol  # Idiosyncratic volatility
+    params:
+      regression_window: 60
+      min_observations: 30
+
+  # --- Relative Strength ---
   relative_strength:
     category: relative_strength
     timeframes: [D, W]
     enabled: true
     requires_cross_sectional: true
-    description: "Relative strength vs SPY, sectors, subsectors"
+    description: "Relative strength vs SPY, QQQ, RSP, sector, subsector"
+    output_features:
+      # vs SPY
+      - rel_strength_spy
+      - rel_strength_spy_{norm,zscore,rsi,macd,macd_hist,macd_signal}
+      # vs QQQ (growth benchmark)
+      - rel_strength_qqq
+      - rel_strength_qqq_{norm,zscore,rsi,macd,macd_hist,macd_signal}
+      - rel_strength_qqq_spy_spread  # QQQ-SPY RS spread
+      - rel_strength_qqq_spy_spread_norm
+      # vs RSP (equal weight, size factor)
+      - rel_strength_rsp
+      - rel_strength_rsp_{norm,zscore,rsi,macd,macd_hist}
+      # vs Sector ETF
+      - rel_strength_sector
+      - rel_strength_sector_{norm,zscore,rsi,macd,macd_hist,macd_signal}
+      - rel_strength_sector_vs_market
+      - rel_strength_sector_vs_market_norm
+      # vs Equal-Weight Sector ETF
+      - rel_strength_sector_ew
+      - rel_strength_sector_ew_{norm,zscore,rsi,macd,macd_hist}
+      # vs Subsector ETF
+      - rel_strength_subsector
+      - rel_strength_subsector_{norm,zscore,rsi,macd,macd_hist}
     params: {}
 
+  # --- Market Breadth ---
   breadth:
     category: breadth
-    timeframes: [D]
+    timeframes: [D, W]
     enabled: true
     requires_cross_sectional: true
-    description: "Market breadth (advancing/declining, highs/lows)"
+    description: "Market breadth indicators (universe-wide)"
+    output_features:
+      - ad_ratio_ema10  # Advance-decline ratio (smoothed)
+      - ad_ratio_universe  # Raw A/D ratio
+      - ad_thrust_10d  # A/D thrust indicator
+      - mcclellan_oscillator  # McClellan oscillator
+      - pct_universe_above_ma{20,50,200}  # % above key MAs
     params: {}
 
+  # --- Cross-Sectional Momentum ---
   xsec_momentum:
     category: cross_sectional
-    timeframes: [D]
+    timeframes: [D, W]
     enabled: true
     requires_cross_sectional: true
-    description: "Cross-sectional momentum rankings"
+    description: "Cross-sectional momentum z-scores and percentiles"
+    output_features:
+      # Daily z-scores
+      - xsec_mom_{5,20,60}d_z  # Universe-wide momentum z-score
+      - xsec_mom_{5,20,60}d_sect_neutral_z  # Sector-neutral momentum
+      # Daily percentiles
+      - xsec_pct_{5,20,60}d  # Momentum percentile in universe
+      - xsec_pct_{5,20,60}d_sect  # Percentile within sector
+      # Weekly variants
+      - xsec_mom_{1w,4w,13w}_z  # Weekly momentum z-scores
+      - xsec_mom_{1w,4w,13w}_sect_neutral_z
+      - xsec_pct_{1w,4w,13w}  # Weekly percentiles
+      - xsec_pct_{1w,4w,13w}_sect
     params:
       lookbacks: [5, 20, 60]
+      weekly_lookbacks: [1, 4, 13]
+
+  # ============================================================================
+  # MACRO & INTERMARKET FEATURES (computed in cross_sectional.py)
+  # ============================================================================
+
+  # --- VIX & Volatility Regime ---
+  vix_regime:
+    category: macro
+    timeframes: [D, W]
+    enabled: true
+    requires_cross_sectional: true
+    description: "VIX regime features and term structure"
+    output_features:
+      # VIX level features
+      - vix_level  # Raw VIX (excluded from selection)
+      - vix_ema10  # Smoothed VIX
+      - vix_percentile_252d  # VIX percentile
+      - vix_zscore_60d  # VIX z-score
+      - vix_ma20_ratio  # VIX vs 20d MA
+      - vix_regime  # Discrete VIX regime
+      - vix_change_{5d,20d}  # VIX changes
+      # VIX-VXN spread (equity vs tech vol)
+      - vix_vxn_ratio
+      - vix_vxn_spread
+      - vxn_level, vxn_percentile_252d
+      # VXX signals
+      - vxx_rsi_14
+      - vxx_ret_{5d,20d}
+      # Weekly VIX
+      - vix_percentile_52w
+      - vix_zscore_12w
+      - vix_ma4_ratio
+      - vix_change_{1w,4w}
+    params: {}
+
+  # --- Cross-Asset / Intermarket ---
+  cross_asset:
+    category: intermarket
+    timeframes: [D, W]
+    enabled: true
+    requires_cross_sectional: true
+    description: "Cross-asset ratios and correlations"
+    output_features:
+      # Copper-Gold (economic growth indicator)
+      - copper_gold_ratio
+      - copper_gold_zscore
+      # Gold-SPY (risk-off indicator)
+      - gold_spy_ratio
+      - gold_spy_ratio_zscore
+      # Dollar momentum
+      - dollar_momentum_20d
+      - dollar_percentile_252d
+      # Oil momentum
+      - oil_momentum_20d
+      # Sector ratios (risk-on/off)
+      - cyclical_defensive_ratio
+      - financials_utilities_ratio
+      - tech_spy_ratio
+      # Correlations
+      - equity_bond_corr_60d
+      # Regime signals
+      - credit_spread_zscore  # Proxy from XLF/XLU
+      - yield_curve_zscore  # Proxy from financials
+      - quiet_trend
+      - trend_alignment
+    params: {}
+
+  # --- FRED Macro Data ---
+  fred_macro:
+    category: macro
+    timeframes: [D, W]
+    enabled: true
+    requires_cross_sectional: true
+    description: "Federal Reserve Economic Data (FRED) features"
+    output_features:
+      # Credit spreads (ICE BofA)
+      - fred_bamlh0a0hym2  # High yield OAS (raw, excluded)
+      - fred_bamlh0a0hym2_{chg5d,chg20d,z60,pct252}
+      - fred_bamlc0a4cbbb_{chg5d,z60}  # BBB OAS
+      # Treasury yields
+      - fred_dgs10_{chg5d,chg20d,z60,pct252}  # 10Y Treasury
+      - fred_dgs2_{chg5d,chg20d}  # 2Y Treasury
+      # Yield curve
+      - fred_t10y2y_{chg5d,z60,pct252}  # 10Y-2Y spread
+      - fred_t10y3m_z60  # 10Y-3M spread
+      # Fed funds
+      - fred_dfedtaru_chg20d  # Fed funds target
+      # Labor market
+      - fred_icsa_{chg4w,z52w,pct104w}  # Initial claims
+      - fred_ccsa_{chg4w,z52w}  # Continued claims
+      # Financial conditions
+      - fred_nfci_{chg4w,z52w}  # Chicago Fed NFCI
+      # VIX from FRED
+      - fred_vixcls_{chg5d,z60,pct252}
+    params:
+      additional_lag_days: 0  # Beyond publication lag
+    notes: |
+      Publication lags are handled automatically per series:
+      - Treasury yields: 1 day
+      - Credit spreads: 1 day
+      - Initial claims: 5 days (released Thursday for prior week)
+      - Continued claims: 12 days
+      - NFCI: 7 days
+
+# ============================================================================
+# WEEKLY TIMEFRAME
+# ============================================================================
+# Most features above support weekly timeframes (W).
+# Weekly features are prefixed with 'w_' (e.g., w_rsi_14, w_alpha_mom_spy_20_ema10)
+# See src/features/timeframe.py for resampling logic.
+
+# ============================================================================
+# NOTES
+# ============================================================================
+# 1. output_features lists are for documentation - actual features may vary slightly
+# 2. Features with numeric suffixes like {5,10,20}d expand to multiple features
+# 3. Raw features (raw MAs, raw prices, raw ATR) are excluded from ML selection
+# 4. See src/feature_selection/base_features.py for the curated feature list
+# 5. The pipeline currently hardcodes feature computation - this config is
+#    primarily documentation. Future work: make pipeline config-driven.

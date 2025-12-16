@@ -131,14 +131,22 @@ def add_breadth_series(
     # A/D thrust: 10-day sum of A/D ratio (measures sustained breadth)
     ad_thrust = ad_ratio.rolling(10, min_periods=5).sum().rename("ad_thrust_10d")
 
-    # Attach breadth features to ALL symbols
+    # Attach breadth features to ALL symbols using pd.concat to avoid fragmentation
     breadth_series = [pct20, pct50, pct200, ad_ratio, ad_ratio_ema10, mcclellan, ad_thrust]
+    breadth_names = [s.name for s in breadth_series if len(s) > 0]
     attached_count = 0
+
     for sym, df in indicators_by_symbol.items():
+        # Build all breadth columns at once for this symbol
+        breadth_data = {}
         for s in breadth_series:
-            if len(s) > 0:
-                # Reindex to symbol's date range and convert to float32
-                df[s.name] = pd.to_numeric(s.reindex(df.index), errors='coerce').astype('float32')
+            if len(s) > 0 and s.name not in df.columns:
+                breadth_data[s.name] = pd.to_numeric(s.reindex(df.index), errors='coerce').astype('float32')
+
+        # Add all columns at once using pd.concat
+        if breadth_data:
+            new_cols_df = pd.DataFrame(breadth_data, index=df.index)
+            indicators_by_symbol[sym] = pd.concat([df, new_cols_df], axis=1)
         attached_count += 1
 
     logger.info(f"Breadth features attached to {attached_count} symbols "

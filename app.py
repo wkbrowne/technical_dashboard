@@ -72,6 +72,62 @@ def load_features():
     return pd.read_parquet(features_file)
 
 
+def get_data_info(features_df: pd.DataFrame, model_features: list) -> dict:
+    """Get data date and missing feature information.
+
+    Args:
+        features_df: Feature DataFrame with 'date' column
+        model_features: List of features the model expects
+
+    Returns:
+        Dictionary with data_date, days_stale, missing_features, available_features, symbols_count
+    """
+    info = {
+        'data_date': None,
+        'days_stale': 0,
+        'missing_features': [],
+        'available_features': [],
+        'coverage_pct': 100.0,
+        'symbols_count': 0,
+    }
+
+    if features_df is None:
+        return info
+
+    # Get latest date with VALID prediction data (non-null close prices)
+    # This is what actually gets used for predictions
+    if 'date' in features_df.columns and 'close' in features_df.columns:
+        features_df = features_df.copy()
+        features_df['date'] = pd.to_datetime(features_df['date'])
+
+        # Filter to rows with valid close prices
+        valid_data = features_df[features_df['close'].notna()]
+
+        if len(valid_data) > 0:
+            # Find the latest date that has substantial data (>100 symbols)
+            date_counts = valid_data.groupby('date').size()
+            substantial_dates = date_counts[date_counts > 100]
+
+            if len(substantial_dates) > 0:
+                max_date = substantial_dates.index.max()
+                info['data_date'] = max_date
+                info['symbols_count'] = int(substantial_dates.loc[max_date])
+
+                # Calculate staleness (days since last data)
+                today = pd.Timestamp.now().normalize()
+                info['days_stale'] = (today - max_date).days
+
+    # Check which model features are available
+    data_columns = set(features_df.columns)
+    info['available_features'] = [f for f in model_features if f in data_columns]
+    info['missing_features'] = [f for f in model_features if f not in data_columns]
+
+    if model_features:
+        info['coverage_pct'] = len(info['available_features']) / len(model_features) * 100
+
+    return info
+
+
 @st.cache_data(ttl=300)
 def load_targets():
     """Load target data."""
@@ -146,6 +202,30 @@ def render_ticker_analysis():
         st.error("Features not found. Run feature computation first.")
         return
 
+    # Get data info (date, missing features)
+    data_info = get_data_info(features_df, feature_names)
+
+    # Display data status bar
+    if data_info['data_date']:
+        date_str = data_info['data_date'].strftime('%Y-%m-%d')
+        stale_days = data_info['days_stale']
+        symbols_count = data_info['symbols_count']
+
+        if stale_days <= 1:
+            st.success(f"📅 **Data Date:** {date_str} ({symbols_count:,} symbols)")
+        elif stale_days <= 3:
+            st.warning(f"📅 **Data Date:** {date_str} ({stale_days} days old, {symbols_count:,} symbols)")
+        else:
+            st.error(f"📅 **Data Date:** {date_str} ({stale_days} days stale, {symbols_count:,} symbols) - run `python -m src.cli.compute` to refresh")
+
+    # Show missing features warning if any
+    if data_info['missing_features']:
+        n_missing = len(data_info['missing_features'])
+        with st.expander(f"⚠️ {n_missing} missing features ({data_info['coverage_pct']:.0f}% coverage)", expanded=False):
+            st.write("The following features expected by the model are missing from the data:")
+            st.code('\n'.join(data_info['missing_features']))
+            st.caption("Missing features are filled with 0. Run feature pipeline to compute them.")
+
     # Get available symbols
     available_symbols = sorted(features_df['symbol'].unique())
 
@@ -213,11 +293,15 @@ def render_ticker_analysis():
     stop_pct = (1 - stop_price / close_price) * 100
     reward_risk = target_pct / max(stop_pct, 0.1)
 
+    # Break-even probability: minimum probability needed to be profitable
+    # Formula: BE = Risk / (Reward + Risk) = 1 / (1 + R/R ratio)
+    break_even_prob = 1 / (1 + reward_risk)
+
     # Display main metrics
     st.markdown("---")
 
     # Probability gauge
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
         prob_color = "🟢" if probability > 0.6 else "🟡" if probability > 0.4 else "🔴"
@@ -248,9 +332,292 @@ def render_ticker_analysis():
             delta=f"{'Good' if reward_risk > 2 else 'Fair' if reward_risk > 1.5 else 'Poor'}"
         )
 
+    with col5:
+        # Edge = probability - break_even (positive = profitable)
+        edge = probability - break_even_prob
+        edge_color = "🟢" if edge > 0.10 else "🟡" if edge > 0 else "🔴"
+        st.metric(
+            label=f"{edge_color} Break-Even",
+            value=f"{break_even_prob:.1%}",
+            delta=f"Edge: {edge:+.1%}",
+            help="Minimum probability needed to break even. Edge = Predicted - Break-even."
+        )
+
     # Price info
     st.markdown(f"**Current Price:** ${close_price:.2f} | **Date:** {latest_date} | **ATR%:** {atr_pct*100:.2f}%")
     st.caption(f"Barriers: Target = Entry + {UP_MULT}×ATR, Stop = Entry - {DN_MULT}×ATR (fixed from training)")
+
+    # Multi-timeframe alignment indicator
+    st.markdown("---")
+    st.subheader("📊 Timeframe Alignment")
+
+    # Define indicator pairs to compare (daily, weekly, interpretation)
+    alignment_indicators = [
+        ('rsi_14', 'w_rsi_14', 'RSI', 'momentum'),
+        ('trend_score_sign', 'w_trend_score_sign', 'Trend', 'trend'),
+        ('pct_slope_ma_20', 'w_pct_slope_ma_20', 'Slope 20', 'slope'),
+        ('vol_regime', 'w_vol_regime', 'Vol Regime', 'volatility'),
+        ('pct_dist_ma_20', 'w_pct_dist_ma_20', 'Dist MA20', 'distance'),
+    ]
+
+    def get_alignment_status(daily_val, weekly_val, indicator_type):
+        """Determine alignment status between daily and weekly values."""
+        if pd.isna(daily_val) or pd.isna(weekly_val):
+            return "⚪", "N/A", "gray"
+
+        if indicator_type == 'momentum':  # RSI: >50 bullish, <50 bearish
+            d_bull = daily_val > 50
+            w_bull = weekly_val > 50
+        elif indicator_type == 'trend':  # Trend score: >0 bullish
+            d_bull = daily_val > 0
+            w_bull = weekly_val > 0
+        elif indicator_type == 'slope':  # Slope: >0 bullish
+            d_bull = daily_val > 0
+            w_bull = weekly_val > 0
+        elif indicator_type == 'volatility':  # Vol regime: <0.5 low vol (favorable)
+            d_bull = daily_val < 0.5
+            w_bull = weekly_val < 0.5
+        elif indicator_type == 'distance':  # Distance: >0 above MA (bullish)
+            d_bull = daily_val > 0
+            w_bull = weekly_val > 0
+        else:
+            d_bull = daily_val > 0
+            w_bull = weekly_val > 0
+
+        if d_bull and w_bull:
+            return "🟢", "Aligned ↑", "#00cc96"
+        elif not d_bull and not w_bull:
+            return "🔴", "Aligned ↓", "#ef553b"
+        else:
+            return "🟡", "Mixed", "#ffa500"
+
+    # Build alignment display
+    alignment_cols = st.columns(len(alignment_indicators))
+
+    aligned_bullish = 0
+    aligned_bearish = 0
+    mixed = 0
+
+    for i, (d_col, w_col, label, ind_type) in enumerate(alignment_indicators):
+        d_val = latest[d_col].iloc[0] if d_col in latest.columns else np.nan
+        w_val = latest[w_col].iloc[0] if w_col in latest.columns else np.nan
+
+        icon, status, color = get_alignment_status(d_val, w_val, ind_type)
+
+        # Count for summary
+        if status == "Aligned ↑":
+            aligned_bullish += 1
+        elif status == "Aligned ↓":
+            aligned_bearish += 1
+        elif status == "Mixed":
+            mixed += 1
+
+        with alignment_cols[i]:
+            # Format values based on type
+            if ind_type == 'momentum':
+                d_str = f"{d_val:.0f}" if pd.notna(d_val) else "—"
+                w_str = f"{w_val:.0f}" if pd.notna(w_val) else "—"
+            elif ind_type in ('slope', 'distance'):
+                d_str = f"{d_val:+.1%}" if pd.notna(d_val) else "—"
+                w_str = f"{w_val:+.1%}" if pd.notna(w_val) else "—"
+            elif ind_type == 'volatility':
+                d_str = f"{d_val:.2f}" if pd.notna(d_val) else "—"
+                w_str = f"{w_val:.2f}" if pd.notna(w_val) else "—"
+            else:
+                d_str = f"{d_val:+.2f}" if pd.notna(d_val) else "—"
+                w_str = f"{w_val:+.2f}" if pd.notna(w_val) else "—"
+
+            st.markdown(f"""
+            <div style="text-align: center; padding: 8px; border-radius: 8px; background-color: {color}22; border: 1px solid {color};">
+                <div style="font-size: 1.5em;">{icon}</div>
+                <div style="font-weight: bold; color: {color};">{label}</div>
+                <div style="font-size: 0.85em; color: #666;">D: {d_str} | W: {w_str}</div>
+                <div style="font-size: 0.75em; color: {color};">{status}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # Overall alignment summary
+    total_indicators = aligned_bullish + aligned_bearish + mixed
+    if total_indicators > 0:
+        if aligned_bullish >= 4:
+            overall = "🟢 **Strong Bullish Alignment** - Daily and Weekly confirm uptrend"
+        elif aligned_bearish >= 4:
+            overall = "🔴 **Strong Bearish Alignment** - Daily and Weekly confirm downtrend"
+        elif aligned_bullish >= 3:
+            overall = "🟢 **Bullish Bias** - Majority of indicators aligned up"
+        elif aligned_bearish >= 3:
+            overall = "🔴 **Bearish Bias** - Majority of indicators aligned down"
+        elif mixed >= 3:
+            overall = "🟡 **Mixed Signals** - Daily and Weekly diverging, proceed with caution"
+        else:
+            overall = "🟡 **Neutral** - No clear alignment"
+
+        st.markdown(f"\n{overall}")
+
+    # Position Planner
+    st.markdown("---")
+    st.subheader("💰 Position Planner")
+
+    # Get settings from session state
+    account_size = st.session_state.get('account_size', 100000)
+    max_risk_pct = st.session_state.get('max_risk_pct', 2.0) / 100
+    num_entries = st.session_state.get('num_entries', 3)
+
+    # Calculate Kelly-based position sizing
+    # Kelly % = Edge / (Risk per unit)
+    # Half-Kelly is more conservative and commonly used
+    if edge > 0:
+        kelly_pct = edge / (stop_pct / 100) if stop_pct > 0 else 0
+        half_kelly_pct = kelly_pct / 2
+    else:
+        kelly_pct = 0
+        half_kelly_pct = 0
+
+    # Cap at max risk
+    suggested_risk_pct = min(half_kelly_pct, max_risk_pct)
+
+    # Calculate position size based on risk
+    max_risk_dollars = account_size * max_risk_pct
+    risk_per_share = close_price * (stop_pct / 100)
+    max_shares = int(max_risk_dollars / risk_per_share) if risk_per_share > 0 else 0
+    max_position_value = max_shares * close_price
+
+    # Define entry levels based on MA distances
+    ma20_val = latest['ma_20'].iloc[0] if 'ma_20' in latest.columns else close_price * 0.98
+    ma50_val = latest['ma_50'].iloc[0] if 'ma_50' in latest.columns else close_price * 0.95
+
+    # Entry allocation based on number of entries and alignment
+    if num_entries == 1:
+        entry_allocations = [1.0]
+        entry_prices = [close_price]
+        entry_labels = ["Current"]
+    elif num_entries == 2:
+        # If bullish aligned, more at current; if mixed, more at pullback
+        if aligned_bullish >= 3:
+            entry_allocations = [0.60, 0.40]
+        else:
+            entry_allocations = [0.40, 0.60]
+        entry_prices = [close_price, ma20_val]
+        entry_labels = ["Current", "MA20 Pullback"]
+    else:  # 3 entries
+        if aligned_bullish >= 4:
+            entry_allocations = [0.50, 0.30, 0.20]
+        elif aligned_bullish >= 3:
+            entry_allocations = [0.40, 0.35, 0.25]
+        else:
+            entry_allocations = [0.30, 0.40, 0.30]
+        entry_prices = [close_price, ma20_val, ma50_val]
+        entry_labels = ["Current", "MA20 Pullback", "MA50 Pullback"]
+
+    # Display position sizing summary
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        kelly_color = "🟢" if half_kelly_pct > max_risk_pct else "🟡" if half_kelly_pct > 0 else "🔴"
+        st.metric(
+            label=f"{kelly_color} Half-Kelly",
+            value=f"{half_kelly_pct:.1%}",
+            delta=f"Full: {kelly_pct:.1%}",
+            help="Kelly Criterion suggests optimal bet size. Half-Kelly reduces variance."
+        )
+
+    with col2:
+        st.metric(
+            label="💵 Max Risk",
+            value=f"${max_risk_dollars:,.0f}",
+            delta=f"{max_risk_pct:.1%} of account",
+            help="Maximum dollar amount at risk based on your settings"
+        )
+
+    with col3:
+        st.metric(
+            label="📊 Max Shares",
+            value=f"{max_shares:,}",
+            delta=f"${max_position_value:,.0f} value",
+            help="Maximum shares based on stop loss distance"
+        )
+
+    with col4:
+        # Confidence level based on edge and alignment
+        if edge > 0.10 and aligned_bullish >= 4:
+            confidence = "High"
+            conf_color = "🟢"
+        elif edge > 0.05 and aligned_bullish >= 3:
+            confidence = "Medium"
+            conf_color = "🟡"
+        elif edge > 0:
+            confidence = "Low"
+            conf_color = "🟠"
+        else:
+            confidence = "None"
+            conf_color = "🔴"
+        st.metric(
+            label=f"{conf_color} Confidence",
+            value=confidence,
+            delta=f"Edge: {edge:+.1%}",
+            help="Based on model edge and timeframe alignment"
+        )
+
+    # Entry plan table
+    st.markdown("#### Entry Plan")
+
+    entry_data = []
+    total_shares = 0
+    total_cost = 0
+
+    for i, (label, price, alloc) in enumerate(zip(entry_labels, entry_prices, entry_allocations)):
+        shares_at_level = int(max_shares * alloc)
+        cost_at_level = shares_at_level * price
+        pct_from_current = (price / close_price - 1) * 100
+        risk_at_level = shares_at_level * risk_per_share
+
+        total_shares += shares_at_level
+        total_cost += cost_at_level
+
+        entry_data.append({
+            "Level": f"{i+1}. {label}",
+            "Price": f"${price:.2f}",
+            "vs Current": f"{pct_from_current:+.1f}%",
+            "Allocation": f"{alloc:.0%}",
+            "Shares": f"{shares_at_level:,}",
+            "Cost": f"${cost_at_level:,.0f}",
+            "Risk $": f"${risk_at_level:,.0f}",
+        })
+
+    # Add totals row
+    avg_entry = total_cost / total_shares if total_shares > 0 else close_price
+    total_risk = total_shares * risk_per_share
+
+    entry_data.append({
+        "Level": "**TOTAL**",
+        "Price": f"**${avg_entry:.2f}**",
+        "vs Current": f"**{(avg_entry/close_price-1)*100:+.1f}%**",
+        "Allocation": "**100%**",
+        "Shares": f"**{total_shares:,}**",
+        "Cost": f"**${total_cost:,.0f}**",
+        "Risk $": f"**${total_risk:,.0f}**",
+    })
+
+    entry_df = pd.DataFrame(entry_data)
+    st.dataframe(entry_df, use_container_width=True, hide_index=True)
+
+    # Effective R/R if all entries fill
+    if total_shares > 0:
+        effective_target = avg_entry * (1 + UP_MULT * atr_pct)
+        effective_stop = avg_entry * (1 - DN_MULT * atr_pct)
+        effective_target_pct = (effective_target / avg_entry - 1) * 100
+        effective_stop_pct = (1 - effective_stop / avg_entry) * 100
+        effective_rr = effective_target_pct / effective_stop_pct if effective_stop_pct > 0 else 0
+
+        st.markdown(f"""
+        **If all entries fill:**
+        Avg Entry: ${avg_entry:.2f} | Target: ${effective_target:.2f} (+{effective_target_pct:.1f}%) |
+        Stop: ${effective_stop:.2f} (-{effective_stop_pct:.1f}%) | R/R: {effective_rr:.1f}x
+        """)
+
+    # Warning if negative edge
+    if edge <= 0:
+        st.warning("⚠️ **Negative or zero edge** - Model suggests this trade may not be profitable. Consider passing or waiting for better setup.")
 
     # SHAP Waterfall
     st.markdown("---")
@@ -374,6 +741,29 @@ def render_top_candidates():
         st.error("Features not found. Run feature computation first.")
         return
 
+    # Get data info (date, missing features)
+    data_info = get_data_info(features_df, feature_names)
+
+    # Display data status bar (compact version for this page)
+    col_date, col_missing = st.columns([2, 3])
+    with col_date:
+        if data_info['data_date']:
+            date_str = data_info['data_date'].strftime('%Y-%m-%d')
+            stale_days = data_info['days_stale']
+            symbols_count = data_info['symbols_count']
+            if stale_days <= 1:
+                st.success(f"📅 Data: {date_str} ({symbols_count:,} symbols)")
+            elif stale_days <= 3:
+                st.warning(f"📅 Data: {date_str} ({stale_days}d old, {symbols_count:,} symbols)")
+            else:
+                st.error(f"📅 Data: {date_str} ({stale_days}d stale, {symbols_count:,} symbols)")
+
+    with col_missing:
+        if data_info['missing_features']:
+            n_missing = len(data_info['missing_features'])
+            with st.expander(f"⚠️ {n_missing} missing features"):
+                st.code('\n'.join(data_info['missing_features']))
+
     # Generate predictions if not available
     if predictions_df is None:
         st.info("Generating predictions...")
@@ -405,24 +795,34 @@ def render_top_candidates():
 
         predictions_df = latest_df
 
+    # Calculate break-even and edge for all predictions
+    predictions_df['break_even'] = 1 / (1 + predictions_df['reward_risk'])
+    predictions_df['edge'] = predictions_df['probability'] - predictions_df['break_even']
+
     # Filters
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
-        min_prob = st.slider("Min Probability", 0.0, 1.0, 0.5, 0.05)
+        min_edge = st.slider("Min Edge", -0.2, 0.5, 0.0, 0.05,
+                             help="Edge = Probability - Break-even. Positive edge = expected profit.")
 
     with col2:
-        min_rr = st.slider("Min Reward/Risk", 0.0, 5.0, 1.5, 0.25)
+        min_target_pct = st.slider("Min Target %", 0.0, 20.0, 5.0, 1.0,
+                                   help="Minimum target return percentage")
 
     with col3:
-        top_n = st.slider("Show Top N", 10, 200, 50, 10)
+        min_rr = st.slider("Min Reward/Risk", 0.0, 5.0, 1.5, 0.25)
 
     with col4:
-        sort_by = st.selectbox("Sort By", ["probability", "reward_risk", "target_pct"])
+        top_n = st.slider("Show Top N", 10, 200, 50, 10)
+
+    with col5:
+        sort_by = st.selectbox("Sort By", ["edge", "probability", "reward_risk", "target_pct"])
 
     # Filter data
     filtered = predictions_df[
-        (predictions_df['probability'] >= min_prob) &
+        (predictions_df['edge'] >= min_edge) &
+        (predictions_df['target_pct'] >= min_target_pct) &
         (predictions_df.get('reward_risk', 999) >= min_rr)
     ].copy()
 
@@ -431,7 +831,7 @@ def render_top_candidates():
     st.markdown(f"**Showing {len(filtered)} candidates** (filtered from {len(predictions_df)} total)")
 
     # Display table
-    display_cols = ['symbol', 'probability', 'close', 'target_price', 'stop_price',
+    display_cols = ['symbol', 'probability', 'break_even', 'edge', 'close', 'target_price', 'stop_price',
                     'target_pct', 'stop_pct', 'reward_risk']
     display_cols = [c for c in display_cols if c in filtered.columns]
 
@@ -444,6 +844,10 @@ def render_top_candidates():
     # Format columns
     if 'probability' in display_df.columns:
         display_df['probability'] = display_df['probability'].apply(lambda x: f"{x:.1%}")
+    if 'break_even' in display_df.columns:
+        display_df['break_even'] = display_df['break_even'].apply(lambda x: f"{x:.1%}")
+    if 'edge' in display_df.columns:
+        display_df['edge'] = display_df['edge'].apply(lambda x: f"{x:+.1%}")
     if 'close' in display_df.columns:
         display_df['close'] = display_df['close'].apply(lambda x: f"${x:.2f}")
     if 'target_price' in display_df.columns:
@@ -461,17 +865,19 @@ def render_top_candidates():
 
     # Distribution plot
     st.markdown("---")
-    st.subheader("📊 Probability Distribution")
+    st.subheader("📊 Edge Distribution")
 
     fig = px.histogram(
         predictions_df,
-        x='probability',
+        x='edge',
         nbins=50,
-        title="Distribution of Hit Probabilities Across Universe"
+        title="Distribution of Edge (Probability - Break-even) Across Universe"
     )
-    fig.add_vline(x=min_prob, line_dash="dash", line_color="red",
-                  annotation_text=f"Filter: {min_prob:.0%}")
-    fig.update_layout(xaxis_title="Probability", yaxis_title="Count")
+    fig.add_vline(x=min_edge, line_dash="dash", line_color="red",
+                  annotation_text=f"Filter: {min_edge:+.0%}")
+    fig.add_vline(x=0, line_dash="dot", line_color="gray",
+                  annotation_text="Break-even")
+    fig.update_layout(xaxis_title="Edge (Probability - Break-even)", yaxis_title="Count")
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -1073,6 +1479,40 @@ def main():
     else:
         st.sidebar.error("❌ No model found")
         st.sidebar.caption("Run: python run_training.py")
+
+    st.sidebar.markdown("---")
+
+    # Position sizing settings (stored in session state)
+    with st.sidebar.expander("💰 Position Sizing", expanded=False):
+        if 'account_size' not in st.session_state:
+            st.session_state.account_size = 100000
+        if 'max_risk_pct' not in st.session_state:
+            st.session_state.max_risk_pct = 2.0
+        if 'num_entries' not in st.session_state:
+            st.session_state.num_entries = 3
+
+        st.session_state.account_size = st.number_input(
+            "Account Size ($)",
+            min_value=1000,
+            max_value=10000000,
+            value=st.session_state.account_size,
+            step=10000,
+            help="Total account value for position sizing"
+        )
+        st.session_state.max_risk_pct = st.slider(
+            "Max Risk per Trade (%)",
+            min_value=0.5,
+            max_value=5.0,
+            value=st.session_state.max_risk_pct,
+            step=0.5,
+            help="Maximum % of account to risk on a single trade"
+        )
+        st.session_state.num_entries = st.selectbox(
+            "Entry Levels",
+            options=[1, 2, 3],
+            index=st.session_state.num_entries - 1,
+            help="Number of entry levels for scaling in"
+        )
 
     st.sidebar.markdown("---")
     st.sidebar.caption("Last updated: " + datetime.now().strftime("%Y-%m-%d %H:%M"))

@@ -10,6 +10,7 @@ from typing import Dict, Optional, List, Union
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+import gc
 
 # Import ParallelConfig - with fallback for different import contexts
 try:
@@ -140,7 +141,15 @@ def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict,
     
     logger.info(f"Added combined weights: min={targets_df['weight_final'].min():.6f}, "
                f"max={targets_df['weight_final'].max():.6f}, sum={targets_df['weight_final'].sum():.2f}")
-    
+
+    # Validate and filter extreme target values
+    targets_df = validate_and_filter_extreme_targets(
+        targets_df,
+        ret_zscore_threshold=5.0,
+        ret_abs_threshold=1.0,
+        report=True
+    )
+
     # Top-level validation to ensure no NaNs in t0 column
     if 't0' in targets_df.columns:
         nan_t0_count = targets_df['t0'].isna().sum()
@@ -578,6 +587,15 @@ def generate_targets_parallel(
     logger.info(f"Processing {n_symbols} symbols in {len(symbol_chunks)} chunks "
                 f"(~{chunk_size} symbols/chunk, {actual_workers} workers)")
 
+    # Reset the loky executor pool to avoid stale state from previous parallel operations
+    # This fixes the '_ReusablePoolExecutor' object has no attribute '_temp_folder_manager' error
+    try:
+        from joblib.externals.loky import get_reusable_executor
+        get_reusable_executor().shutdown(wait=True)
+    except Exception:
+        pass  # Ignore if executor doesn't exist or can't be shut down
+    gc.collect()
+
     # Process chunks in parallel
     try:
         results = Parallel(
@@ -609,8 +627,152 @@ def generate_targets_parallel(
         raise
 
 
-def _add_combined_weights(targets_df: pd.DataFrame, 
-                         weight_min_clip: float = 0.01, 
+def validate_and_filter_extreme_targets(
+    targets_df: pd.DataFrame,
+    ret_zscore_threshold: float = 5.0,
+    ret_abs_threshold: float = 1.0,
+    report: bool = True
+) -> pd.DataFrame:
+    """
+    Validate targets and filter out rows with extreme/invalid values.
+
+    This function detects and removes targets with implausible return values
+    that could indicate data errors or extreme outliers that would harm model training.
+
+    Args:
+        targets_df: DataFrame with target columns including ret_from_entry
+        ret_zscore_threshold: Z-score threshold for return outliers (default 5.0 = ~3 per 10000)
+        ret_abs_threshold: Absolute return threshold (default 1.0 = 100% return, log scale)
+        report: Whether to log detailed report of filtered values
+
+    Returns:
+        DataFrame with extreme values filtered out
+
+    Notes:
+        - Filters applied:
+          1. NaN/Inf values in ret_from_entry
+          2. Absolute returns > ret_abs_threshold (default 100%, which is extreme for daily/weekly)
+          3. Z-score outliers > ret_zscore_threshold
+        - A warning is logged if >1% of rows are filtered
+        - A detailed report is logged if report=True and any rows are filtered
+    """
+    if targets_df.empty:
+        return targets_df
+
+    initial_count = len(targets_df)
+    targets_df = targets_df.copy()
+
+    # Track filtering reasons for report
+    filter_reasons = {}
+
+    # 1. Check for NaN/Inf in ret_from_entry
+    if 'ret_from_entry' in targets_df.columns:
+        nan_mask = targets_df['ret_from_entry'].isna()
+        inf_mask = ~np.isfinite(targets_df['ret_from_entry'].fillna(0))
+        nan_inf_mask = nan_mask | inf_mask
+        nan_inf_count = nan_inf_mask.sum()
+
+        if nan_inf_count > 0:
+            filter_reasons['nan_inf'] = {
+                'count': nan_inf_count,
+                'pct': 100 * nan_inf_count / initial_count,
+                'description': 'NaN or Inf values in ret_from_entry'
+            }
+            targets_df = targets_df[~nan_inf_mask]
+
+    # 2. Check for extreme absolute returns
+    if 'ret_from_entry' in targets_df.columns and len(targets_df) > 0:
+        extreme_abs_mask = np.abs(targets_df['ret_from_entry']) > ret_abs_threshold
+        extreme_abs_count = extreme_abs_mask.sum()
+
+        if extreme_abs_count > 0:
+            extreme_values = targets_df.loc[extreme_abs_mask, 'ret_from_entry']
+            filter_reasons['extreme_abs'] = {
+                'count': extreme_abs_count,
+                'pct': 100 * extreme_abs_count / initial_count,
+                'description': f'Absolute return > {ret_abs_threshold:.2f} (log scale)',
+                'min_val': extreme_values.min(),
+                'max_val': extreme_values.max(),
+                'examples': extreme_values.head(5).tolist()
+            }
+            targets_df = targets_df[~extreme_abs_mask]
+
+    # 3. Check for z-score outliers
+    if 'ret_from_entry' in targets_df.columns and len(targets_df) > 10:
+        ret_mean = targets_df['ret_from_entry'].mean()
+        ret_std = targets_df['ret_from_entry'].std()
+
+        if ret_std > 0:
+            ret_zscore = (targets_df['ret_from_entry'] - ret_mean) / ret_std
+            zscore_outlier_mask = np.abs(ret_zscore) > ret_zscore_threshold
+            zscore_outlier_count = zscore_outlier_mask.sum()
+
+            if zscore_outlier_count > 0:
+                outlier_values = targets_df.loc[zscore_outlier_mask, 'ret_from_entry']
+                filter_reasons['zscore_outlier'] = {
+                    'count': zscore_outlier_count,
+                    'pct': 100 * zscore_outlier_count / initial_count,
+                    'description': f'Z-score > {ret_zscore_threshold:.1f}',
+                    'min_val': outlier_values.min(),
+                    'max_val': outlier_values.max(),
+                    'examples': outlier_values.head(5).tolist()
+                }
+                targets_df = targets_df[~zscore_outlier_mask]
+
+    # Calculate total filtered
+    final_count = len(targets_df)
+    total_filtered = initial_count - final_count
+    filter_pct = 100 * total_filtered / initial_count if initial_count > 0 else 0
+
+    # Generate report
+    if total_filtered > 0:
+        # Always warn if significant filtering occurred
+        if filter_pct > 1.0:
+            logger.warning(
+                f"EXTREME TARGET VALUES: Filtered {total_filtered:,} rows ({filter_pct:.2f}%) "
+                f"with extreme/invalid target values"
+            )
+        else:
+            logger.info(
+                f"Target validation: filtered {total_filtered:,} rows ({filter_pct:.2f}%) "
+                f"with extreme/invalid values"
+            )
+
+        if report:
+            logger.info("=" * 60)
+            logger.info("TARGET VALIDATION REPORT")
+            logger.info("=" * 60)
+            logger.info(f"Initial rows: {initial_count:,}")
+            logger.info(f"Final rows:   {final_count:,}")
+            logger.info(f"Filtered:     {total_filtered:,} ({filter_pct:.2f}%)")
+            logger.info("-" * 60)
+
+            for reason_key, reason_data in filter_reasons.items():
+                logger.info(f"  {reason_data['description']}:")
+                logger.info(f"    Count: {reason_data['count']:,} ({reason_data['pct']:.2f}%)")
+                if 'min_val' in reason_data:
+                    logger.info(f"    Range: [{reason_data['min_val']:.4f}, {reason_data['max_val']:.4f}]")
+                if 'examples' in reason_data:
+                    logger.info(f"    Examples: {reason_data['examples']}")
+
+            logger.info("=" * 60)
+    else:
+        logger.info("Target validation: no extreme values detected")
+
+    # Final stats on cleaned data
+    if 'ret_from_entry' in targets_df.columns and len(targets_df) > 0:
+        ret_stats = targets_df['ret_from_entry'].describe()
+        logger.info(
+            f"Cleaned ret_from_entry stats: "
+            f"mean={ret_stats['mean']:.4f}, std={ret_stats['std']:.4f}, "
+            f"min={ret_stats['min']:.4f}, max={ret_stats['max']:.4f}"
+        )
+
+    return targets_df
+
+
+def _add_combined_weights(targets_df: pd.DataFrame,
+                         weight_min_clip: float = 0.01,
                          weight_max_clip: float = 10.0) -> pd.DataFrame:
     """
     Add combined weights to targets DataFrame using overlap and class balance components.

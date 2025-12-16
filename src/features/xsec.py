@@ -165,18 +165,32 @@ def _write_back_to_dfs(
     result_array: np.ndarray,
     syms: List[str],
     date_index: pd.DatetimeIndex,
-    col_name: str
-) -> None:
+    col_name: str,
+    pending_writes: Optional[Dict[str, Dict[str, np.ndarray]]] = None
+) -> Optional[Dict[str, Dict[str, np.ndarray]]]:
     """
     Efficiently write results back to DataFrames using vectorized indexing.
+
+    If pending_writes is provided, accumulates results instead of writing immediately.
+    Call _flush_pending_writes() to write all accumulated results at once.
     """
     # Create result DataFrame for efficient reindex
     result_df = pd.DataFrame(result_array, index=date_index, columns=syms, dtype=np.float32)
 
-    for s in syms:
-        df = indicators_by_symbol[s]
-        # Use reindex which is highly optimized
-        df[col_name] = result_df[s].reindex(df.index).values
+    if pending_writes is not None:
+        # Accumulate results for batch writing
+        for s in syms:
+            if s not in pending_writes:
+                pending_writes[s] = {}
+            df = indicators_by_symbol[s]
+            pending_writes[s][col_name] = result_df[s].reindex(df.index).values
+        return pending_writes
+    else:
+        # Immediate write (legacy behavior)
+        for s in syms:
+            df = indicators_by_symbol[s]
+            df[col_name] = result_df[s].reindex(df.index).values
+        return None
 
 
 def _write_back_to_dfs_weekly(
@@ -184,18 +198,48 @@ def _write_back_to_dfs_weekly(
     result_array: np.ndarray,
     syms: List[str],
     weekly_dates: pd.DatetimeIndex,
-    col_name: str
-) -> None:
+    col_name: str,
+    pending_writes: Optional[Dict[str, Dict[str, np.ndarray]]] = None
+) -> Optional[Dict[str, Dict[str, np.ndarray]]]:
     """
     Efficiently write weekly results back to daily DataFrames with forward-fill.
+
+    If pending_writes is provided, accumulates results instead of writing immediately.
     """
     # Create weekly result DataFrame
     weekly_df = pd.DataFrame(result_array, index=weekly_dates, columns=syms, dtype=np.float32)
 
-    for s in syms:
-        df = indicators_by_symbol[s]
-        # Forward-fill weekly values to daily
-        df[col_name] = weekly_df[s].reindex(df.index, method='ffill').values
+    if pending_writes is not None:
+        # Accumulate results for batch writing
+        for s in syms:
+            if s not in pending_writes:
+                pending_writes[s] = {}
+            df = indicators_by_symbol[s]
+            pending_writes[s][col_name] = weekly_df[s].reindex(df.index, method='ffill').values
+        return pending_writes
+    else:
+        # Immediate write (legacy behavior)
+        for s in syms:
+            df = indicators_by_symbol[s]
+            df[col_name] = weekly_df[s].reindex(df.index, method='ffill').values
+        return None
+
+
+def _flush_pending_writes(
+    indicators_by_symbol: Dict[str, pd.DataFrame],
+    pending_writes: Dict[str, Dict[str, np.ndarray]]
+) -> None:
+    """
+    Write all accumulated pending writes to DataFrames using pd.concat to avoid fragmentation.
+    """
+    for sym, col_data in pending_writes.items():
+        if not col_data:
+            continue
+        df = indicators_by_symbol[sym]
+        # Create DataFrame with all new columns at once
+        new_cols_df = pd.DataFrame(col_data, index=df.index)
+        # Use pd.concat to add all columns at once (avoids fragmentation)
+        indicators_by_symbol[sym] = pd.concat([df, new_cols_df], axis=1)
 
 
 def add_xsec_momentum_panel(
@@ -245,6 +289,9 @@ def add_xsec_momentum_panel(
             if isinstance(sec, str):
                 sect_col_indices.setdefault(sec, []).append(s_idx)
 
+    # Accumulate writes to avoid DataFrame fragmentation
+    pending_writes: Dict[str, Dict[str, np.ndarray]] = {}
+
     for L in lookbacks:
         logger.debug(f"Processing {L}-day momentum")
 
@@ -271,12 +318,15 @@ def add_xsec_momentum_panel(
             # Z-score the sector-neutral values
             z_sect = _numpy_cross_sectional_zscore(mom_sect_neutral)
             sect_name = f"{col_prefix}_{L}d_sect_neutral_z"
-            _write_back_to_dfs(indicators_by_symbol, z_sect, syms, date_index, sect_name)
+            _write_back_to_dfs(indicators_by_symbol, z_sect, syms, date_index, sect_name, pending_writes)
 
         # Plain z-score
         z_plain = _numpy_cross_sectional_zscore(momL)
         plain_name = f"{col_prefix}_{L}d_z"
-        _write_back_to_dfs(indicators_by_symbol, z_plain, syms, date_index, plain_name)
+        _write_back_to_dfs(indicators_by_symbol, z_plain, syms, date_index, plain_name, pending_writes)
+
+    # Flush all accumulated writes at once
+    _flush_pending_writes(indicators_by_symbol, pending_writes)
 
     features_added = len(lookbacks) * (2 if sector_map else 1)
     logger.info(f"Added {features_added} cross-sectional momentum features to {len(syms)} symbols")
@@ -325,6 +375,9 @@ def add_weekly_xsec_momentum_panel(
             if isinstance(sec, str):
                 sect_col_indices.setdefault(sec, []).append(s_idx)
 
+    # Accumulate writes to avoid DataFrame fragmentation
+    pending_writes: Dict[str, Dict[str, np.ndarray]] = {}
+
     for L in lookbacks:
         logger.debug(f"Processing {L}-week momentum")
 
@@ -344,11 +397,14 @@ def add_weekly_xsec_momentum_panel(
             z_sect = _numpy_cross_sectional_zscore(mom_sect_neutral)
 
             sect_name = f"{col_prefix}_{L}w_sect_neutral_z"
-            _write_back_to_dfs_weekly(indicators_by_symbol, z_sect, syms, weekly_dates, sect_name)
+            _write_back_to_dfs_weekly(indicators_by_symbol, z_sect, syms, weekly_dates, sect_name, pending_writes)
 
         z_plain = _numpy_cross_sectional_zscore(momL)
         plain_name = f"{col_prefix}_{L}w_z"
-        _write_back_to_dfs_weekly(indicators_by_symbol, z_plain, syms, weekly_dates, plain_name)
+        _write_back_to_dfs_weekly(indicators_by_symbol, z_plain, syms, weekly_dates, plain_name, pending_writes)
+
+    # Flush all accumulated writes at once
+    _flush_pending_writes(indicators_by_symbol, pending_writes)
 
     features_added = len(lookbacks) * (2 if sector_map else 1)
     logger.info(f"Added {features_added} weekly cross-sectional momentum features to {len(syms)} symbols")
@@ -389,6 +445,9 @@ def add_xsec_percentile_rank(
             if isinstance(sec, str):
                 sect_col_indices.setdefault(sec, []).append(s_idx)
 
+    # Accumulate writes to avoid DataFrame fragmentation
+    pending_writes: Dict[str, Dict[str, np.ndarray]] = {}
+
     for L in lookbacks:
         logger.debug(f"Processing {L}-day percentile rank")
 
@@ -398,7 +457,7 @@ def add_xsec_percentile_rank(
         # Cross-sectional percentile rank
         pct_rank = _numpy_cross_sectional_percentile(momL)
         col_name = f"{col_prefix}_{L}d"
-        _write_back_to_dfs(indicators_by_symbol, pct_rank, syms, date_index, col_name)
+        _write_back_to_dfs(indicators_by_symbol, pct_rank, syms, date_index, col_name, pending_writes)
 
         # Sector-relative percentile
         if sector_map and sect_col_indices:
@@ -416,7 +475,10 @@ def add_xsec_percentile_rank(
                     sect_pct[:, s_idx] = pct_rank[:, s_idx]
 
             sect_col_name = f"{col_prefix}_{L}d_sect"
-            _write_back_to_dfs(indicators_by_symbol, sect_pct, syms, date_index, sect_col_name)
+            _write_back_to_dfs(indicators_by_symbol, sect_pct, syms, date_index, sect_col_name, pending_writes)
+
+    # Flush all accumulated writes at once
+    _flush_pending_writes(indicators_by_symbol, pending_writes)
 
     features_added = len(lookbacks) * (2 if sector_map else 1)
     logger.info(f"Added {features_added} cross-sectional percentile features to {len(syms)} symbols")
@@ -465,6 +527,9 @@ def add_weekly_xsec_percentile_rank(
             if isinstance(sec, str):
                 sect_col_indices.setdefault(sec, []).append(s_idx)
 
+    # Accumulate writes to avoid DataFrame fragmentation
+    pending_writes: Dict[str, Dict[str, np.ndarray]] = {}
+
     for L in lookbacks:
         logger.debug(f"Processing {L}-week percentile rank")
 
@@ -473,7 +538,7 @@ def add_weekly_xsec_percentile_rank(
 
         pct_rank = _numpy_cross_sectional_percentile(momL)
         col_name = f"{col_prefix}_{L}w"
-        _write_back_to_dfs_weekly(indicators_by_symbol, pct_rank, syms, weekly_dates, col_name)
+        _write_back_to_dfs_weekly(indicators_by_symbol, pct_rank, syms, weekly_dates, col_name, pending_writes)
 
         # Sector-relative percentile
         if sector_map and sect_col_indices:
@@ -486,7 +551,10 @@ def add_weekly_xsec_percentile_rank(
                 sect_pct[:, col_indices] = _numpy_cross_sectional_percentile(sect_data)
 
             sect_col_name = f"{col_prefix}_{L}w_sect"
-            _write_back_to_dfs_weekly(indicators_by_symbol, sect_pct, syms, weekly_dates, sect_col_name)
+            _write_back_to_dfs_weekly(indicators_by_symbol, sect_pct, syms, weekly_dates, sect_col_name, pending_writes)
+
+    # Flush all accumulated writes at once
+    _flush_pending_writes(indicators_by_symbol, pending_writes)
 
     features_added = len(lookbacks) * (2 if sector_map else 1)
     logger.info(f"Added {features_added} weekly cross-sectional percentile features to {len(syms)} symbols")

@@ -94,7 +94,8 @@ def assemble_indicators_from_wide(
                 df[c] = df[c] * factor
 
         # Calculate log returns
-        df["ret"] = np.log(df["adjclose"]).diff()
+        with np.errstate(divide='ignore', invalid='ignore'):
+            df["ret"] = np.log(df["adjclose"]).diff()
         indicators_by_symbol[sym] = df
 
     logger.info(f"Assembled indicators for {len(indicators_by_symbol)} symbols")

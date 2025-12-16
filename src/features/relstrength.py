@@ -13,6 +13,12 @@ import pandas as pd
 import numpy as np
 from joblib import Parallel, delayed
 
+# Import parallel config for stocks_per_worker based parallelism
+try:
+    from ..config.parallel import calculate_workers_from_items, DEFAULT_STOCKS_PER_WORKER
+except ImportError:
+    from src.config.parallel import calculate_workers_from_items, DEFAULT_STOCKS_PER_WORKER
+
 logger = logging.getLogger(__name__)
 
 
@@ -167,7 +173,8 @@ def _compute_zscore(series: pd.Series, window: int = 20) -> pd.Series:
 def _compute_rs_batch(
     work_items_batch: List[Tuple[str, pd.Index, np.ndarray, Dict[str, Any]]],
     benchmarks: Dict[str, Tuple[pd.Index, np.ndarray]],
-    spy_symbol: str
+    spy_symbol: str,
+    qqq_symbol: str = "QQQ"
 ) -> List[Tuple[str, Dict[str, pd.Series]]]:
     """
     Process a batch of symbols for RS computation to reduce IPC overhead.
@@ -176,6 +183,7 @@ def _compute_rs_batch(
         work_items_batch: List of (symbol, px_index, px_values, mapping) tuples
         benchmarks: Pre-extracted benchmark price series
         spy_symbol: Symbol used as market benchmark
+        qqq_symbol: Symbol used as QQQ benchmark (growth/liquidity factor)
 
     Returns:
         List of (symbol, rs_features_dict) tuples
@@ -183,7 +191,7 @@ def _compute_rs_batch(
     results = []
     for sym, px_index, px_values, mapping in work_items_batch:
         rs_features = _compute_rs_for_symbol(
-            sym, px_index, px_values, benchmarks, mapping, spy_symbol
+            sym, px_index, px_values, benchmarks, mapping, spy_symbol, qqq_symbol
         )
         results.append((sym, rs_features))
     return results
@@ -192,6 +200,50 @@ def _compute_rs_batch(
 def _chunk_list(items: List, chunk_size: int) -> List[List]:
     """Split a list into chunks of specified size."""
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _get_required_benchmarks_for_rs_batch(
+    work_items_batch: List[Tuple[str, pd.Index, np.ndarray, Dict[str, Any]]],
+    all_benchmarks: Dict[str, Tuple[pd.Index, np.ndarray]],
+    spy_symbol: str = "SPY",
+    qqq_symbol: str = "QQQ"
+) -> Dict[str, Tuple[pd.Index, np.ndarray]]:
+    """
+    Extract only the benchmarks needed by a specific batch of symbols for RS computation.
+
+    This reduces memory usage by only sending relevant benchmark data to each worker
+    instead of the entire benchmark dictionary.
+
+    Args:
+        work_items_batch: List of (symbol, px_index, px_values, mapping) tuples
+        all_benchmarks: Complete benchmark dictionary
+        spy_symbol: Market benchmark symbol (always included)
+        qqq_symbol: Growth benchmark symbol (always included)
+
+    Returns:
+        Subset of benchmarks needed by this batch
+    """
+    # Core benchmarks always needed
+    required = {'SPY', 'QQQ', 'RSP'}
+
+    # Add ETFs referenced by symbols in this batch
+    for item in work_items_batch:
+        if len(item) >= 4 and isinstance(item[3], dict):
+            mapping = item[3]
+            if mapping.get('sector_etf'):
+                required.add(mapping['sector_etf'])
+            if mapping.get('equal_weight_etf'):
+                required.add(mapping['equal_weight_etf'])
+            if mapping.get('subsector_etf'):
+                required.add(mapping['subsector_etf'])
+
+    # Extract only required benchmarks
+    subset = {}
+    for key in required:
+        if key in all_benchmarks:
+            subset[key] = all_benchmarks[key]
+
+    return subset
 
 
 def _compute_relative_strength_block(
@@ -267,7 +319,8 @@ def _compute_rs_for_symbol(
     px_values: np.ndarray,
     benchmarks: Dict[str, Tuple[pd.Index, np.ndarray]],
     symbol_mapping: Dict[str, Any],
-    spy_symbol: str = "SPY"
+    spy_symbol: str = "SPY",
+    qqq_symbol: str = "QQQ"
 ) -> Dict[str, pd.Series]:
     """
     Compute all relative strength features for a single symbol.
@@ -282,6 +335,7 @@ def _compute_rs_for_symbol(
         benchmarks: Dict mapping benchmark name -> (index, values) tuple
         symbol_mapping: Dict with keys like 'sector_etf', 'subsector_etf', 'equal_weight_etf'
         spy_symbol: Symbol used as market benchmark
+        qqq_symbol: Symbol used as QQQ benchmark (growth/liquidity factor)
 
     Returns:
         Dict mapping column_name -> pd.Series with computed RS features
@@ -290,7 +344,7 @@ def _compute_rs_for_symbol(
     px = pd.Series(px_values, index=px_index, dtype='float64')
 
     # Skip if this is a benchmark symbol
-    if sym == spy_symbol:
+    if sym == spy_symbol or sym == qqq_symbol:
         return result
 
     # 1) RS vs SPY
@@ -307,7 +361,34 @@ def _compute_rs_for_symbol(
         result["rel_strength_spy_macd_hist"] = rs_metrics['rs_macd_hist']
         result["rel_strength_spy_zscore"] = rs_metrics['rs_zscore']
 
-    # 2) RS vs RSP (equal-weight market)
+    # 2) RS vs QQQ (growth/liquidity factor)
+    # Applied to ALL stocks regardless of sector to capture growth sensitivity
+    if 'QQQ' in benchmarks:
+        qqq_idx, qqq_vals = benchmarks['QQQ']
+        qqq_px = pd.Series(qqq_vals, index=qqq_idx, dtype='float64')
+        rs_metrics = _compute_relative_strength_block(px, qqq_px, compute_extended=True)
+        result["rel_strength_qqq"] = rs_metrics['rs']
+        result["rel_strength_qqq_norm"] = rs_metrics['rs_norm']
+        result["rel_strength_qqq_rsi"] = rs_metrics['rs_rsi']
+        result["rel_strength_qqq_macd"] = rs_metrics['rs_macd']
+        result["rel_strength_qqq_macd_signal"] = rs_metrics['rs_macd_signal']
+        result["rel_strength_qqq_macd_hist"] = rs_metrics['rs_macd_hist']
+        result["rel_strength_qqq_zscore"] = rs_metrics['rs_zscore']
+
+        # QQQ vs SPY spread (captures growth vs value regime)
+        # Positive = stock outperforming relative to QQQ more than SPY
+        if 'SPY' in benchmarks:
+            spy_rs = result.get("rel_strength_spy")
+            qqq_rs = rs_metrics['rs']
+            if spy_rs is not None:
+                # Ratio of QQQ-relative to SPY-relative RS
+                rs_qqq_spy_spread = (qqq_rs / spy_rs.replace(0, np.nan)).astype('float32')
+                result["rel_strength_qqq_spy_spread"] = rs_qqq_spy_spread
+                # Normalized spread (mean-centered)
+                roll = rs_qqq_spy_spread.rolling(60, min_periods=20).mean()
+                result["rel_strength_qqq_spy_spread_norm"] = ((rs_qqq_spy_spread / roll) - 1.0).astype('float32')
+
+    # 3) RS vs RSP (equal-weight market)
     if 'RSP' in benchmarks:
         rsp_idx, rsp_vals = benchmarks['RSP']
         rsp_px = pd.Series(rsp_vals, index=rsp_idx, dtype='float64')
@@ -319,7 +400,7 @@ def _compute_rs_for_symbol(
         result["rel_strength_rsp_macd_hist"] = rs_metrics['rs_macd_hist']
         result["rel_strength_rsp_zscore"] = rs_metrics['rs_zscore']
 
-    # 3) RS vs Sector ETF
+    # 4) RS vs Sector ETF
     sector_etf = symbol_mapping.get('sector_etf')
     if sector_etf and sector_etf in benchmarks:
         sec_idx, sec_vals = benchmarks[sector_etf]
@@ -341,7 +422,8 @@ def _compute_rs_for_symbol(
             result["rel_strength_sector_vs_market"] = rs_sect_mkt['rs']
             result["rel_strength_sector_vs_market_norm"] = rs_sect_mkt['rs_norm']
 
-    # 4) RS vs Equal-Weight Sector ETF
+    # 5) RS vs Equal-Weight Best-Match ETF (replaces broken equal-weight sector)
+    # Uses R²-based best-match from equal-weight ETF candidates
     ew_etf = symbol_mapping.get('equal_weight_etf')
     if ew_etf and ew_etf in benchmarks:
         ew_idx, ew_vals = benchmarks[ew_etf]
@@ -354,18 +436,10 @@ def _compute_rs_for_symbol(
         result["rel_strength_sector_ew_macd_hist"] = rs_metrics['rs_macd_hist']
         result["rel_strength_sector_ew_zscore"] = rs_metrics['rs_zscore']
 
-    # 5) RS vs Subsector ETF
-    subsector_etf = symbol_mapping.get('subsector_etf')
-    if subsector_etf and subsector_etf in benchmarks:
-        sub_idx, sub_vals = benchmarks[subsector_etf]
-        sub_px = pd.Series(sub_vals, index=sub_idx, dtype='float64')
-        rs_metrics = _compute_relative_strength_block(px, sub_px, compute_extended=True)
-        result["rel_strength_subsector"] = rs_metrics['rs']
-        result["rel_strength_subsector_norm"] = rs_metrics['rs_norm']
-        result["rel_strength_subsector_rsi"] = rs_metrics['rs_rsi']
-        result["rel_strength_subsector_macd"] = rs_metrics['rs_macd']
-        result["rel_strength_subsector_macd_hist"] = rs_metrics['rs_macd_hist']
-        result["rel_strength_subsector_zscore"] = rs_metrics['rs_zscore']
+    # NOTE: Subsector features (rel_strength_subsector_*) have been REMOVED.
+    # They had 40-48% NaN rates due to unstable correlation-based subsector discovery.
+    # The best-match ETF selection (using R² from factor_regression.py) now provides
+    # stable sector/subsector references through sector_etf and equal_weight_etf.
 
     return result
 
@@ -375,6 +449,7 @@ def add_relative_strength(
     sectors: Optional[Dict[str, str]] = None,
     sector_to_etf: Optional[Dict[str, str]] = None,
     spy_symbol: str = "SPY",
+    qqq_symbol: str = "QQQ",
     enhanced_mappings: Optional[Dict[str, Dict]] = None,
     n_jobs: int = -1
 ) -> None:
@@ -387,6 +462,9 @@ def add_relative_strength(
     Standard features (always added if benchmarks available):
     - rel_strength_spy: Raw relative strength vs SPY
     - rel_strength_spy_norm: Normalized relative strength vs SPY
+    - rel_strength_qqq: Raw relative strength vs QQQ (growth/liquidity factor)
+    - rel_strength_qqq_norm: Normalized relative strength vs QQQ
+    - rel_strength_qqq_spy_spread: Ratio of QQQ-relative to SPY-relative RS
     - rel_strength_sector: Raw relative strength vs sector ETF
     - rel_strength_sector_norm: Normalized relative strength vs sector ETF
 
@@ -400,11 +478,12 @@ def add_relative_strength(
         sectors: Optional mapping of symbol -> sector name
         sector_to_etf: Optional mapping of lowercase sector name -> ETF symbol
         spy_symbol: Symbol to use as market benchmark
+        qqq_symbol: Symbol to use as growth/liquidity benchmark (default: QQQ)
         enhanced_mappings: Optional enhanced sector/subsector mappings from sector_mapping module
         n_jobs: Number of parallel jobs (-1 for all cores)
     """
     import os
-    logger.info(f"Computing relative strength features using {spy_symbol} as market benchmark (parallel)")
+    logger.info(f"Computing relative strength features using {spy_symbol} and {qqq_symbol} as benchmarks (parallel)")
 
     # Prepare sector mappings (convert to lowercase)
     sector_to_etf = sector_to_etf or {}
@@ -429,6 +508,15 @@ def add_relative_strength(
         rsp_px = pd.to_numeric(rsp_data["adjclose"], errors='coerce')
         benchmarks['RSP'] = (rsp_px.index, rsp_px.values)
         logger.debug(f"Loaded RSP benchmark: {len(rsp_px)} data points")
+
+    # QQQ benchmark (growth/liquidity factor)
+    qqq_data = indicators_by_symbol.get(qqq_symbol)
+    if qqq_data is not None and "adjclose" in qqq_data.columns:
+        qqq_px = pd.to_numeric(qqq_data["adjclose"], errors='coerce')
+        benchmarks['QQQ'] = (qqq_px.index, qqq_px.values)
+        logger.debug(f"Loaded QQQ benchmark: {len(qqq_px)} data points")
+    else:
+        logger.warning(f"{qqq_symbol} missing or has no 'adjclose' column - QQQ features will be skipped")
 
     # Collect all ETFs needed (sector, equal-weight, subsector)
     all_etfs_needed = set()
@@ -509,45 +597,51 @@ def add_relative_strength(
     n_symbols = len(work_items)
 
     # =========================================================================
-    # Step 4: Parallel computation with batching
+    # Step 4: Parallel computation with batching (stocks_per_worker based)
     # =========================================================================
-    if n_jobs == -1:
-        import multiprocessing
-        effective_jobs = multiprocessing.cpu_count()
-    else:
-        effective_jobs = n_jobs
-
-    # Calculate optimal chunk size: minimum 100 symbols per chunk to amortize IPC overhead
-    min_chunk_size = 100
-    chunk_size = max(min_chunk_size, n_symbols // effective_jobs)
-    n_chunks = max(1, n_symbols // chunk_size)
-    actual_workers = min(effective_jobs, n_chunks)
+    chunk_size = DEFAULT_STOCKS_PER_WORKER
+    n_workers = calculate_workers_from_items(n_symbols, items_per_worker=chunk_size)
+    n_chunks = max(1, (n_symbols + chunk_size - 1) // chunk_size)
 
     logger.info(f"Computing RS features for {n_symbols} symbols in {n_chunks} batches "
-                f"(~{chunk_size} symbols/batch, {actual_workers} workers)")
+                f"({chunk_size} stocks/worker, {n_workers} workers)")
 
     # Use sequential processing for small datasets
-    if n_symbols < 10 or actual_workers == 1:
+    if n_symbols < 10 or n_workers == 1:
         logger.info("Using sequential processing for RS computation")
         results = []
         for sym, px_index, px_values, mapping in work_items:
             rs_features = _compute_rs_for_symbol(
-                sym, px_index, px_values, benchmarks, mapping, spy_symbol
+                sym, px_index, px_values, benchmarks, mapping, spy_symbol, qqq_symbol
             )
             results.append((sym, rs_features))
     else:
-        # Create batches for parallel processing
+        # Create batches for parallel processing with subsetted benchmarks
         work_chunks = _chunk_list(work_items, chunk_size)
+
+        # Pre-compute subsetted benchmarks for each chunk to reduce serialization
+        # Each worker only gets the benchmarks it needs (core + batch-specific ETFs)
+        chunk_benchmarks = []
+        for chunk in work_chunks:
+            benchmark_subset = _get_required_benchmarks_for_rs_batch(
+                chunk, benchmarks, spy_symbol, qqq_symbol
+            )
+            chunk_benchmarks.append(benchmark_subset)
+
+        # Log benchmark reduction
+        total_benchmarks = len(benchmarks)
+        avg_benchmarks = sum(len(b) for b in chunk_benchmarks) / len(chunk_benchmarks) if chunk_benchmarks else 0
+        logger.info(f"Benchmark subsetting: {total_benchmarks} total -> {avg_benchmarks:.1f} avg per batch")
 
         try:
             batch_results = Parallel(
-                n_jobs=actual_workers,
+                n_jobs=n_workers,
                 backend='loky',
                 verbose=0,
                 prefer='processes'
             )(
-                delayed(_compute_rs_batch)(chunk, benchmarks, spy_symbol)
-                for chunk in work_chunks
+                delayed(_compute_rs_batch)(chunk, chunk_benchmarks[i], spy_symbol, qqq_symbol)
+                for i, chunk in enumerate(work_chunks)
             )
 
             # Flatten batch results
@@ -560,7 +654,7 @@ def add_relative_strength(
             results = []
             for sym, px_index, px_values, mapping in work_items:
                 rs_features = _compute_rs_for_symbol(
-                    sym, px_index, px_values, benchmarks, mapping, spy_symbol
+                    sym, px_index, px_values, benchmarks, mapping, spy_symbol, qqq_symbol
                 )
                 results.append((sym, rs_features))
 
@@ -568,6 +662,7 @@ def add_relative_strength(
     # Step 5: Apply results back to DataFrames
     # =========================================================================
     rs_spy_count = 0
+    rs_qqq_count = 0
     rs_sector_count = 0
     rs_subsector_count = 0
 
@@ -582,11 +677,14 @@ def add_relative_strength(
         # Count features added
         if "rel_strength_spy" in rs_features:
             rs_spy_count += 1
+        if "rel_strength_qqq" in rs_features:
+            rs_qqq_count += 1
         if "rel_strength_sector" in rs_features:
             rs_sector_count += 1
         if "rel_strength_subsector" in rs_features:
             rs_subsector_count += 1
 
     logger.info(f"Added SPY relative strength to {rs_spy_count} symbols, "
+                f"QQQ relative strength to {rs_qqq_count} symbols, "
                 f"sector relative strength to {rs_sector_count} symbols, "
                 f"subsector relative strength to {rs_subsector_count} symbols")

@@ -2,12 +2,13 @@
 """
 CLI for downloading market data.
 
-This module provides commands for downloading stock and ETF data from Yahoo Finance.
+This module provides commands for downloading stock, ETF, and FRED data.
 It can be run independently from feature computation, allowing you to iterate on
 compute logic while a long download runs in another terminal.
 
 Usage:
     python -m src.cli.download --universe sp500 --output cache/
+    python -m src.cli.download --universe fred --output cache/
     python -m src.cli.download --symbols AAPL,MSFT,GOOGL
     python -m src.cli.download --symbols-file symbols.txt --rate-limit 2.0
 """
@@ -23,6 +24,13 @@ from typing import List, Optional
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# Load .env file for RAPIDAPI_KEY
+try:
+    from dotenv import load_dotenv
+    load_dotenv(PROJECT_ROOT / '.env')
+except ImportError:
+    pass  # dotenv not installed, rely on environment variables
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +52,49 @@ def get_sp500_symbols() -> List[str]:
         return []
 
 
+def download_fred_data(output_dir: Path, force_update: bool = False) -> dict:
+    """Download FRED economic data.
+
+    Args:
+        output_dir: Directory to save data
+        force_update: If True, re-download even if cached
+
+    Returns:
+        Dict with download statistics
+    """
+    from src.data.fred import download_fred_series
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_path = output_dir / "fred_data.parquet"
+
+    stats = {"success": 0, "failed": 0, "skipped": 0, "total": 1}
+
+    # Check cache
+    if cache_path.exists() and not force_update:
+        logger.info(f"FRED data already cached at {cache_path}")
+        stats["skipped"] = 1
+        return stats
+
+    # Download
+    try:
+        logger.info("Downloading FRED economic data...")
+        df = download_fred_series(cache_path=cache_path, force_refresh=force_update)
+        if df is not None and not df.empty:
+            stats["success"] = 1
+            logger.info(f"Downloaded FRED data: {df.shape[0]} rows, {df.shape[1]} series")
+            logger.info(f"Saved to: {cache_path}")
+        else:
+            stats["failed"] = 1
+            logger.error("FRED download returned empty data")
+    except Exception as e:
+        stats["failed"] = 1
+        logger.error(f"FRED download failed: {e}")
+
+    return stats
+
+
 def get_default_etfs() -> List[str]:
     """Get comprehensive ETF list including all sector and subsector ETFs."""
     return [
@@ -56,15 +107,28 @@ def get_default_etfs() -> List[str]:
         # Sector cap-weighted (Select Sector SPDRs)
         "XLF", "XLK", "XLE", "XLY", "XLI", "XLP", "XLV", "XLU", "XLB", "XLC", "XLRE",
 
-        # Sector equal-weight (Invesco)
-        "RSP",   # S&P 500 Equal Weight
-        "RYT",   # Technology Equal Weight
-        "RYF",   # Financial Equal Weight
-        "RYE",   # Energy Equal Weight
-        "RYH",   # Healthcare Equal Weight (note: maps to XLI equal weight in some configs)
-        "RYU",   # Utilities Equal Weight
-        "RHS",   # Consumer Staples Equal Weight
-        "RTM",   # Materials Equal Weight
+        # Sector equal-weight (Invesco S&P 500 Equal Weight Sector ETFs)
+        # These are used by BEST_MATCH_EW_CANDIDATES in factor_regression.py
+        "RSP",   # S&P 500 Equal Weight (market benchmark)
+        "RSPT",  # Technology Equal Weight Sector
+        "RSPF",  # Financials Equal Weight Sector
+        "RSPH",  # Health Care Equal Weight Sector
+        "RSPE",  # Energy Equal Weight Sector
+        "RSPS",  # Consumer Staples Equal Weight Sector
+        "RSPC",  # Consumer Discretionary Equal Weight Sector
+        "RSPU",  # Utilities Equal Weight Sector
+        "RSPM",  # Materials Equal Weight Sector
+        "RSPD",  # Communication Services Equal Weight Sector
+        "RSPN",  # Industrials Equal Weight Sector
+
+        # Older Rydex/Invesco equal-weight ETFs (alternative mappings)
+        "RYT",   # Technology Equal Weight (legacy)
+        "RYF",   # Financial Equal Weight (legacy)
+        "RYE",   # Energy Equal Weight (legacy)
+        "RYH",   # Healthcare Equal Weight (legacy)
+        "RYU",   # Utilities Equal Weight (legacy)
+        "RHS",   # Consumer Staples Equal Weight (legacy)
+        "RTM",   # Materials Equal Weight (legacy)
         "EWRE",  # Real Estate Equal Weight
 
         # Technology subsectors
@@ -154,7 +218,9 @@ def download_symbols(
     output_dir: Path,
     rate_limit: float = 1.0,
     interval: str = "1d",
-    force_update: bool = False
+    force_update: bool = False,
+    is_etf: bool = False,
+    cleanup: bool = False
 ) -> dict:
     """Download data for a list of symbols.
 
@@ -164,6 +230,8 @@ def download_symbols(
         rate_limit: Requests per second
         interval: Data interval (1d, 1h, etc.)
         force_update: If True, re-download even if cached
+        is_etf: If True, save to stock_data_etf.parquet instead of stock_data_combined.parquet
+        cleanup: If True, remove individual symbol parquet files after creating combined file
 
     Returns:
         Dict with download statistics
@@ -176,12 +244,13 @@ def download_symbols(
     stats = {"success": 0, "failed": 0, "skipped": 0, "total": len(symbols)}
     all_data = {}
 
-    logger.info(f"Downloading {len(symbols)} symbols to {output_dir}")
+    logger.info(f"Downloading {len(symbols)} {'ETF' if is_etf else 'stock'} symbols to {output_dir}")
     logger.info(f"Rate limit: {rate_limit} req/sec, Interval: {interval}")
 
     for i, symbol in enumerate(symbols, 1):
-        # Check cache
-        cache_path = output_dir / f"{symbol}.parquet"
+        # Check cache - normalize symbol for file path (remove ^ prefix)
+        file_symbol = symbol.replace("^", "")
+        cache_path = output_dir / f"{file_symbol}.parquet"
         if cache_path.exists() and not force_update:
             stats["skipped"] += 1
             logger.debug(f"[{i}/{len(symbols)}] {symbol}: cached")
@@ -205,13 +274,47 @@ def download_symbols(
         if i < len(symbols):
             sleep(1.0 / rate_limit)
 
-    # Save combined file
+    # Save combined file in long format (compatible with loader's _load_long_parquet)
+    # ETFs go to stock_data_etf.parquet, stocks go to stock_data_combined.parquet
     if all_data:
-        combined_path = output_dir / "stock_data_combined.parquet"
+        from src.data.loader import _save_long_parquet
         import pandas as pd
-        combined = pd.concat(all_data.values(), ignore_index=True)
-        combined.to_parquet(combined_path)
-        logger.info(f"Saved combined data to {combined_path}")
+
+        # Convert individual symbol DataFrames to wide format dict by metric
+        # all_data is {symbol: DataFrame with OHLCV + symbol column}
+        combined = pd.concat(all_data.values(), ignore_index=False).reset_index().rename(columns={'index': 'date'})
+        combined['date'] = pd.to_datetime(combined['date'])
+        combined['symbol'] = combined['symbol'].astype('string')
+
+        # Pivot to {metric: wide DataFrame} format expected by _save_long_parquet
+        result_dict = {}
+        for metric in ["Open", "High", "Low", "Close", "AdjClose", "Volume"]:
+            if metric in combined.columns:
+                result_dict[metric] = combined.pivot(index='date', columns='symbol', values=metric).sort_index()
+
+        # Choose output file based on whether these are ETFs or stocks
+        if is_etf:
+            combined_path = output_dir / "stock_data_etf.parquet"
+        else:
+            combined_path = output_dir / "stock_data_combined.parquet"
+
+        _save_long_parquet(result_dict, str(combined_path))
+        logger.info(f"Saved combined {'ETF' if is_etf else 'stock'} data ({len(all_data)} symbols) to {combined_path}")
+
+        # Cleanup individual symbol files if requested
+        if cleanup:
+            cleaned = 0
+            for symbol in symbols:
+                file_symbol = symbol.replace("^", "")
+                cache_path = output_dir / f"{file_symbol}.parquet"
+                if cache_path.exists():
+                    try:
+                        cache_path.unlink()
+                        cleaned += 1
+                    except Exception as e:
+                        logger.warning(f"Could not remove {cache_path}: {e}")
+            if cleaned > 0:
+                logger.info(f"Cleaned up {cleaned} individual symbol files")
 
     return stats
 
@@ -234,8 +337,14 @@ Examples:
     # Download ETFs only
     python -m src.cli.download --universe etf
 
+    # Download FRED economic data (requires FRED_API_KEY)
+    python -m src.cli.download --universe fred
+
     # Force update with custom rate limit
     python -m src.cli.download --universe sp500 --force --rate-limit 0.5
+
+    # Download all and cleanup individual files
+    python -m src.cli.download --universe all --cleanup
         """
     )
 
@@ -243,8 +352,8 @@ Examples:
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument(
         "--universe",
-        choices=["sp500", "etf", "all"],
-        help="Download predefined universe"
+        choices=["sp500", "etf", "fred", "all"],
+        help="Download predefined universe (fred requires FRED_API_KEY env var)"
     )
     source_group.add_argument(
         "--symbols",
@@ -292,53 +401,117 @@ Examples:
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Remove individual symbol parquet files after creating combined file"
+    )
 
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Determine symbols to download
-    symbols = []
-    if args.universe == "sp500":
-        symbols = get_sp500_symbols()
-    elif args.universe == "etf":
-        symbols = get_default_etfs()
+    # Helper to deduplicate symbols while preserving order
+    def deduplicate(symbols_list):
+        seen = set()
+        unique = []
+        for s in symbols_list:
+            if s not in seen:
+                seen.add(s)
+                unique.append(s)
+        return unique
+
+    # Determine symbols to download based on source
+    # Note: ETFs go to stock_data_etf.parquet, stocks go to stock_data_combined.parquet
+    # FRED data is special - it's economic data, not symbols
+    if args.universe == "fred":
+        # FRED download is special - doesn't use symbols
+        stats = download_fred_data(
+            output_dir=Path(args.output),
+            force_update=args.force
+        )
     elif args.universe == "all":
-        symbols = get_sp500_symbols() + get_default_etfs()
-    elif args.symbols:
-        symbols = [s.strip() for s in args.symbols.split(",")]
-    elif args.symbols_file:
-        with open(args.symbols_file) as f:
-            symbols = [line.strip() for line in f if line.strip()]
+        # Download stocks and ETFs separately to maintain file separation
+        stock_symbols = deduplicate(get_sp500_symbols())
+        etf_symbols = deduplicate(get_default_etfs())
 
-    if not symbols:
-        logger.error("No symbols to download")
-        sys.exit(1)
+        if args.max_symbols:
+            stock_symbols = stock_symbols[:args.max_symbols]
+            etf_symbols = etf_symbols[:args.max_symbols]
 
-    # Apply max symbols limit
-    if args.max_symbols:
-        symbols = symbols[:args.max_symbols]
+        logger.info(f"Will download {len(stock_symbols)} stocks and {len(etf_symbols)} ETFs")
 
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_symbols = []
-    for s in symbols:
-        if s not in seen:
-            seen.add(s)
-            unique_symbols.append(s)
-    symbols = unique_symbols
+        # Download stocks first
+        stats_stocks = download_symbols(
+            symbols=stock_symbols,
+            output_dir=Path(args.output),
+            rate_limit=args.rate_limit,
+            interval=args.interval,
+            force_update=args.force,
+            is_etf=False,
+            cleanup=args.cleanup
+        )
 
-    logger.info(f"Will download {len(symbols)} symbols")
+        # Then download ETFs
+        stats_etfs = download_symbols(
+            symbols=etf_symbols,
+            output_dir=Path(args.output),
+            rate_limit=args.rate_limit,
+            interval=args.interval,
+            force_update=args.force,
+            is_etf=True,
+            cleanup=args.cleanup
+        )
 
-    # Download
-    stats = download_symbols(
-        symbols=symbols,
-        output_dir=Path(args.output),
-        rate_limit=args.rate_limit,
-        interval=args.interval,
-        force_update=args.force
-    )
+        # Combine stats for reporting
+        stats = {
+            "success": stats_stocks["success"] + stats_etfs["success"],
+            "failed": stats_stocks["failed"] + stats_etfs["failed"],
+            "skipped": stats_stocks["skipped"] + stats_etfs["skipped"],
+            "total": stats_stocks["total"] + stats_etfs["total"]
+        }
+    else:
+        # Single universe download
+        symbols = []
+        is_etf = False
+
+        if args.universe == "sp500":
+            symbols = get_sp500_symbols()
+            is_etf = False
+        elif args.universe == "etf":
+            symbols = get_default_etfs()
+            is_etf = True
+        elif args.symbols:
+            symbols = [s.strip() for s in args.symbols.split(",")]
+            # Custom symbols go to stock file by default
+            is_etf = False
+        elif args.symbols_file:
+            with open(args.symbols_file) as f:
+                symbols = [line.strip() for line in f if line.strip()]
+            is_etf = False
+
+        if not symbols:
+            logger.error("No symbols to download")
+            sys.exit(1)
+
+        # Apply max symbols limit
+        if args.max_symbols:
+            symbols = symbols[:args.max_symbols]
+
+        symbols = deduplicate(symbols)
+        logger.info(f"Will download {len(symbols)} {'ETF' if is_etf else 'stock'} symbols")
+
+        # Download
+        stats = download_symbols(
+            symbols=symbols,
+            output_dir=Path(args.output),
+            rate_limit=args.rate_limit,
+            interval=args.interval,
+            force_update=args.force,
+            is_etf=is_etf,
+            cleanup=args.cleanup
+        )
 
     # Report results
     print("\n" + "=" * 50)

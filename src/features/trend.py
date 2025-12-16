@@ -186,9 +186,17 @@ def add_macd_features(
     if src_col not in df.columns:
         logger.warning(f"Source column '{src_col}' not found for MACD calculation")
         return df
-    
+
     price_series = pd.to_numeric(df[src_col], errors='coerce')
-    
+
+    # Check if we have enough valid data for MACD calculation
+    # MACD needs at least slow + signal periods of valid data
+    min_required = slow + signal
+    valid_count = price_series.notna().sum()
+    if valid_count < min_required:
+        logger.debug(f"Insufficient data for MACD: {valid_count} valid points, need {min_required}")
+        return df
+
     try:
         # Use pandas-ta to calculate MACD (returns DataFrame with MACD, signal, and histogram)
         macd_data = ta.macd(price_series, fast=fast, slow=slow, signal=signal)

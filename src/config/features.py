@@ -15,17 +15,35 @@ logger = logging.getLogger(__name__)
 
 
 class FeatureCategory(str, Enum):
-    """Categories of features for organization and filtering."""
+    """Categories of features for organization and filtering.
+
+    Updated to match actual pipeline implementation:
+    - Single-stock: trend, momentum, volatility, volume, price_position, range_breakout, liquidity
+    - Cross-sectional: cross_sectional, alpha, relative_strength, breadth
+    - Macro/Intermarket: macro, intermarket
+    """
+    # Single-stock features (computed per symbol)
     TREND = "trend"
     MOMENTUM = "momentum"
     VOLATILITY = "volatility"
     VOLUME = "volume"
-    DISTANCE = "distance"
-    RANGE = "range"
-    CROSS_SECTIONAL = "cross_sectional"
-    RELATIVE_STRENGTH = "relative_strength"
-    BREADTH = "breadth"
-    ALPHA = "alpha"
+    PRICE_POSITION = "price_position"  # Distance to MA, position in range
+    RANGE_BREAKOUT = "range_breakout"  # ATR, ranges, breakouts
+    LIQUIDITY = "liquidity"  # Spread proxies, VWAP, Amihud
+
+    # Cross-sectional features (require multi-stock data)
+    CROSS_SECTIONAL = "cross_sectional"  # Vol regime CS, xsec momentum
+    ALPHA = "alpha"  # Alpha-momentum, betas, factor regression
+    RELATIVE_STRENGTH = "relative_strength"  # RS vs benchmarks
+    BREADTH = "breadth"  # Market breadth indicators
+
+    # Macro/Intermarket features
+    MACRO = "macro"  # VIX regime, FRED data
+    INTERMARKET = "intermarket"  # Cross-asset ratios, correlations
+
+    # Legacy aliases (for backward compatibility)
+    DISTANCE = "price_position"  # Alias for price_position
+    RANGE = "range_breakout"  # Alias for range_breakout
 
 
 class Timeframe(str, Enum):
@@ -164,7 +182,7 @@ class FeatureConfig:
         # Distance to MA features
         config.features['distance_ma'] = FeatureSpec(
             name='distance_ma',
-            category=FeatureCategory.DISTANCE,
+            category=FeatureCategory.PRICE_POSITION,
             timeframes=[Timeframe.DAILY, Timeframe.WEEKLY],
             enabled=True,
             params={
@@ -177,8 +195,8 @@ class FeatureConfig:
         # Range and breakout features
         config.features['range_breakout'] = FeatureSpec(
             name='range_breakout',
-            category=FeatureCategory.RANGE,
-            timeframes=[Timeframe.DAILY],
+            category=FeatureCategory.RANGE_BREAKOUT,
+            timeframes=[Timeframe.DAILY, Timeframe.WEEKLY],
             enabled=True,
             params={
                 'win_list': (5, 10, 20),
@@ -271,6 +289,69 @@ class FeatureConfig:
                 'lookbacks': (5, 20, 60),
             },
             description="Cross-sectional momentum rankings"
+        )
+
+        # === NEW: LIQUIDITY FEATURES ===
+        config.features['liquidity'] = FeatureSpec(
+            name='liquidity',
+            category=FeatureCategory.LIQUIDITY,
+            timeframes=[Timeframe.DAILY, Timeframe.WEEKLY],
+            enabled=True,
+            params={
+                'windows': (5, 10, 20),
+            },
+            description="Spread proxies, VWAP, Amihud illiquidity"
+        )
+
+        # === NEW: FACTOR REGRESSION FEATURES ===
+        config.features['factor_regression'] = FeatureSpec(
+            name='factor_regression',
+            category=FeatureCategory.ALPHA,
+            timeframes=[Timeframe.DAILY, Timeframe.WEEKLY],
+            enabled=True,
+            requires_cross_sectional=True,
+            params={
+                'regression_window': 60,
+                'min_observations': 30,
+            },
+            description="Multi-factor regression (SPY, QQQ, best-match ETF)"
+        )
+
+        # === NEW: MACRO FEATURES ===
+
+        # VIX regime features
+        config.features['vix_regime'] = FeatureSpec(
+            name='vix_regime',
+            category=FeatureCategory.MACRO,
+            timeframes=[Timeframe.DAILY, Timeframe.WEEKLY],
+            enabled=True,
+            requires_cross_sectional=True,
+            params={},
+            description="VIX regime features and term structure"
+        )
+
+        # Cross-asset / intermarket features
+        config.features['cross_asset'] = FeatureSpec(
+            name='cross_asset',
+            category=FeatureCategory.INTERMARKET,
+            timeframes=[Timeframe.DAILY, Timeframe.WEEKLY],
+            enabled=True,
+            requires_cross_sectional=True,
+            params={},
+            description="Cross-asset ratios and correlations"
+        )
+
+        # FRED macro data features
+        config.features['fred_macro'] = FeatureSpec(
+            name='fred_macro',
+            category=FeatureCategory.MACRO,
+            timeframes=[Timeframe.DAILY, Timeframe.WEEKLY],
+            enabled=True,
+            requires_cross_sectional=True,
+            params={
+                'additional_lag_days': 0,
+            },
+            description="Federal Reserve Economic Data (FRED) features"
         )
 
         return config

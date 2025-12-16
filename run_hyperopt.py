@@ -62,6 +62,22 @@ def load_selected_features() -> list[str]:
     return features
 
 
+def compute_scale_pos_weight(y: np.ndarray) -> float:
+    """Compute scale_pos_weight for LightGBM class balancing.
+
+    scale_pos_weight = n_negative / n_positive
+
+    Args:
+        y: Binary target array (0/1)
+
+    Returns:
+        scale_pos_weight value for LightGBM
+    """
+    n_positive = (y == 1).sum()
+    n_negative = (y == 0).sum()
+    return n_negative / n_positive
+
+
 def load_and_prepare_data(
     selected_features: list[str],
     max_symbols: int = 5000,
@@ -194,7 +210,8 @@ def objective(
     cv_splits: list[tuple[np.ndarray, np.ndarray]],
     n_jobs: int = 8,
     min_fold_auc: float = 0.55,
-    variance_penalty: float = 1.0
+    variance_penalty: float = 1.0,
+    scale_pos_weight: float = None
 ) -> float:
     """Optuna objective function for LightGBM hyperparameter optimization.
 
@@ -209,6 +226,7 @@ def objective(
         n_jobs: Threads per model
         min_fold_auc: Minimum AUC required on each fold (default 0.55)
         variance_penalty: Weight for std penalty (default 1.0)
+        scale_pos_weight: Class weight for balancing (n_neg/n_pos). None for no weighting.
 
     Returns:
         Stability-adjusted AUC score (mean - penalty * std)
@@ -245,6 +263,10 @@ def objective(
         # Additional
         'max_bin': trial.suggest_categorical('max_bin', [63, 127, 255]),
     }
+
+    # Add class weighting if specified
+    if scale_pos_weight is not None:
+        params['scale_pos_weight'] = scale_pos_weight
 
     # Constraint: num_leaves <= 2^max_depth
     max_leaves = 2 ** params['max_depth']
@@ -345,7 +367,8 @@ def run_hyperopt(
     n_folds: int = 5,
     gap: int = 20,
     min_fold_auc: float = 0.55,
-    variance_penalty: float = 1.0
+    variance_penalty: float = 1.0,
+    balanced: bool = False
 ) -> dict:
     """Run hyperparameter optimization.
 
@@ -358,12 +381,17 @@ def run_hyperopt(
         gap: Embargo gap in days
         min_fold_auc: Minimum AUC required on each fold
         variance_penalty: Weight for std penalty in objective
+        balanced: If True, use class weights (scale_pos_weight) for balanced training
 
     Returns:
         Dictionary with best params and results
     """
     print("=" * 60)
     print("LightGBM Hyperparameter Optimization")
+    if balanced:
+        print("  MODE: BALANCED (using class weights)")
+    else:
+        print("  MODE: IMBALANCED (no class weights)")
     print("=" * 60)
     print()
 
@@ -379,6 +407,15 @@ def run_hyperopt(
     feature_names = X.columns.tolist()
     X_np = X.values.astype(np.float32)
     y_np = y.values
+
+    # Compute scale_pos_weight if balanced mode
+    scale_pos_weight = None
+    if balanced:
+        scale_pos_weight = compute_scale_pos_weight(y_np)
+        print(f"\nClass balancing enabled:")
+        print(f"  Positive samples: {(y_np == 1).sum():,}")
+        print(f"  Negative samples: {(y_np == 0).sum():,}")
+        print(f"  scale_pos_weight: {scale_pos_weight:.3f}")
 
     # Generate CV splits
     print(f"\nGenerating {n_folds}-fold expanding CV splits with {gap}-day embargo...")
@@ -396,6 +433,8 @@ def run_hyperopt(
     print(f"  Min fold AUC: {min_fold_auc}")
     print(f"  Variance penalty: {variance_penalty}")
     print(f"  Objective: mean_auc - {variance_penalty} * std_auc")
+    if scale_pos_weight is not None:
+        print(f"  Class balancing: scale_pos_weight={scale_pos_weight:.3f}")
     print()
 
     sampler = TPESampler(seed=42)
@@ -414,7 +453,8 @@ def run_hyperopt(
         lambda trial: objective(
             trial, X_np, y_np, cv_splits, n_jobs_model,
             min_fold_auc=min_fold_auc,
-            variance_penalty=variance_penalty
+            variance_penalty=variance_penalty,
+            scale_pos_weight=scale_pos_weight
         ),
         n_trials=n_trials,
         timeout=timeout,
@@ -472,6 +512,9 @@ def run_hyperopt(
     best_params['elapsed_seconds'] = elapsed
     best_params['timestamp'] = datetime.now().isoformat()
     best_params['features'] = feature_names
+    best_params['balanced'] = balanced
+    if scale_pos_weight is not None:
+        best_params['scale_pos_weight'] = scale_pos_weight
 
     params_file = output_dir / 'best_params.json'
     with open(params_file, 'w') as f:
@@ -513,6 +556,10 @@ def run_hyperopt(
         'num_threads': n_jobs_model,
         **study.best_params
     }
+
+    # Add class weighting if used
+    if scale_pos_weight is not None:
+        final_params['scale_pos_weight'] = scale_pos_weight
 
     # Ensure num_leaves constraint
     max_leaves = 2 ** final_params['max_depth']
@@ -609,6 +656,8 @@ def main():
                         help='Minimum AUC required on each fold (trials below this are pruned)')
     parser.add_argument('--variance-penalty', type=float, default=1.0,
                         help='Penalty weight for std in objective (score = mean - penalty * std)')
+    parser.add_argument('--balanced', action='store_true',
+                        help='Use class weights (scale_pos_weight) for balanced training')
 
     args = parser.parse_args()
 
@@ -619,7 +668,8 @@ def main():
         n_folds=args.n_folds,
         gap=args.gap,
         min_fold_auc=args.min_fold_auc,
-        variance_penalty=args.variance_penalty
+        variance_penalty=args.variance_penalty,
+        balanced=args.balanced
     )
 
     return results

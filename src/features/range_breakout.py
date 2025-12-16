@@ -59,11 +59,11 @@ def add_range_breakout_features(
     df["hl_range_pct_close"] = _safe_div(hl_range, close)
 
     # --- True range & ATR ---
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low  - prev_close).abs()
-    ], axis=1).max(axis=1)
+    # Use np.maximum instead of pd.concat to avoid DataFrame fragmentation
+    tr = np.maximum(
+        np.maximum(high - low, (high - prev_close).abs()),
+        (low - prev_close).abs()
+    )
     df["true_range"] = tr
     df["tr_pct_close"] = _safe_div(tr, close)
 

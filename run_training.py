@@ -59,8 +59,15 @@ def load_selected_features() -> list[str]:
     return features
 
 
-def load_best_params() -> dict:
-    """Load the best hyperparameters from hyperopt output."""
+def load_best_params() -> tuple[dict, bool, float]:
+    """Load the best hyperparameters from hyperopt output.
+
+    Returns:
+        Tuple of (params, balanced, scale_pos_weight)
+        - params: dict of hyperparameters
+        - balanced: whether hyperopt was run with balanced mode
+        - scale_pos_weight: the weight used (or None if not balanced)
+    """
     params_file = Path('artifacts/hyperopt/best_params.json')
 
     if params_file.exists():
@@ -73,8 +80,12 @@ def load_best_params() -> dict:
             'subsample', 'subsample_freq', 'colsample_bytree', 'max_bin'
         ]
         params = {k: v for k, v in data.items() if k in param_keys}
+        balanced = data.get('balanced', False)
+        scale_pos_weight = data.get('scale_pos_weight', None)
         print(f"  Loaded hyperparameters from {params_file}")
-        return params
+        if balanced:
+            print(f"  Hyperopt was run with balanced=True, scale_pos_weight={scale_pos_weight:.3f}")
+        return params, balanced, scale_pos_weight
     else:
         # Default conservative parameters
         print("  Warning: No hyperopt results found, using default parameters")
@@ -91,7 +102,23 @@ def load_best_params() -> dict:
             'subsample_freq': 5,
             'colsample_bytree': 0.8,
             'max_bin': 255,
-        }
+        }, False, None
+
+
+def compute_scale_pos_weight(y: pd.Series) -> float:
+    """Compute scale_pos_weight for LightGBM class balancing.
+
+    scale_pos_weight = n_negative / n_positive
+
+    Args:
+        y: Binary target series (0/1)
+
+    Returns:
+        scale_pos_weight value for LightGBM
+    """
+    n_positive = (y == 1).sum()
+    n_negative = (y == 0).sum()
+    return n_negative / n_positive
 
 
 def load_training_data(
@@ -171,7 +198,8 @@ def train_production_model(
     X: pd.DataFrame,
     y: pd.Series,
     params: dict,
-    n_jobs: int = 8
+    n_jobs: int = 8,
+    scale_pos_weight: float = None
 ) -> lgb.LGBMClassifier:
     """Train the production model on all data.
 
@@ -180,6 +208,7 @@ def train_production_model(
         y: Target vector
         params: LightGBM hyperparameters
         n_jobs: Number of threads
+        scale_pos_weight: Class weight for balancing (n_neg/n_pos). None for no weighting.
 
     Returns:
         Trained LGBMClassifier
@@ -196,6 +225,11 @@ def train_production_model(
         'num_threads': n_jobs,
         **params
     }
+
+    # Add class weighting if specified
+    if scale_pos_weight is not None:
+        full_params['scale_pos_weight'] = scale_pos_weight
+        print(f"  Using class balancing: scale_pos_weight={scale_pos_weight:.3f}")
 
     # Ensure num_leaves constraint
     max_leaves = 2 ** full_params.get('max_depth', 6)
@@ -273,6 +307,8 @@ def save_model_artifacts(
         'n_samples': train_metrics['n_samples'],
         'positive_rate': train_metrics['positive_rate'],
         'date_range': train_metrics['date_range'],
+        'balanced': train_metrics.get('balanced', False),
+        'scale_pos_weight': train_metrics.get('scale_pos_weight'),
     }
 
     metadata_file = output_dir / 'model_metadata.json'
@@ -287,6 +323,10 @@ def main():
                         help='Output directory for model artifacts')
     parser.add_argument('--n-jobs', type=int, default=8,
                         help='Number of threads for training')
+    parser.add_argument('--balanced', action='store_true',
+                        help='Use class weights for balanced training (auto if hyperopt used --balanced)')
+    parser.add_argument('--no-balanced', action='store_true',
+                        help='Force disable balanced training even if hyperopt used it')
 
     args = parser.parse_args()
     output_dir = Path(args.output_dir)
@@ -301,13 +341,33 @@ def main():
     selected_features = load_selected_features()
     print(f"  {len(selected_features)} selected features")
 
-    params = load_best_params()
+    params, hyperopt_balanced, hyperopt_scale_pos_weight = load_best_params()
 
     # Load data
     X, y, metadata = load_training_data(selected_features)
 
+    # Determine whether to use balanced training
+    # Priority: --no-balanced > --balanced > hyperopt setting
+    if args.no_balanced:
+        scale_pos_weight = None
+        print("\n  Balanced training DISABLED (--no-balanced flag)")
+    elif args.balanced:
+        # Recompute scale_pos_weight from current data
+        scale_pos_weight = compute_scale_pos_weight(y)
+        print(f"\n  Balanced training ENABLED (--balanced flag)")
+        print(f"    scale_pos_weight: {scale_pos_weight:.3f}")
+    elif hyperopt_balanced and hyperopt_scale_pos_weight is not None:
+        # Use the weight from hyperopt (recalculate to match current data)
+        scale_pos_weight = compute_scale_pos_weight(y)
+        print(f"\n  Balanced training ENABLED (from hyperopt config)")
+        print(f"    scale_pos_weight: {scale_pos_weight:.3f}")
+        print(f"    (hyperopt used: {hyperopt_scale_pos_weight:.3f})")
+    else:
+        scale_pos_weight = None
+        print("\n  Balanced training: disabled")
+
     # Train model
-    model = train_production_model(X, y, params, n_jobs=args.n_jobs)
+    model = train_production_model(X, y, params, n_jobs=args.n_jobs, scale_pos_weight=scale_pos_weight)
 
     # Calculate metrics for metadata
     X_clean = X.fillna(0).replace([np.inf, -np.inf], 0)
@@ -319,6 +379,8 @@ def main():
         'n_samples': len(y),
         'positive_rate': y.mean(),
         'date_range': [str(metadata['date'].min()), str(metadata['date'].max())],
+        'balanced': scale_pos_weight is not None,
+        'scale_pos_weight': scale_pos_weight,
     }
 
     # Save artifacts

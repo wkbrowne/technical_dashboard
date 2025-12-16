@@ -10,6 +10,7 @@ each symbol only depends on its own return series and pre-computed benchmark ret
 """
 import logging
 import os
+import warnings
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
@@ -42,8 +43,11 @@ def _rolling_beta_alpha(ret: pd.Series, bench_ret: pd.Series, win: int, min_peri
         min_periods = max(20, win // 3)
 
     # Rolling covariance and variance with min_periods to handle NaN gaps
-    cov = ret.rolling(win, min_periods=min_periods).cov(bench_ret)
-    var = bench_ret.rolling(win, min_periods=min_periods).var()
+    # Suppress numpy warnings from covariance calculation (expected when variance is 0 or NaN present)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        cov = ret.rolling(win, min_periods=min_periods).cov(bench_ret)
+        var = bench_ret.rolling(win, min_periods=min_periods).var()
 
     # Beta calculation
     beta = cov / var.replace(0, np.nan)
@@ -97,7 +101,8 @@ def _compute_alpha_batch(
     market_symbol: str,
     beta_win: int,
     windows: Tuple[int, ...],
-    ema_span: int
+    ema_span: int,
+    qqq_symbol: str = "QQQ"
 ) -> List[Tuple[str, Dict[str, pd.Series]]]:
     """
     Process a batch of symbols for alpha computation to reduce IPC overhead.
@@ -109,6 +114,7 @@ def _compute_alpha_batch(
         beta_win: Rolling window for beta/alpha calculation
         windows: Momentum calculation windows
         ema_span: EMA span for smoothing
+        qqq_symbol: Symbol used as QQQ benchmark (growth/liquidity factor)
 
     Returns:
         List of (symbol, alpha_features_dict) tuples
@@ -117,7 +123,7 @@ def _compute_alpha_batch(
     for sym, ret_index, ret_values, sector_etf in work_items_batch:
         alpha_features = _compute_alpha_for_symbol(
             sym, ret_index, ret_values, benchmarks, sector_etf,
-            market_symbol, beta_win, windows, ema_span
+            market_symbol, beta_win, windows, ema_span, qqq_symbol
         )
         results.append((sym, alpha_features))
     return results
@@ -137,7 +143,8 @@ def _compute_alpha_for_symbol(
     market_symbol: str,
     beta_win: int,
     windows: Tuple[int, ...],
-    ema_span: int
+    ema_span: int,
+    qqq_symbol: str = "QQQ"
 ) -> Dict[str, pd.Series]:
     """
     Compute alpha momentum features for a single symbol.
@@ -154,6 +161,7 @@ def _compute_alpha_for_symbol(
         beta_win: Rolling window for beta/alpha calculation
         windows: Momentum calculation windows
         ema_span: EMA span for smoothing
+        qqq_symbol: Symbol for QQQ benchmark (growth/liquidity factor)
 
     Returns:
         Dict mapping column_name -> pd.Series with computed alpha features
@@ -161,12 +169,13 @@ def _compute_alpha_for_symbol(
     result = {}
     r = pd.Series(ret_values, index=ret_index, dtype='float64')
 
-    # Skip if this is the market benchmark
-    if sym == market_symbol:
+    # Skip if this is a benchmark symbol
+    if sym == market_symbol or sym == qqq_symbol:
         return result
 
     alpha_mkt = None
     alpha_sec = None
+    alpha_qqq = None
 
     # Market alpha (vs SPY)
     if market_symbol in benchmarks:
@@ -181,6 +190,21 @@ def _compute_alpha_for_symbol(
             alpha_mkt, windows=windows, ema_span=ema_span, prefix="alpha_mom_spy"
         )
         result.update(mkt_feats)
+
+    # QQQ alpha (vs QQQ - growth/liquidity factor)
+    # Applied to ALL stocks regardless of sector to capture growth sensitivity
+    if qqq_symbol in benchmarks:
+        qqq_idx, qqq_vals = benchmarks[qqq_symbol]
+        qqq_ret = pd.Series(qqq_vals, index=qqq_idx, dtype='float64').reindex(ret_index)
+        beta_qqq, alpha_qqq = _rolling_beta_alpha(r, qqq_ret, win=beta_win)
+        result['beta_qqq'] = beta_qqq
+        result['alpha_resid_qqq'] = alpha_qqq
+
+        # Create momentum features from QQQ alpha
+        qqq_feats = _alpha_momentum_from_residual(
+            alpha_qqq, windows=windows, ema_span=ema_span, prefix="alpha_mom_qqq"
+        )
+        result.update(qqq_feats)
 
     # Sector alpha (vs sector ETF)
     if symbol_sector_etf and symbol_sector_etf in benchmarks:
@@ -204,6 +228,20 @@ def _compute_alpha_for_symbol(
         )
         result.update(combo_feats)
 
+    # SPY-QQQ spread alpha (captures value vs growth positioning)
+    # This is the difference in alpha residuals - positive means stock outperforms
+    # its expected QQQ-based return MORE than its expected SPY-based return
+    if alpha_mkt is not None and alpha_qqq is not None:
+        # Difference shows growth vs broad market tilt in alpha generation
+        alpha_qqq_vs_spy = alpha_qqq - alpha_mkt
+        result['alpha_qqq_vs_spy'] = alpha_qqq_vs_spy.astype('float32')
+
+        # Momentum of the spread
+        spread_feats = _alpha_momentum_from_residual(
+            alpha_qqq_vs_spy, windows=windows, ema_span=ema_span, prefix="alpha_mom_qqq_spread"
+        )
+        result.update(spread_feats)
+
     return result
 
 
@@ -212,21 +250,27 @@ def add_alpha_momentum_features(
     sectors: Optional[Dict[str, str]] = None,
     sector_to_etf: Optional[Dict[str, str]] = None,
     market_symbol: str = "SPY",
+    qqq_symbol: str = "QQQ",
     beta_win: int = 60,
     windows: Tuple[int, ...] = (20, 60, 120),
     ema_span: int = 10,
     n_jobs: int = -1
 ) -> None:
     """
-    Add alpha momentum features based on CAPM residuals vs market and sector benchmarks.
+    Add alpha momentum features based on CAPM residuals vs market, QQQ, and sector benchmarks.
 
     This function is parallelized across symbols using joblib.
 
     Features added (if benchmarks available):
-    - alpha_resid_spy: CAPM alpha residuals vs market
+    - beta_spy, alpha_resid_spy: CAPM beta/alpha residuals vs market
     - alpha_mom_spy_ema{ema_span}: EMA of market alpha residuals
     - alpha_mom_spy_{w}_ema{ema_span}: EMA of {w}-day cumulative market alpha
-    - alpha_resid_sector: CAPM alpha residuals vs sector
+    - beta_qqq, alpha_resid_qqq: CAPM beta/alpha residuals vs QQQ (growth factor)
+    - alpha_mom_qqq_ema{ema_span}: EMA of QQQ alpha residuals
+    - alpha_mom_qqq_{w}_ema{ema_span}: EMA of {w}-day cumulative QQQ alpha
+    - alpha_qqq_vs_spy: Difference in alpha (QQQ - SPY) capturing growth vs value tilt
+    - alpha_mom_qqq_spread_*: Momentum of the QQQ-SPY alpha spread
+    - beta_sector, alpha_resid_sector: CAPM beta/alpha residuals vs sector
     - alpha_mom_sector_ema{ema_span}: EMA of sector alpha residuals
     - alpha_mom_sector_{w}_ema{ema_span}: EMA of {w}-day cumulative sector alpha
     - alpha_mom_combo_*: Blended features (50/50 market/sector) if both exist
@@ -235,13 +279,14 @@ def add_alpha_momentum_features(
         indicators_by_symbol: Dictionary of symbol DataFrames (modified in place)
         sectors: Optional mapping of symbol -> sector name
         sector_to_etf: Optional mapping of lowercase sector name -> ETF symbol
-        market_symbol: Symbol to use as market benchmark
+        market_symbol: Symbol to use as market benchmark (default: SPY)
+        qqq_symbol: Symbol to use as growth/liquidity benchmark (default: QQQ)
         beta_win: Rolling window for beta/alpha calculation
         windows: Momentum calculation windows
         ema_span: EMA span for smoothing momentum features
         n_jobs: Number of parallel jobs (-1 for all cores)
     """
-    logger.info(f"Computing alpha momentum features using {market_symbol} as market benchmark (parallel)")
+    logger.info(f"Computing alpha momentum features using {market_symbol} and {qqq_symbol} as benchmarks (parallel)")
 
     # Pre-build sector ETF mapping (lowercase)
     sec_map_lc = {k.lower(): v for k, v in (sector_to_etf or {}).items()}
@@ -251,7 +296,7 @@ def add_alpha_momentum_features(
     # =========================================================================
     benchmarks: Dict[str, Tuple[pd.Index, np.ndarray]] = {}
 
-    # Market benchmark
+    # Market benchmark (SPY)
     mkt_df = indicators_by_symbol.get(market_symbol)
     if mkt_df is not None and 'ret' in mkt_df.columns:
         mkt_ret = pd.to_numeric(mkt_df['ret'], errors='coerce')
@@ -259,6 +304,15 @@ def add_alpha_momentum_features(
         logger.debug(f"Loaded {market_symbol} returns: {len(mkt_ret)} data points")
     else:
         logger.warning(f"{market_symbol} missing or has no 'ret' column")
+
+    # QQQ benchmark (growth/liquidity factor)
+    qqq_df = indicators_by_symbol.get(qqq_symbol)
+    if qqq_df is not None and 'ret' in qqq_df.columns:
+        qqq_ret = pd.to_numeric(qqq_df['ret'], errors='coerce')
+        benchmarks[qqq_symbol] = (qqq_ret.index, qqq_ret.values)
+        logger.debug(f"Loaded {qqq_symbol} returns: {len(qqq_ret)} data points")
+    else:
+        logger.warning(f"{qqq_symbol} missing or has no 'ret' column - QQQ features will be skipped")
 
     # Sector ETF returns
     if sectors and sector_to_etf:
@@ -300,7 +354,8 @@ def add_alpha_momentum_features(
     for sym, df in indicators_by_symbol.items():
         if 'ret' not in df.columns or 'adjclose' not in df.columns:
             continue
-        if sym == market_symbol:
+        # Skip benchmark symbols (SPY and QQQ)
+        if sym == market_symbol or sym == qqq_symbol:
             continue
 
         r = pd.to_numeric(df['ret'], errors='coerce')
@@ -333,7 +388,7 @@ def add_alpha_momentum_features(
         for sym, ret_index, ret_values, sector_etf in work_items:
             alpha_features = _compute_alpha_for_symbol(
                 sym, ret_index, ret_values, benchmarks, sector_etf,
-                market_symbol, beta_win, windows, ema_span
+                market_symbol, beta_win, windows, ema_span, qqq_symbol
             )
             results.append((sym, alpha_features))
     else:
@@ -348,7 +403,7 @@ def add_alpha_momentum_features(
                 prefer='processes'
             )(
                 delayed(_compute_alpha_batch)(
-                    chunk, benchmarks, market_symbol, beta_win, windows, ema_span
+                    chunk, benchmarks, market_symbol, beta_win, windows, ema_span, qqq_symbol
                 )
                 for chunk in work_chunks
             )
@@ -364,7 +419,7 @@ def add_alpha_momentum_features(
             for sym, ret_index, ret_values, sector_etf in work_items:
                 alpha_features = _compute_alpha_for_symbol(
                     sym, ret_index, ret_values, benchmarks, sector_etf,
-                    market_symbol, beta_win, windows, ema_span
+                    market_symbol, beta_win, windows, ema_span, qqq_symbol
                 )
                 results.append((sym, alpha_features))
 

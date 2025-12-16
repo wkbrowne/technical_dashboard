@@ -29,6 +29,7 @@ ETF Symbols Used:
 - XLF: Financials (rate sensitive)
 """
 import logging
+import warnings
 from typing import Dict, Optional, List
 import numpy as np
 import pandas as pd
@@ -133,7 +134,10 @@ def _compute_rolling_corr(
     window: int = 60
 ) -> pd.Series:
     """Compute rolling correlation between two series."""
-    return series1.rolling(window, min_periods=30).corr(series2)
+    # Suppress numpy warnings from correlation calculation (expected when variance is 0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return series1.rolling(window, min_periods=30).corr(series2)
 
 
 def add_cross_asset_features(

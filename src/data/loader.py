@@ -37,24 +37,64 @@ def _save_long_parquet(data_dict: Dict[str, pd.DataFrame], parquet_path: str) ->
 
 
 def _load_long_parquet(parquet_path: str) -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    Load parquet file in either long format or raw OHLCV format.
+
+    Supports two formats:
+    1. Long format: columns = [date, symbol, metric, value] - pivot to {metric: wide DataFrame}
+    2. Raw format: columns = [Open, High, Low, Close, AdjClose, Volume, symbol, date] - convert to same structure
+
+    Returns None if format is unrecognized or data is invalid.
+    """
     if not os.path.exists(parquet_path):
         return None
     df = pd.read_parquet(parquet_path)
-    if df.empty or not {'date', 'symbol', 'metric', 'value'}.issubset(df.columns):
+    if df.empty:
         return None
-    out: Dict[str, pd.DataFrame] = {}
-    for metric, chunk in df.groupby('metric'):
-        out[str(metric)] = chunk.pivot(index='date', columns='symbol', values='value').sort_index()
-    return out
+
+    # Format 1: Long format with [date, symbol, metric, value]
+    if {'date', 'symbol', 'metric', 'value'}.issubset(df.columns):
+        # Filter out invalid symbols (file names like 'fred_data', lowercase, underscores)
+        valid_symbol_mask = df['symbol'].str.match(r'^[A-Z\^][A-Z0-9\.]*$', na=False)
+        invalid_symbols = df.loc[~valid_symbol_mask, 'symbol'].unique()
+        if len(invalid_symbols) > 0:
+            print(f"⚠️  Filtering {len(invalid_symbols)} invalid symbols: {list(invalid_symbols)[:5]}")
+            df = df[valid_symbol_mask]
+
+        out: Dict[str, pd.DataFrame] = {}
+        for metric, chunk in df.groupby('metric'):
+            out[str(metric)] = chunk.pivot(index='date', columns='symbol', values='value').sort_index()
+        return out
+
+    # Format 2: Raw OHLCV format with symbol and date columns (from new download CLI)
+    ohlcv_cols = ['Open', 'High', 'Low', 'Close', 'AdjClose', 'Volume']
+    if 'symbol' in df.columns and 'date' in df.columns and any(col in df.columns for col in ohlcv_cols):
+        print("📊 Converting raw format with dates to wide format...")
+        df['date'] = pd.to_datetime(df['date'])
+        df['symbol'] = df['symbol'].astype('string')
+
+        out: Dict[str, pd.DataFrame] = {}
+        for metric in ohlcv_cols:
+            if metric in df.columns:
+                out[metric] = df.pivot(index='date', columns='symbol', values=metric).sort_index()
+        return out if out else None
+
+    # Format 3: Raw OHLCV format WITHOUT date column - invalid, skip this file
+    if 'symbol' in df.columns and any(col in df.columns for col in ohlcv_cols):
+        print(f"⚠️  Cache file {parquet_path} missing date column - falling back to legacy cache")
+        return None
+
+    return None
 
 
 # ---------- Robust GET w/ retries ----------
 def _request_with_retries(url: str, headers: dict, params: dict,
-                          max_retries: int = 4, base_sleep: float = 2.0) -> requests.Response:
+                          max_retries: int = 4, base_sleep: float = 2.0,
+                          verify_ssl: bool = True) -> requests.Response:
     last_err = None
     for attempt in range(max_retries):
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=(10, 30))
+            resp = requests.get(url, headers=headers, params=params, timeout=(10, 30), verify=verify_ssl)
             if 200 <= resp.status_code < 300:
                 return resp
             if resp.status_code == 429:
@@ -77,6 +117,9 @@ def _request_with_retries(url: str, headers: dict, params: dict,
 
 
 # ---------- Yahoo (RapidAPI) fetch ----------
+# Set to False to bypass SSL verification (use if RapidAPI has cert issues)
+VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() not in ("false", "0", "no")
+
 def get_stock_data(symbol: str, interval: str = "1d", original_symbol: Optional[str] = None) -> Optional[pd.DataFrame]:
     """
     Fetch historical OHLCV from Yahoo Finance (via RapidAPI yahoo-finance15).
@@ -93,7 +136,7 @@ def get_stock_data(symbol: str, interval: str = "1d", original_symbol: Optional[
 
     print(f"↪ {original_symbol or symbol} …", end="", flush=True)
     try:
-        resp = _request_with_retries(url, headers, params, max_retries=4, base_sleep=2.0)
+        resp = _request_with_retries(url, headers, params, max_retries=4, base_sleep=2.0, verify_ssl=VERIFY_SSL)
         data = resp.json()
     except Exception as e:
         print(f" fail ({type(e).__name__})")
@@ -138,20 +181,125 @@ def _discover_universe_csv(cache_file: str) -> str:
         raise FileNotFoundError("No universe CSV found in cache directory.")
     return os.path.join(cache_dir, sorted(cands)[0])
 
-def _symbols_from_csv(path: str, max_symbols: Optional[int] = None) -> List[str]:
+
+def _filter_untradeable_securities(df: pd.DataFrame, sym_col: str, desc_col: Optional[str] = None) -> pd.DataFrame:
+    """
+    Filter out SPACs, ADRs, warrants, units, and other untradeable securities.
+
+    Filtering rules:
+    1. SPACs: Description contains "Acquisition" (case-insensitive)
+    2. ADRs: Description contains "ADR" or symbol ends with common ADR suffixes
+    3. Warrants: Symbol contains "W" suffix pattern (e.g., FOOW, FOO.W, FOO/W)
+    4. Units: Symbol contains "U" suffix pattern or "/U"
+    5. Foreign listings: Symbol ends with "F" (foreign ordinary shares)
+    6. Rights: Symbol contains "R" suffix pattern
+    7. Preferred shares: Symbol contains "P" suffix (e.g., BAC.PR.A, BAC-P)
+
+    Args:
+        df: DataFrame with at least a symbol column
+        sym_col: Name of the symbol column
+        desc_col: Name of the description column (optional, for SPAC/ADR detection)
+
+    Returns:
+        Filtered DataFrame
+    """
+    original_count = len(df)
+    mask = pd.Series(True, index=df.index)
+
+    # Get symbols for pattern matching
+    symbols = df[sym_col].astype(str).str.upper()
+
+    # 1. Filter by symbol patterns (warrants, units, rights, preferred, foreign)
+    # Be CONSERVATIVE - only filter obvious derivative patterns with separators
+
+    # Warrants: .W, /W, -W, or WS suffix (require separator to avoid false positives like ACIW, CDW)
+    warrant_pattern = r'[.\-/]W[S]?$'
+    mask &= ~symbols.str.contains(warrant_pattern, regex=True, na=False)
+
+    # Units: .U, /U, -U (require separator)
+    unit_pattern = r'[.\-/]U$'
+    mask &= ~symbols.str.contains(unit_pattern, regex=True, na=False)
+
+    # Rights: .R, /R, -R (require separator)
+    rights_pattern = r'[.\-/]R$'
+    mask &= ~symbols.str.contains(rights_pattern, regex=True, na=False)
+
+    # Preferred: .PR, -PR, /PR, or .P, -P, /P followed by letter (e.g., BAC.PRA)
+    preferred_pattern = r'[.\-/]PR?[A-Z]?$'
+    mask &= ~symbols.str.contains(preferred_pattern, regex=True, na=False)
+
+    # Foreign ordinary shares: .F or /F only (require separator)
+    foreign_pattern = r'[.\-/]F$'
+    mask &= ~symbols.str.contains(foreign_pattern, regex=True, na=False)
+
+    # 2. Filter by description if available
+    if desc_col and desc_col in df.columns:
+        descriptions = df[desc_col].astype(str).str.upper()
+
+        # SPACs: Description contains "Acquisition Corp/Inc/Company" pattern (more specific to avoid "GE Aerospace")
+        # Must have "Acquisition" followed by Corp/Corporation/Co/Company/Inc/Limited
+        spac_pattern = r'ACQUISITION\s+(?:CORP|CO\b|COMPANY|LIMITED|INC)'
+        mask &= ~descriptions.str.contains(spac_pattern, regex=True, na=False)
+
+        # ADRs: Description contains "ADR", "American Depositary", "Depositary Share/Receipt"
+        # More specific - require word boundary or "ADS-" prefix, not just "ADS" anywhere
+        adr_pattern = r'\bADR\b|AMERICAN DEPOSITARY|DEPOSITARY SHARE|DEPOSITARY RECEIPT|^ADS-'
+        mask &= ~descriptions.str.contains(adr_pattern, regex=True, na=False)
+
+        # Blank Check Companies
+        blank_check_pattern = r'BLANK CHECK'
+        mask &= ~descriptions.str.contains(blank_check_pattern, regex=True, na=False)
+
+    filtered_df = df[mask].copy()
+    removed_count = original_count - len(filtered_df)
+
+    if removed_count > 0:
+        print(f"   🚫 Filtered {removed_count} untradeable securities (SPACs, ADRs, warrants, etc.)")
+
+    return filtered_df
+
+
+def _symbols_from_csv(path: str, max_symbols: Optional[int] = None, filter_untradeable: bool = True) -> List[str]:
+    """
+    Load symbols from CSV, optionally filtering out untradeable securities.
+
+    Args:
+        path: Path to CSV file
+        max_symbols: Maximum number of symbols to return
+        filter_untradeable: If True, filter out SPACs, ADRs, warrants, etc.
+
+    Returns:
+        List of symbol strings
+    """
     df = pd.read_csv(path)
     col = "Symbol" if "Symbol" in df.columns else next((c for c in df.columns if "symbol" in c.lower()), None)
     if not col:
         raise ValueError(f"No symbol column in {path}. Columns: {list(df.columns)}")
+
+    # Apply filtering if requested
+    if filter_untradeable:
+        desc_col = "Description" if "Description" in df.columns else next(
+            (c for c in df.columns if "description" in c.lower()), None
+        )
+        df = _filter_untradeable_securities(df, col, desc_col)
+
     syms = df[col].dropna().astype(str).tolist()
     if max_symbols and max_symbols > 0:
         syms = syms[:max_symbols]
     return syms
 
-def _sectors_from_universe(path: str, max_symbols: Optional[int] = None) -> Dict[str, str]:
+def _sectors_from_universe(path: str, max_symbols: Optional[int] = None, filter_untradeable: bool = True) -> Dict[str, str]:
     """
     Returns a dict: {symbol -> sector} from the universe CSV.
     Keeps the sector text as-is (strip/normalize whitespace & capitalization lightly).
+
+    Args:
+        path: Path to universe CSV file
+        max_symbols: Maximum number of symbols to return
+        filter_untradeable: If True, filter out SPACs, ADRs, warrants, etc.
+
+    Returns:
+        Dictionary mapping symbol -> sector
     """
     df = pd.read_csv(path)
     # Detect columns (robust to case/spacing)
@@ -159,6 +307,13 @@ def _sectors_from_universe(path: str, max_symbols: Optional[int] = None) -> Dict
     sec_col = "Sector" if "Sector" in df.columns else next((c for c in df.columns if "sector" in c.lower()), None)
     if not sym_col or not sec_col:
         raise ValueError(f"No Symbol/Sector columns in {path}. Columns: {list(df.columns)}")
+
+    # Apply filtering if requested
+    if filter_untradeable:
+        desc_col = "Description" if "Description" in df.columns else next(
+            (c for c in df.columns if "description" in c.lower()), None
+        )
+        df = _filter_untradeable_securities(df, sym_col, desc_col)
 
     out = (df[[sym_col, sec_col]]
            .dropna(subset=[sym_col])
@@ -266,48 +421,80 @@ def load_stock_universe(max_symbols: Optional[int] = None,
                         include_sectors: bool = False
                         ) -> Union[Dict[str, pd.DataFrame], Tuple[Dict[str, pd.DataFrame], Dict[str, str]]]:
     """
-    Load stock OHLCV into dict of wide DataFrames. Caches to *_universe.parquet.
+    Load stock OHLCV into dict of wide DataFrames. Caches to *_universe.parquet or *_combined.parquet.
     If include_sectors=True, returns a tuple: (data, sectors_map)
     where sectors_map is {symbol -> sector} from the universe CSV.
-    """
-    # Cache path
-    cache_parquet = (CACHE_FILE.with_name(CACHE_FILE.stem + "_universe.parquet")
-                     if hasattr(CACHE_FILE, "with_name") else str(CACHE_FILE).replace(".pkl", "_universe.parquet"))
 
-    # Try cache (OHLCV only; sectors always re-read from CSV for freshness)
-    if not update and os.path.exists(cache_parquet):
-        print(f"💾 stocks: loading cache {cache_parquet}")
-        cached = _load_long_parquet(cache_parquet)
-        if cached:
-            if include_sectors:
-                universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
-                sectors = _sectors_from_universe(universe_csv, max_symbols=max_symbols)
-                
-                # Apply max_symbols limit to cached data to match sector mappings
-                if max_symbols:
-                    limited_symbols = list(sectors.keys())  # These are already limited by max_symbols
-                    cached_limited = {}
-                    for metric, df in cached.items():
-                        # Only keep columns (symbols) that are in the limited sectors list
-                        available_symbols = [sym for sym in limited_symbols if sym in df.columns]
-                        cached_limited[metric] = df[available_symbols] if available_symbols else df.iloc[:, :0]
-                    cached = cached_limited
-                    print(f"📊 Applied max_symbols limit: reduced to {len(limited_symbols)} symbols")
-                
-                return cached, sectors
-            
-            # Apply max_symbols limit even when not including sectors
-            if max_symbols:
-                universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
-                limited_symbols = _symbols_from_csv(universe_csv, max_symbols=max_symbols)
-                cached_limited = {}
-                for metric, df in cached.items():
-                    available_symbols = [sym for sym in limited_symbols if sym in df.columns]
-                    cached_limited[metric] = df[available_symbols] if available_symbols else df.iloc[:, :0]
-                cached = cached_limited
-                
-            return cached
-        print("⚠️  cache empty/corrupt — fetching")
+    Cache selection logic:
+    - Prefers *_combined.parquet (created by download CLI) if it exists and is newer
+    - Falls back to *_universe.parquet (legacy cache format)
+    """
+    # Cache paths - check both legacy and combined formats
+    cache_dir = CACHE_FILE.parent if hasattr(CACHE_FILE, "parent") else os.path.dirname(str(CACHE_FILE))
+    cache_stem = CACHE_FILE.stem if hasattr(CACHE_FILE, "stem") else os.path.splitext(os.path.basename(str(CACHE_FILE)))[0]
+
+    universe_parquet = os.path.join(cache_dir, f"{cache_stem}_universe.parquet")
+    combined_parquet = os.path.join(cache_dir, f"{cache_stem}_combined.parquet")
+
+    # Determine cache preference order (prefer combined if newer)
+    cache_preference = []
+    if os.path.exists(combined_parquet) and os.path.exists(universe_parquet):
+        combined_mtime = os.path.getmtime(combined_parquet)
+        universe_mtime = os.path.getmtime(universe_parquet)
+        if combined_mtime > universe_mtime:
+            cache_preference = [combined_parquet, universe_parquet]
+        else:
+            cache_preference = [universe_parquet, combined_parquet]
+    elif os.path.exists(combined_parquet):
+        cache_preference = [combined_parquet]
+    elif os.path.exists(universe_parquet):
+        cache_preference = [universe_parquet]
+
+    # Try cache files in preference order (OHLCV only; sectors always re-read from CSV for freshness)
+    cached = None
+    cache_parquet = None
+    if not update:
+        for cache_path in cache_preference:
+            print(f"💾 stocks: trying cache {cache_path}")
+            cached = _load_long_parquet(cache_path)
+            if cached:
+                cache_parquet = cache_path
+                print(f"✅ stocks: loaded from {cache_path}")
+                break
+            else:
+                print(f"⚠️  Cache {cache_path} invalid, trying next...")
+
+    if not update and cached:
+        if include_sectors:
+            universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
+            sectors = _sectors_from_universe(universe_csv, max_symbols=max_symbols)
+
+            # ALWAYS filter cached data to match filtered sectors (removes SPACs, ADRs, etc.)
+            # The sectors dict has already filtered out untradeable securities
+            filtered_symbols = list(sectors.keys())
+            cached_limited = {}
+            for metric, df in cached.items():
+                available_symbols = [sym for sym in filtered_symbols if sym in df.columns]
+                cached_limited[metric] = df[available_symbols] if available_symbols else df.iloc[:, :0]
+            cached = cached_limited
+            print(f"📊 Filtered to {len(filtered_symbols)} tradeable symbols (removed SPACs, ADRs, etc.)")
+
+            return cached, sectors
+
+        # When not including sectors, still filter out untradeable securities
+        universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
+        filtered_symbols = _symbols_from_csv(universe_csv, max_symbols=max_symbols)
+        cached_limited = {}
+        for metric, df in cached.items():
+            available_symbols = [sym for sym in filtered_symbols if sym in df.columns]
+            cached_limited[metric] = df[available_symbols] if available_symbols else df.iloc[:, :0]
+        cached = cached_limited
+        print(f"📊 Filtered to {len(filtered_symbols)} tradeable symbols")
+
+        return cached
+
+    # No valid cache found - fetch from API
+    print("⚠️  No valid cache found — fetching from API...")
 
     # Discover symbols & sectors from stock universe CSV
     universe_csv = _discover_universe_csv(CACHE_FILE if isinstance(CACHE_FILE, str) else str(CACHE_FILE))
@@ -319,11 +506,13 @@ def load_stock_universe(max_symbols: Optional[int] = None,
     # Fetch & cache
     data = _fetch_symbols(symbols, interval=interval, rate_limit=rate_limit)
     if not data:
-        print("❌ no stock data fetched"); 
+        print("❌ no stock data fetched");
         return (None, sectors) if include_sectors else None
 
-    print(f"💾 stocks: writing {cache_parquet}")
-    _save_long_parquet(data, cache_parquet)
+    # Save to universe cache (default location for API-fetched data)
+    save_path = universe_parquet
+    print(f"💾 stocks: writing {save_path}")
+    _save_long_parquet(data, save_path)
     return (data, sectors) if include_sectors else data
 
 
