@@ -42,6 +42,12 @@ try:
 except ImportError:
     from src.config.parallel import calculate_workers_from_items, DEFAULT_STOCKS_PER_WORKER
 
+# Import spread features for bestmatch-SPY spread computation
+try:
+    from .spread_features import compute_bestmatch_spread_features, DAILY_WINDOWS as SPREAD_DAILY_WINDOWS
+except ImportError:
+    from src.features.spread_features import compute_bestmatch_spread_features, DAILY_WINDOWS as SPREAD_DAILY_WINDOWS
+
 logger = logging.getLogger(__name__)
 
 # Default beta windows - matches existing alpha.py
@@ -538,6 +544,26 @@ def compute_joint_factor_features_for_symbol(
             result[f'{prefix}{feat_name}{win_suffix}'] = pd.Series(
                 feat_vals, index=ret_index, dtype='float32'
             )
+
+    # Compute bestmatch-SPY spread features if best_match_etf is available
+    if best_match_etf and best_match_etf in factor_returns and MARKET_FACTOR in factor_returns:
+        bm_idx, bm_vals = factor_returns[best_match_etf]
+        bm_ret = pd.Series(bm_vals, index=bm_idx, dtype='float64')
+        mkt_idx, mkt_vals = factor_returns[MARKET_FACTOR]
+        spy_ret = pd.Series(mkt_vals, index=mkt_idx, dtype='float64')
+
+        # Use appropriate windows based on frequency
+        spread_windows = SPREAD_DAILY_WINDOWS if frequency == 'daily' else (4, 12, 24)
+
+        # Compute spread features (bestmatch - SPY)
+        spread_features = compute_bestmatch_spread_features(
+            stock_ret_index=ret_index,
+            bestmatch_ret=bm_ret,
+            spy_ret=spy_ret,
+            windows=spread_windows,
+            prefix=prefix
+        )
+        result.update(spread_features)
 
     # Store best-match info
     if best_match_etf:

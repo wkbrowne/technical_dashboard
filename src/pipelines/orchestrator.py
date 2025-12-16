@@ -29,6 +29,7 @@ try:
     from ..features.assemble import assemble_indicators_from_wide
     from ..features.single_stock import compute_single_stock_features
     from ..features.cross_sectional import compute_cross_sectional_features, compute_weekly_cross_sectional_features
+    from ..features.spread_features import add_spread_features, add_weekly_spread_features
     from ..features.postprocessing import interpolate_internal_gaps, drop_rows_with_excessive_nans
     from ..features.ohlc_adjustment import adjust_ohlc_to_adjclose
     from ..features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
@@ -51,6 +52,7 @@ except ImportError:
     from src.features.assemble import assemble_indicators_from_wide
     from src.features.single_stock import compute_single_stock_features
     from src.features.cross_sectional import compute_cross_sectional_features, compute_weekly_cross_sectional_features
+    from src.features.spread_features import add_spread_features, add_weekly_spread_features
     from src.features.postprocessing import interpolate_internal_gaps, drop_rows_with_excessive_nans
     from src.features.ohlc_adjustment import adjust_ohlc_to_adjclose
     from src.features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
@@ -1021,6 +1023,11 @@ def run_pipeline_v2(
             # Shut down loky workers after cross-sectional to free memory
             shutdown_loky_workers()
 
+    # Step 2b: Add daily spread features (QQQ, SPY, QQQ-SPY, RSP-SPY)
+    # These are market-level features broadcast to all symbols
+    with profile_stage("Daily Spread Features"):
+        add_spread_features(indicators_by_symbol, lag_days=1)
+
     # Step 3: Add higher timeframe features (W/M) - compute alongside daily features
     higher_tfs = [tf for tf in timeframes if tf in ['W', 'M']]
     if higher_tfs:
@@ -1049,6 +1056,10 @@ def run_pipeline_v2(
             )
             # Shut down loky workers after weekly CS features to free memory
             shutdown_loky_workers()
+
+        # Step 3c: Add weekly spread features (QQQ, SPY, QQQ-SPY, RSP-SPY on weekly data)
+        with profile_stage("Weekly Spread Features"):
+            add_weekly_spread_features(indicators_by_symbol, prefix="w_")
 
     # Step 4: Interpolate NaNs (applies to daily AND higher TF features)
     with profile_stage("NaN Interpolation"):
