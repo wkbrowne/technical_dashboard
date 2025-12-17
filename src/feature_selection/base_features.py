@@ -198,8 +198,9 @@ BASE_FEATURES = [
     "xsec_mom_20d_z",            # Cross-sectional momentum z-score
     "w_xsec_mom_4w_z",           # Weekly cross-sectional z-score
 
-    # === BREADTH (1) ===
-    "w_ad_ratio_universe",       # Weekly advance-decline ratio
+    # === SECTOR BREADTH PROXY (2) ===
+    "sector_breadth_pct_above_ma200",  # Slow structural regime (% sectors above 200d MA)
+    "sector_breadth_mcclellan_osc",    # Fast breadth momentum (EMA(19) - EMA(39) of net adv)
 
     # === LIQUIDITY / VOLUME (2) ===
     "upper_shadow_ratio",        # Selling pressure (candlestick)
@@ -356,13 +357,15 @@ FEATURE_CATEGORIES = {
         "w_rel_strength_sector",
     ],
     "breadth": [
-        "ad_ratio_ema10",
-        "ad_ratio_universe",
-        "ad_thrust_10d",
-        "mcclellan_oscillator",
-        "pct_universe_above_ma20",
-        "pct_universe_above_ma50",
-        "w_ad_ratio_universe",
+        # Sector ETF Breadth Proxy (11 Select Sector SPDRs)
+        # These replace the old stock-universe breadth features
+        "sector_breadth_pct_above_ma50",    # Tactical participation (50d MA)
+        "sector_breadth_pct_above_ma200",   # Structural regime (200d MA)
+        "sector_breadth_mcclellan_osc",     # Breadth momentum (fast)
+        "sector_breadth_ad_line",           # Cumulative A/D line (slow drift)
+        "w_sector_breadth_pct_above_ma10",  # Weekly 10-week ≈ 50d
+        "w_sector_breadth_pct_above_ma40",  # Weekly 40-week ≈ 200d
+        "w_sector_breadth_mcclellan_osc",   # Weekly breadth momentum
     ],
 
     # === MACRO/INTERMARKET FEATURES ===
@@ -632,14 +635,13 @@ EXPANSION_CANDIDATES = {
         "w_illiquidity_score",
     ],
 
-    # --- Market Breadth (6) ---
-    "market_breadth": [
-        "ad_ratio_ema10",
-        "ad_ratio_universe",
-        "mcclellan_oscillator",
-        "w_ad_ratio_ema10",
-        "w_mcclellan_oscillator",
-        "w_ad_thrust_4w",
+    # --- Sector ETF Breadth Proxy (4) ---
+    # These are expansion candidates - not in BASE_FEATURES
+    "sector_breadth": [
+        "sector_breadth_pct_above_ma50",    # Tactical participation (if not using mcclellan_osc)
+        "sector_breadth_ad_line",           # Slow drift; sometimes useful
+        "w_sector_breadth_pct_above_ma40",  # Weekly 200d proxy
+        "w_sector_breadth_mcclellan_osc",   # Weekly breadth momentum filter
     ],
 
     # --- Intermarket Ratios (10) ---
@@ -751,6 +753,22 @@ EXCLUDED_FEATURES = [
     # Raw credit/yield proxies (use z-scores)
     "credit_spread_proxy", "yield_curve_proxy",
     "w_credit_spread_proxy", "w_yield_curve_proxy",
+    # Sector breadth intermediates (use osc/pct_above instead)
+    # Daily intermediates
+    "sector_breadth_adv",            # Intermediate count; use osc or pct_above
+    "sector_breadth_dec",            # Intermediate count
+    "sector_breadth_net_adv",        # Intermediate; osc is the filtered version
+    "sector_breadth_mcclellan_sum",  # Too slow + integral of osc; redundant
+    # Weekly intermediates
+    "w_sector_breadth_adv",          # Intermediate count
+    "w_sector_breadth_dec",          # Intermediate count
+    "w_sector_breadth_net_adv",      # Intermediate
+    "w_sector_breadth_ad_line",      # Integral; redundant with daily
+    "w_sector_breadth_mcclellan_sum",  # Very redundant / slow
+    # Old stock-universe breadth (deprecated - replaced by sector ETF proxy)
+    "ad_ratio_ema10", "ad_ratio_universe", "ad_thrust_10d", "mcclellan_oscillator",
+    "pct_universe_above_ma20", "pct_universe_above_ma50",
+    "w_ad_ratio_universe", "w_ad_ratio_ema10", "w_mcclellan_oscillator", "w_ad_thrust_4w",
 ]
 
 

@@ -31,7 +31,7 @@ try:
         _compute_rs_for_symbol,
         _compute_relative_strength_block
     )
-    from .breadth import add_breadth_series
+    from .sector_breadth import add_sector_breadth_features, SECTOR_ETFS
     from .xsec import (
         add_xsec_momentum_panel,
         add_weekly_xsec_momentum_panel,
@@ -62,7 +62,7 @@ except ImportError:
         _compute_rs_for_symbol,
         _compute_relative_strength_block
     )
-    from src.features.breadth import add_breadth_series
+    from src.features.sector_breadth import add_sector_breadth_features, SECTOR_ETFS
     from src.features.xsec import (
         add_xsec_momentum_panel,
         add_weekly_xsec_momentum_panel,
@@ -693,13 +693,24 @@ def compute_cross_sectional_features(
     )
     logger.debug("  ✓ Joint factor features (weekly) completed")
 
-    # 4) Breadth features (requires SP500 ticker list)
-    if sp500_tickers:
-        logger.info("Adding market breadth features...")
-        add_breadth_series(indicators_by_symbol, sp500_tickers)
-        logger.debug(f"  ✓ Breadth features completed ({len(sp500_tickers)} tickers)")
-    else:
-        logger.warning("Skipping breadth features (sp500_tickers not provided)")
+    # 4) Sector ETF Breadth Proxy features (uses 11 sector ETFs - no external data needed)
+    # This is survivorship-bias-free since the 11 sector ETFs are a fixed set
+    logger.info("Adding sector ETF breadth proxy features...")
+    try:
+        # Load sector ETF data from cache
+        etf_data = _load_sector_etf_data_for_breadth()
+        if etf_data:
+            add_sector_breadth_features(
+                indicators_by_symbol,
+                etf_data=etf_data,
+                weekly_etf_data=None,  # Weekly added separately in compute_weekly_cross_sectional_features
+                price_col=price_col
+            )
+            logger.debug(f"  ✓ Sector ETF breadth proxy features completed ({len(etf_data)} ETFs)")
+        else:
+            logger.warning("Could not load sector ETF data for breadth features - skipping")
+    except Exception as e:
+        logger.warning(f"Sector ETF breadth failed: {e}")
 
     # 5) Cross-sectional momentum z-scores (daily)
     logger.info("Adding daily cross-sectional momentum z-scores...")
@@ -809,6 +820,157 @@ def compute_cross_sectional_features_safe(
     except Exception as e:
         logger.error(f"Cross-sectional feature computation failed: {e}")
         return False
+
+
+def _load_sector_etf_data_for_breadth() -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    Load the 11 Select Sector SPDR ETFs from cache for sector breadth computation.
+
+    Returns:
+        Dictionary mapping ETF symbol -> DataFrame with OHLCV data,
+        or None if cache not found or insufficient ETFs available.
+    """
+    cache_dir = Path(__file__).parent.parent.parent / "cache"
+    etf_cache_path = cache_dir / "etfs" / "stock_data_etf.parquet"
+
+    if not etf_cache_path.exists():
+        logger.warning(f"ETF cache not found for sector breadth: {etf_cache_path}")
+        return None
+
+    try:
+        etf_cache_df = pd.read_parquet(etf_cache_path)
+    except Exception as e:
+        logger.warning(f"Failed to load ETF cache for sector breadth: {e}")
+        return None
+
+    # Load the 11 sector ETFs
+    etf_data = {}
+    for etf_sym in SECTOR_ETFS:
+        try:
+            etf_subset = etf_cache_df[etf_cache_df['symbol'] == etf_sym]
+            if len(etf_subset) == 0:
+                logger.debug(f"Sector ETF {etf_sym} not found in cache")
+                continue
+
+            # Pivot from long to wide format
+            etf_df = etf_subset.pivot_table(index='date', columns='metric', values='value')
+
+            # Normalize column names to lowercase
+            etf_df.columns = [c.lower() for c in etf_df.columns]
+
+            # Ensure DatetimeIndex
+            if not isinstance(etf_df.index, pd.DatetimeIndex):
+                etf_df.index = pd.to_datetime(etf_df.index)
+            etf_df = etf_df.sort_index()
+
+            if len(etf_df) >= 50:  # Need at least 50 days for MA calculations
+                etf_data[etf_sym] = etf_df
+                logger.debug(f"Loaded sector ETF {etf_sym}: {len(etf_df)} rows")
+
+        except Exception as e:
+            logger.debug(f"Failed to load sector ETF {etf_sym}: {e}")
+            continue
+
+    if len(etf_data) < 6:  # Need at least half the sectors
+        logger.warning(f"Insufficient sector ETFs for breadth: {len(etf_data)}/{len(SECTOR_ETFS)}")
+        return None
+
+    logger.info(f"Loaded {len(etf_data)}/{len(SECTOR_ETFS)} sector ETFs for breadth features")
+    return etf_data
+
+
+def _load_sector_etf_data_weekly_for_breadth() -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    Load the 11 Select Sector SPDR ETFs as weekly-resampled data for weekly breadth.
+
+    Returns:
+        Dictionary mapping ETF symbol -> DataFrame with weekly OHLCV data,
+        or None if cache not found or insufficient ETFs available.
+    """
+    cache_dir = Path(__file__).parent.parent.parent / "cache"
+
+    # Try weekly cache first
+    weekly_cache_path = cache_dir / "etfs" / "etf_data_weekly.parquet"
+    daily_cache_path = cache_dir / "etfs" / "stock_data_etf.parquet"
+
+    etf_cache_df = None
+    is_weekly = False
+
+    # Try weekly cache first
+    if weekly_cache_path.exists():
+        try:
+            etf_cache_df = pd.read_parquet(weekly_cache_path)
+            is_weekly = True
+            logger.debug("Using pre-computed weekly ETF cache for breadth")
+        except Exception as e:
+            logger.debug(f"Failed to load weekly ETF cache: {e}")
+
+    # Fall back to daily cache
+    if etf_cache_df is None and daily_cache_path.exists():
+        try:
+            etf_cache_df = pd.read_parquet(daily_cache_path)
+            logger.debug("Using daily ETF cache, will resample to weekly")
+        except Exception as e:
+            logger.warning(f"Failed to load ETF cache for weekly breadth: {e}")
+            return None
+
+    if etf_cache_df is None:
+        logger.warning("No ETF cache found for weekly sector breadth")
+        return None
+
+    # Load the 11 sector ETFs
+    etf_data = {}
+    for etf_sym in SECTOR_ETFS:
+        try:
+            etf_subset = etf_cache_df[etf_cache_df['symbol'] == etf_sym]
+            if len(etf_subset) == 0:
+                continue
+
+            # Pivot from long to wide format
+            etf_df = etf_subset.pivot_table(index='date', columns='metric', values='value')
+
+            # Normalize column names to lowercase
+            etf_df.columns = [c.lower() for c in etf_df.columns]
+
+            # Ensure DatetimeIndex
+            if not isinstance(etf_df.index, pd.DatetimeIndex):
+                etf_df.index = pd.to_datetime(etf_df.index)
+            etf_df = etf_df.sort_index()
+
+            # Resample to weekly if using daily data
+            if not is_weekly:
+                agg_rules = {}
+                if 'open' in etf_df.columns:
+                    agg_rules['open'] = lambda x: x.iloc[0] if len(x) > 0 else np.nan
+                if 'high' in etf_df.columns:
+                    agg_rules['high'] = 'max'
+                if 'low' in etf_df.columns:
+                    agg_rules['low'] = 'min'
+                if 'close' in etf_df.columns:
+                    agg_rules['close'] = lambda x: x.iloc[-1] if len(x) > 0 else np.nan
+                if 'adjclose' in etf_df.columns:
+                    agg_rules['adjclose'] = lambda x: x.iloc[-1] if len(x) > 0 else np.nan
+                if 'volume' in etf_df.columns:
+                    agg_rules['volume'] = 'sum'
+
+                if agg_rules:
+                    etf_df = etf_df[list(agg_rules.keys())].resample('W-FRI').agg(agg_rules)
+                    price_col = 'adjclose' if 'adjclose' in etf_df.columns else 'close'
+                    etf_df = etf_df.dropna(subset=[price_col])
+
+            if len(etf_df) >= 10:  # Need at least 10 weeks
+                etf_data[etf_sym] = etf_df
+
+        except Exception as e:
+            logger.debug(f"Failed to load weekly sector ETF {etf_sym}: {e}")
+            continue
+
+    if len(etf_data) < 6:
+        logger.warning(f"Insufficient sector ETFs for weekly breadth: {len(etf_data)}/{len(SECTOR_ETFS)}")
+        return None
+
+    logger.info(f"Loaded {len(etf_data)}/{len(SECTOR_ETFS)} sector ETFs for weekly breadth")
+    return etf_data
 
 
 def _load_benchmark_etfs_for_weekly(
@@ -1058,13 +1220,31 @@ def compute_weekly_cross_sectional_features(
     except Exception as e:
         logger.warning(f"Weekly alpha features failed: {e}")
 
-    # Step 5: Compute weekly breadth features
-    if sp500_tickers:
-        logger.info("Computing weekly breadth features...")
-        try:
-            _add_weekly_breadth_features(weekly_by_symbol, sp500_tickers, prefix=prefix)
-        except Exception as e:
-            logger.warning(f"Weekly breadth features failed: {e}")
+    # Step 5: Compute weekly sector ETF breadth proxy features
+    logger.info("Computing weekly sector ETF breadth features...")
+    try:
+        weekly_etf_data = _load_sector_etf_data_weekly_for_breadth()
+        if weekly_etf_data:
+            # Import the weekly breadth computation
+            from .sector_breadth import compute_sector_breadth_weekly
+
+            weekly_breadth = compute_sector_breadth_weekly(weekly_etf_data)
+            if weekly_breadth is not None and not weekly_breadth.empty:
+                # Broadcast weekly breadth to all symbols
+                for sym, df in weekly_by_symbol.items():
+                    breadth_data = {}
+                    for col in weekly_breadth.columns:
+                        if col not in df.columns:
+                            aligned = weekly_breadth[col].reindex(df.index, method='ffill')
+                            breadth_data[col] = aligned.astype('float32')
+                    if breadth_data:
+                        new_cols_df = pd.DataFrame(breadth_data, index=df.index)
+                        weekly_by_symbol[sym] = pd.concat([df, new_cols_df], axis=1)
+                logger.debug(f"  ✓ Weekly sector breadth features added ({len(weekly_breadth.columns)} features)")
+        else:
+            logger.warning("Could not load weekly sector ETF data for breadth - skipping")
+    except Exception as e:
+        logger.warning(f"Weekly sector breadth features failed: {e}")
 
     # Step 6: Compute weekly relative strength features
     if sectors and sector_to_etf:
@@ -1541,85 +1721,6 @@ def _add_weekly_alpha_features(
             count += 1
 
     logger.info(f"  Added weekly alpha features to {count} symbols")
-
-
-def _add_weekly_breadth_features(
-    weekly_by_symbol: Dict[str, pd.DataFrame],
-    sp500_tickers: List[str],
-    prefix: str = "w_"
-) -> None:
-    """Add weekly breadth features to weekly data.
-
-    Extended to compute:
-    - w_ad_ratio_universe: Raw advance-decline ratio
-    - w_ad_ratio_ema10: EMA-smoothed A/D ratio (2-week EMA for weekly data)
-    - w_mcclellan_oscillator: Weekly McClellan oscillator (4/8 week EMAs)
-    - w_ad_thrust_4w: A/D thrust indicator (4-week sum of extreme readings)
-    """
-    # Count advancing and declining stocks each week
-    available_tickers = [t for t in sp500_tickers if t in weekly_by_symbol]
-
-    if len(available_tickers) < 50:
-        logger.warning(f"Only {len(available_tickers)} SP500 tickers available for weekly breadth")
-        return
-
-    # Build returns matrix
-    returns_list = []
-    for ticker in available_tickers:
-        df = weekly_by_symbol[ticker]
-        if 'ret' in df.columns:
-            returns_list.append(df['ret'].rename(ticker))
-
-    if len(returns_list) < 50:
-        logger.warning("Insufficient returns data for weekly breadth features")
-        return
-
-    returns_df = pd.concat(returns_list, axis=1)
-
-    # Compute advancing/declining
-    advancing = (returns_df > 0).sum(axis=1)
-    declining = (returns_df < 0).sum(axis=1)
-    total = advancing + declining
-
-    # Build breadth features
-    features = {}
-
-    # AD ratio (raw)
-    ad_ratio = (advancing / total.replace(0, np.nan)).astype('float32')
-    features[f'{prefix}ad_ratio_universe'] = ad_ratio
-
-    # AD ratio EMA (2-week EMA ~ 10 days)
-    ad_ratio_ema = ad_ratio.ewm(span=2, min_periods=1).mean().astype('float32')
-    features[f'{prefix}ad_ratio_ema10'] = ad_ratio_ema
-
-    # A/D line (cumulative advancing - declining)
-    ad_line = (advancing - declining).cumsum()
-
-    # McClellan Oscillator (4-week EMA minus 8-week EMA of A/D diff)
-    # Weekly: 4 weeks ~ 19 days, 8 weeks ~ 39 days
-    ad_diff = advancing - declining
-    ema_fast = ad_diff.ewm(span=4, min_periods=2).mean()
-    ema_slow = ad_diff.ewm(span=8, min_periods=4).mean()
-    mcclellan = (ema_fast - ema_slow).astype('float32')
-    features[f'{prefix}mcclellan_oscillator'] = mcclellan
-
-    # A/D thrust (4-week rolling count of high A/D ratio weeks)
-    # High A/D = more than 60% advancing
-    high_ad_signal = (ad_ratio > 0.60).astype(float)
-    ad_thrust = high_ad_signal.rolling(4, min_periods=2).sum().astype('float32')
-    features[f'{prefix}ad_thrust_4w'] = ad_thrust
-
-    # Attach to all symbols
-    for sym, df in weekly_by_symbol.items():
-        new_cols = {}
-        for name, series in features.items():
-            reindexed = series.reindex(df.index)
-            new_cols[name] = reindexed
-        if new_cols:
-            new_df = pd.DataFrame(new_cols, index=df.index)
-            weekly_by_symbol[sym] = pd.concat([df, new_df], axis=1)
-
-    logger.info(f"  Added {len(features)} weekly breadth features")
 
 
 def _add_weekly_relative_strength_features(

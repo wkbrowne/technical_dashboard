@@ -307,7 +307,7 @@ def _initialize_registry():
         from .volume import add_volume_features, add_volume_shock_features
         from .alpha import add_alpha_momentum_features
         from .relstrength import add_relative_strength
-        from .breadth import add_breadth_series
+        from .sector_breadth import add_sector_breadth_features
         from .xsec import add_xsec_momentum_panel
 
         # Register single-stock features
@@ -372,8 +372,8 @@ def _initialize_registry():
             cross_sectional=True
         )
         register_legacy_feature(
-            'breadth',
-            add_breadth_series,
+            'sector_breadth',
+            add_sector_breadth_features,
             category='breadth',
             cross_sectional=True
         )

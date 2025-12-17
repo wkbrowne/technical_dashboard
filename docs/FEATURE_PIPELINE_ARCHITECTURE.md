@@ -49,7 +49,7 @@ For the high-level ML pipeline (feature selection, hyperparameter tuning, model 
 ├───────────────────────────────────┤   ├───────────────────────────────────┤
 │  Single-Stock Features:           │   │  Weekly-Only Features:            │
 │  - trend.py (MA slopes, RSI)      │   │  - Weekly RSI, MACD               │
-│  - volatility.py (ATR, regimes)   │   │  - Weekly breadth                 │
+│  - volatility.py (ATR, regimes)   │   │  - Weekly sector breadth proxy    │
 │  - volume.py (volume ratios)      │   │  - Weekly cross-asset             │
 │  - distance.py (distance to MA)   │   │  - Weekly alpha momentum          │
 │  - range_breakout.py              │   │                                   │
@@ -57,7 +57,7 @@ For the high-level ML pipeline (feature selection, hyperparameter tuning, model 
 │  Cross-Sectional Features:        │   │  Falls back to inline if no cache │
 │  - alpha.py (alpha vs benchmarks) │   │                                   │
 │  - xsec.py (cross-sec momentum)   │   │                                   │
-│  - breadth.py (market breadth)    │   │                                   │
+│  - sector_breadth.py (ETF proxy)  │   │                                   │
 │                                   │   │                                   │
 │                                   │   │                                   │
 └───────────────────────────────────┘   └───────────────────────────────────┘
@@ -444,7 +444,7 @@ Similarly, daily files must NOT contain partially completed days:
 - `w_macd_histogram`, `w_macd_signal` - Weekly MACD
 - `w_beta_spy`, `w_beta_qqq` - Rolling beta vs benchmarks
 - `w_alpha_mom_spy_*` - Weekly alpha momentum
-- `w_ad_ratio_universe` - Weekly breadth
+- `w_sector_breadth_*` - Weekly sector ETF breadth proxy
 - `w_vix_vxn_spread` - Weekly volatility spreads
 
 **Weekly Spread Features:**
@@ -568,7 +568,7 @@ artifacts/checkpoints/
 ├── 03_spread_features.parquet     # After spread features (QQQ-SPY, RSP-SPY, etc.)
 ├── 04_factor_regression.parquet   # After factor regression (beta, alpha, bestmatch spreads)
 ├── 05_cross_sectional.parquet     # After cross-sectional features (xsec momentum, ranks)
-├── 06_breadth.parquet             # After breadth features (AD ratio, etc.)
+├── 06_breadth.parquet             # After sector ETF breadth proxy features
 ├── 07_weekly_features.parquet     # After weekly feature computation
 └── 08_merged_complete.parquet     # Final merged output
 ```
@@ -632,7 +632,7 @@ def pipeline_with_checkpoints(indicators_by_symbol, output_dir, resume_from=None
 | 3. Spread Features | `03_spread_features.parquet` | QQQ/SPY/RSP spread metrics | ~4.5 GB |
 | 4. Factor Regression | `04_factor_regression.parquet` | Beta, alpha, bestmatch spreads | ~5 GB |
 | 5. Cross-Sectional | `05_cross_sectional.parquet` | Xsec momentum, ranks | ~5.5 GB |
-| 6. Breadth | `06_breadth.parquet` | AD ratio, new highs/lows | ~6 GB |
+| 6. Breadth | `06_breadth.parquet` | Sector ETF breadth proxy, McClellan | ~6 GB |
 | 7. Weekly Features | `07_weekly_features.parquet` | All w_* features | ~7 GB |
 | 8. Final Merge | `08_merged_complete.parquet` | Combined daily + weekly | ~7 GB |
 
@@ -876,7 +876,109 @@ Cross-sectional features require benchmark ETF data from the ETF cache:
 2. Fall back to `cache/stock_data_etf.parquet`
 3. Fall back to `cache/etf_data_weekly.parquet` (for weekly)
 
-### 5.3 Date Alignment
+### 5.3 Sector ETF Breadth Proxy (Global-by-Date)
+
+**Module:** [src/features/sector_breadth.py](../src/features/sector_breadth.py)
+
+Traditional market breadth data (NYSE advance/decline) is not reliably available via free APIs. The Sector ETF Breadth Proxy provides a survivorship-bias-free alternative using the 11 Select Sector SPDR ETFs.
+
+**Purpose:**
+
+Approximate traditional market-level breadth indicators (advance/decline, percent above moving averages) using the fixed set of 11 sector ETFs. These cover the entire S&P 500 without survivorship bias since the ETF set is static.
+
+**Inputs:**
+
+The 11 Select Sector SPDR ETFs (must be present in ETF cache):
+
+| ETF | Sector |
+|-----|--------|
+| XLB | Materials |
+| XLC | Communication Services |
+| XLE | Energy |
+| XLF | Financials |
+| XLI | Industrials |
+| XLK | Technology |
+| XLP | Consumer Staples |
+| XLRE | Real Estate |
+| XLU | Utilities |
+| XLV | Health Care |
+| XLY | Consumer Discretionary |
+
+**Daily Outputs:**
+
+| Feature | Description | Computation |
+|---------|-------------|-------------|
+| `sector_breadth_adv` | Count of advancing sectors | Count where daily return > 0 |
+| `sector_breadth_dec` | Count of declining sectors | Count where daily return < 0 |
+| `sector_breadth_net_adv` | Net advancers | adv - dec |
+| `sector_breadth_ad_line` | Cumulative A/D line | Cumulative sum of net_adv |
+| `sector_breadth_pct_above_ma50` | Pct of sectors above 50-day MA | Count(close > ma50) / 11 |
+| `sector_breadth_pct_above_ma200` | Pct of sectors above 200-day MA | Count(close > ma200) / 11 |
+| `sector_breadth_mcclellan_osc` | McClellan Oscillator | EMA(19, net_adv) - EMA(39, net_adv) |
+| `sector_breadth_mcclellan_sum` | McClellan Summation Index | Cumulative sum of McClellan Oscillator |
+
+**Weekly Outputs:**
+
+Weekly versions are computed on weekly-resampled ETF data and prefixed with `w_`:
+
+| Feature | Description |
+|---------|-------------|
+| `w_sector_breadth_adv` | Weekly advancing sectors count |
+| `w_sector_breadth_dec` | Weekly declining sectors count |
+| `w_sector_breadth_net_adv` | Weekly net advancers |
+| `w_sector_breadth_ad_line` | Cumulative weekly A/D line |
+| `w_sector_breadth_pct_above_ma10` | Pct above 10-week MA (≈50-day) |
+| `w_sector_breadth_pct_above_ma40` | Pct above 40-week MA (≈200-day) |
+| `w_sector_breadth_mcclellan_osc` | Weekly McClellan Oscillator (EMA(4) - EMA(8)) |
+| `w_sector_breadth_mcclellan_sum` | Weekly McClellan Summation Index |
+
+**McClellan Oscillator:**
+
+The McClellan Oscillator is a breadth momentum indicator computed from the A/D line:
+
+```python
+# Daily: traditional EMA spans (19 and 39 days)
+ema_fast = net_adv.ewm(span=19, adjust=False).mean()
+ema_slow = net_adv.ewm(span=39, adjust=False).mean()
+mcclellan_osc = ema_fast - ema_slow
+
+# Weekly: adjusted spans (4 and 8 weeks ≈ 19 and 39 days)
+w_ema_fast = w_net_adv.ewm(span=4, adjust=False).mean()
+w_ema_slow = w_net_adv.ewm(span=8, adjust=False).mean()
+w_mcclellan_osc = w_ema_fast - w_ema_slow
+
+# Summation index (cumulative)
+mcclellan_sum = mcclellan_osc.cumsum()
+```
+
+Interpretation:
+- Positive oscillator → breadth momentum improving
+- Negative oscillator → breadth momentum weakening
+- Summation index shows longer-term breadth trend
+
+**Joining Rule:**
+
+These features are **global-by-date** (same value for all symbols on a given date). Computed once per date, then broadcast to all symbols via a left join on date.
+
+```python
+# Global features computed once
+breadth_features = compute_sector_breadth(etf_data)  # DatetimeIndex → features
+
+# Broadcast to all symbols
+for sym, df in indicators_by_symbol.items():
+    df = df.join(breadth_features, on='date', how='left')
+```
+
+**Replacement Notice:**
+
+This feature set **replaces** the prior `breadth.py` logic that depended on external advance/decline data sources (which are unavailable via free APIs). The old `ad_ratio_universe` and similar features are deprecated.
+
+**Non-Goals:**
+
+- Does NOT replace per-symbol sector-relative features (alpha, relative strength)
+- Does NOT provide true NYSE advance/decline counts (only sector-level proxy with 11 data points per day)
+
+### 5.4 Date Alignment
 
 Weekly features have date alignment challenges:
 
