@@ -471,33 +471,26 @@ def _count_overlaps_efficient(symbol_targets: pd.DataFrame) -> Dict:
     }
 
 
-def _process_symbol_group(df: pd.DataFrame, config: Dict, symbols: List[str],
+def _process_symbol_group(chunk_df: pd.DataFrame, config: Dict,
                          weight_min_clip: float = 0.01, weight_max_clip: float = 10.0) -> pd.DataFrame:
     """
-    Process a group of symbols by filtering and running triple barrier target generation.
-    
+    Process a pre-filtered chunk of symbol data for triple barrier target generation.
+
     Args:
-        df: Long-format DataFrame with all symbol data
+        chunk_df: Pre-filtered DataFrame containing only this chunk's symbols
         config: Triple barrier configuration dictionary
-        symbols: List of symbols to process in this chunk
         weight_min_clip: Minimum weight value (prevents zero weights)
         weight_max_clip: Maximum weight value (prevents extreme weights)
-        
+
     Returns:
-        DataFrame with triple barrier targets for the specified symbols
+        DataFrame with triple barrier targets for the chunk's symbols
     """
-    if not symbols:
-        return pd.DataFrame()
-    
-    # Filter to only the symbols in this chunk
-    chunk_df = df[df['symbol'].isin(symbols)]
-    
     if chunk_df.empty:
-        logger.debug(f"No data found for symbols: {symbols}")
         return pd.DataFrame()
-    
-    logger.debug(f"Processing {len(symbols)} symbols: {symbols}")
-    
+
+    n_symbols = chunk_df['symbol'].nunique()
+    logger.debug(f"Processing chunk with {n_symbols} symbols, {len(chunk_df)} rows")
+
     # Generate targets for this chunk
     return generate_triple_barrier_targets(chunk_df, config, weight_min_clip, weight_max_clip)
 
@@ -584,8 +577,18 @@ def generate_targets_parallel(
         for i in range(0, n_symbols, chunk_size)
     ]
 
+    # Pre-filter DataFrame per chunk to avoid sending entire dataset to each worker
+    # This is critical for parallelism efficiency - see Section 4 of FEATURE_PIPELINE_ARCHITECTURE.md
+    chunk_dataframes = []
+    for symbols in symbol_chunks:
+        chunk_df = df[df['symbol'].isin(symbols)].copy()
+        chunk_dataframes.append(chunk_df)
+
+    total_rows = len(df)
+    avg_rows_per_chunk = sum(len(cdf) for cdf in chunk_dataframes) / len(chunk_dataframes) if chunk_dataframes else 0
     logger.info(f"Processing {n_symbols} symbols in {len(symbol_chunks)} chunks "
                 f"(~{chunk_size} symbols/chunk, {actual_workers} workers)")
+    logger.info(f"Data subsetting: {total_rows} total rows -> {avg_rows_per_chunk:.0f} avg rows/chunk")
 
     # Reset the loky executor pool to avoid stale state from previous parallel operations
     # This fixes the '_ReusablePoolExecutor' object has no attribute '_temp_folder_manager' error
@@ -596,7 +599,7 @@ def generate_targets_parallel(
         pass  # Ignore if executor doesn't exist or can't be shut down
     gc.collect()
 
-    # Process chunks in parallel
+    # Process chunks in parallel - each worker receives only its pre-filtered data
     try:
         results = Parallel(
             n_jobs=n_jobs,
@@ -604,8 +607,8 @@ def generate_targets_parallel(
             verbose=verbose,
             prefer=prefer
         )(
-            delayed(_process_symbol_group)(df, config, chunk, weight_min_clip, weight_max_clip)
-            for chunk in symbol_chunks
+            delayed(_process_symbol_group)(chunk_df, config, weight_min_clip, weight_max_clip)
+            for chunk_df in chunk_dataframes
         )
 
         # Filter out empty results and concatenate

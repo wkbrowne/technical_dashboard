@@ -134,6 +134,39 @@ def _chunk_list(items: List, chunk_size: int) -> List[List]:
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
+def _get_required_benchmarks_for_alpha_batch(
+    work_items_batch: List[Tuple[str, pd.Index, np.ndarray, Optional[str]]],
+    all_benchmarks: Dict[str, Tuple[pd.Index, np.ndarray]],
+    market_symbol: str = "SPY",
+    qqq_symbol: str = "QQQ"
+) -> Dict[str, Tuple[pd.Index, np.ndarray]]:
+    """
+    Extract only the benchmarks needed by a specific batch for alpha computation.
+
+    This reduces serialization overhead by only sending relevant benchmark data to
+    each worker instead of the entire benchmark dictionary.
+
+    Args:
+        work_items_batch: List of (symbol, ret_index, ret_values, sector_etf) tuples
+        all_benchmarks: Complete benchmark dictionary
+        market_symbol: Market benchmark symbol (always included)
+        qqq_symbol: QQQ benchmark symbol (always included)
+
+    Returns:
+        Subset of benchmarks needed by this batch
+    """
+    # Core benchmarks always needed for alpha computation
+    required = {market_symbol, qqq_symbol}
+
+    # Add sector ETFs referenced by symbols in this batch
+    for item in work_items_batch:
+        if len(item) >= 4 and item[3]:  # item[3] is symbol_sector_etf
+            required.add(item[3])
+
+    # Extract only required benchmarks that exist
+    return {k: v for k, v in all_benchmarks.items() if k in required}
+
+
 def _compute_alpha_for_symbol(
     sym: str,
     ret_index: pd.Index,
@@ -392,8 +425,23 @@ def add_alpha_momentum_features(
             )
             results.append((sym, alpha_features))
     else:
-        # Create batches for parallel processing
+        # Create batches for parallel processing with subsetted benchmarks
         work_chunks = _chunk_list(work_items, chunk_size)
+
+        # Pre-compute subsetted benchmarks for each chunk to reduce serialization
+        # Each worker only gets the benchmarks it needs (core + batch-specific sector ETFs)
+        # See Section 4 of FEATURE_PIPELINE_ARCHITECTURE.md for parallelism best practices
+        chunk_benchmarks = []
+        for chunk in work_chunks:
+            benchmark_subset = _get_required_benchmarks_for_alpha_batch(
+                chunk, benchmarks, market_symbol, qqq_symbol
+            )
+            chunk_benchmarks.append(benchmark_subset)
+
+        # Log benchmark reduction
+        total_benchmarks = len(benchmarks)
+        avg_benchmarks = sum(len(b) for b in chunk_benchmarks) / len(chunk_benchmarks) if chunk_benchmarks else 0
+        logger.info(f"Benchmark subsetting: {total_benchmarks} total -> {avg_benchmarks:.1f} avg per batch")
 
         try:
             batch_results = Parallel(
@@ -403,9 +451,9 @@ def add_alpha_momentum_features(
                 prefer='processes'
             )(
                 delayed(_compute_alpha_batch)(
-                    chunk, benchmarks, market_symbol, beta_win, windows, ema_span, qqq_symbol
+                    chunk, chunk_benchmarks[i], market_symbol, beta_win, windows, ema_span, qqq_symbol
                 )
-                for chunk in work_chunks
+                for i, chunk in enumerate(work_chunks)
             )
 
             # Flatten batch results

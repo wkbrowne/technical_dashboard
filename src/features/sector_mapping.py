@@ -189,7 +189,7 @@ SECTOR_ETF_MAP = {
 
 def _process_symbol_mapping_batch(
     work_items: List[Tuple[str, Dict, str]],
-    stock_data: Dict[str, pd.DataFrame],
+    batch_stock_data: Dict[str, pd.DataFrame],
     etf_data: Dict[str, pd.DataFrame]
 ) -> List[Tuple[str, Dict]]:
     """
@@ -197,8 +197,8 @@ def _process_symbol_mapping_batch(
 
     Args:
         work_items: List of (symbol, symbol_info, base_sector) tuples
-        stock_data: Stock price data dict (shared across batch)
-        etf_data: ETF price data dict (shared across batch)
+        batch_stock_data: Stock price data dict (pre-filtered to batch symbols only)
+        etf_data: ETF price data dict (full - ETFs are few and needed for all correlation tests)
 
     Returns:
         List of (symbol, mapping_dict) tuples
@@ -213,13 +213,13 @@ def _process_symbol_mapping_batch(
 
         # Find best subsector ETF using multi-stage approach
         subsector_etf = _find_best_subsector_etf(
-            symbol, symbol_info, sector_etf, stock_data, etf_data
+            symbol, symbol_info, sector_etf, batch_stock_data, etf_data
         )
 
         # Calculate correlations for validation
         correlations = _calculate_correlations(
             symbol, sector_etf, subsector_etf,
-            stock_data, etf_data, equal_weight_etf
+            batch_stock_data, etf_data, equal_weight_etf
         )
 
         # Determine confidence level
@@ -307,7 +307,20 @@ def build_enhanced_sector_mappings(universe_csv: str, stock_data: Dict[str, pd.D
     else:
         # Parallel with batching
         chunks = [work_items[i:i + chunk_size] for i in range(0, n_symbols, chunk_size)]
+
+        # Pre-subset stock_data per batch to avoid sending entire dataset to each worker
+        # ETF data is small (few dozen ETFs) and needed for correlation tests, so pass full dict
+        # See Section 4 of FEATURE_PIPELINE_ARCHITECTURE.md for parallelism best practices
+        chunk_stock_data = []
+        for chunk in chunks:
+            batch_symbols = {item[0] for item in chunk}  # Extract symbols from work_items
+            batch_data = {sym: stock_data[sym] for sym in batch_symbols if sym in stock_data}
+            chunk_stock_data.append(batch_data)
+
+        total_stock_symbols = len(stock_data)
+        avg_symbols_per_batch = sum(len(d) for d in chunk_stock_data) / len(chunk_stock_data) if chunk_stock_data else 0
         logger.info(f"Parallel sector mapping: {len(chunks)} batches, {n_workers} workers")
+        logger.info(f"Stock data subsetting: {total_stock_symbols} total -> {avg_symbols_per_batch:.0f} avg symbols/batch")
 
         try:
             batch_results = Parallel(
@@ -315,8 +328,8 @@ def build_enhanced_sector_mappings(universe_csv: str, stock_data: Dict[str, pd.D
                 backend='loky',
                 verbose=0
             )(
-                delayed(_process_symbol_mapping_batch)(chunk, stock_data, etf_data)
-                for chunk in chunks
+                delayed(_process_symbol_mapping_batch)(chunk, chunk_stock_data[i], etf_data)
+                for i, chunk in enumerate(chunks)
             )
 
             # Flatten results
