@@ -3,12 +3,17 @@
 Data Quality Check Script
 
 Analyzes pipeline output files and provides actionable insights:
-- BASE_FEATURES validation (golden reference from base_features.py)
-- EXPANSION_CANDIDATES validation (feature selection pool coverage)
+- BASE_FEATURES V2 validation (~38 curated core features from base_features.py)
+- EXPANSION_CANDIDATES V2 validation (~200 features for forward selection)
 - Feature coverage and NaN rates by category
 - Data quality issues (infinite values, missing features)
 - Targets file validation
 - Recommendations for fixing issues
+
+V2 Feature Set (updated Dec 2024):
+- BASE_FEATURES: 38 curated features covering trend, volatility, relative perf, macro
+- EXPANSION_CANDIDATES: ~200 features organized by category for feature selection
+- Output filtering: Pipeline now outputs curated ~200 features (vs ~480 raw)
 
 Usage:
     conda run -n stocks_predictor python run_data_quality.py
@@ -44,216 +49,314 @@ except ImportError:
 # FEATURE DEFINITIONS - Descriptions and expected behavior
 # =============================================================================
 
-# Complete feature descriptions including all BASE_FEATURES
+# Complete feature descriptions including all BASE_FEATURES V2
+# Updated to match the curated 38 features in base_features.py
 FEATURE_DESCRIPTIONS = {
     # ==========================================================================
-    # BASE_FEATURES - The 53 features selected by ML model (0.6932 AUC)
-    # These are the GOLDEN REFERENCE features that must be present
+    # BASE_FEATURES V2 - Curated core features (~38 total)
+    # Streamlined set for multi-timeframe coverage, diverse signal types,
+    # low correlation, and strong feature selection performance
     # ==========================================================================
 
-    # === TREND DIRECTION (3 BASE_FEATURES) ===
+    # === TREND / MOMENTUM (4 BASE_FEATURES) ===
     "rsi_14": "14-day RSI (0-100, >70 overbought, <30 oversold) [BASE_FEATURE]",
-    "w_rsi_14": "Weekly 14-day RSI - slower, filters noise [BASE_FEATURE]",
     "w_macd_histogram": "Weekly MACD histogram - momentum trend [BASE_FEATURE]",
-
-    # === TREND STRENGTH (8 BASE_FEATURES) ===
     "trend_score_sign": "Multi-MA alignment direction (+1/-1 per MA) [BASE_FEATURE]",
     "trend_score_slope": "Rate of change of trend score [BASE_FEATURE]",
-    "trend_persist_ema": "EMA-smoothed consecutive up/down days [BASE_FEATURE]",
+
+    # === TREND SLOPES (3 BASE_FEATURES) ===
     "pct_slope_ma_20": "20-day MA slope as % of price (short-term trend) [BASE_FEATURE]",
     "pct_slope_ma_100": "100-day MA slope as % of price (medium-term trend) [BASE_FEATURE]",
-    "w_pct_slope_ma_20": "Weekly 20-day MA slope [BASE_FEATURE]",
-    "w_rv60_slope_norm": "Weekly 60-day realized vol slope (normalized) [BASE_FEATURE]",
-    "w_rv100_slope_norm": "Weekly 100-day realized vol slope (normalized) [BASE_FEATURE]",
+    "w_pct_slope_ma_50": "Weekly 50-day MA slope [BASE_FEATURE]",
 
-    # === PRICE POSITION (8 BASE_FEATURES) ===
-    "pct_dist_ma_20": "% distance from 20-day MA (mean reversion signal) [BASE_FEATURE]",
-    "pct_dist_ma_50": "% distance from 50-day MA (trend distance) [BASE_FEATURE]",
-    "w_pct_dist_ma_20": "Weekly % distance from 20-day MA [BASE_FEATURE]",
-    "w_pct_dist_ma_100_z": "Weekly distance to 100d MA z-score [BASE_FEATURE]",
+    # === PRICE POSITION / MEAN REVERSION (5 BASE_FEATURES) ===
+    "pct_dist_ma_20_z": "Z-scored distance from 20-day MA [BASE_FEATURE]",
+    "pct_dist_ma_50_z": "Z-scored distance from 50-day MA [BASE_FEATURE]",
+    "relative_dist_20_50_z": "Relative position between 20/50 MAs (z-scored) [BASE_FEATURE]",
     "pos_in_20d_range": "Position in 20-day high-low range (0-1) [BASE_FEATURE]",
-    "w_pos_in_5d_range": "Weekly position in 5d range [BASE_FEATURE]",
     "vwap_dist_20d_zscore": "Z-scored distance from 20d VWAP [BASE_FEATURE]",
-    "w_vwap_dist_20d_zscore": "Weekly VWAP distance (smoother) [BASE_FEATURE]",
 
-    # === VOLATILITY REGIME (7 BASE_FEATURES) ===
-    "vol_regime": "Volatility regime (0-1, higher = more volatile) [BASE_FEATURE]",
+    # === VOLATILITY / REGIME (5 BASE_FEATURES) ===
+    "atr_percent": "ATR as % of price (REQUIRED for targets) [BASE_FEATURE]",
     "vol_regime_ema10": "10-day EMA smoothed volatility regime [BASE_FEATURE]",
-    "atr_percent": "ATR as % of price (position sizing) [BASE_FEATURE]",
-    "vix_regime": "VIX regime (0=low, 1=elevated, 2=high) [BASE_FEATURE]",
-    "w_vix_ma4_ratio": "Weekly VIX vs 4-week MA ratio [BASE_FEATURE]",
-    "w_vix_vxn_spread": "Weekly VIX-VXN spread (equity vs tech vol) [BASE_FEATURE]",
-    "w_alpha_mom_qqq_spread_60_ema10": "Weekly QQQ-SPY alpha spread (growth vs value) [BASE_FEATURE]",
+    "rv_z_60": "60-day realized vol z-score [BASE_FEATURE]",
+    "vix_zscore_60d": "VIX z-score vs 60-day history (market fear) [BASE_FEATURE]",
+    "w_vix_vxn_spread": "Weekly VIX-VXN spread (tech vs broad vol) [BASE_FEATURE]",
 
-    # === RELATIVE PERFORMANCE (7 BASE_FEATURES) ===
+    # === RELATIVE PERFORMANCE / CROSS-SECTION (6 BASE_FEATURES) ===
     "alpha_mom_spy_20_ema10": "20-day alpha momentum vs SPY (EMA smoothed) [BASE_FEATURE]",
     "alpha_mom_sector_20_ema10": "20-day alpha momentum vs sector [BASE_FEATURE]",
-    "beta_spy": "Rolling beta vs SPY (CAPM) [BASE_FEATURE]",
+    "w_alpha_mom_spy_20_ema10": "Weekly alpha vs SPY [BASE_FEATURE]",
     "rel_strength_sector": "Relative strength vs sector ETF [BASE_FEATURE]",
     "xsec_mom_20d_z": "20-day momentum cross-sectional z-score [BASE_FEATURE]",
-    "w_alpha_mom_spy_20_ema10": "Weekly alpha vs SPY [BASE_FEATURE]",
-    "w_beta_spy": "Weekly market beta [BASE_FEATURE]",
-
-    # === MACRO/INTERMARKET (16 BASE_FEATURES) ===
-    "copper_gold_ratio": "Copper/Gold ratio - economic growth indicator [BASE_FEATURE]",
-    "copper_gold_zscore": "Copper/Gold z-score [BASE_FEATURE]",
-    "gold_spy_ratio": "Gold/SPY ratio - risk-off indicator [BASE_FEATURE]",
-    "fred_ccsa_z52w": "Continued claims z-score (labor market) [BASE_FEATURE]",
-    "fred_dgs2_chg20d": "20-day change in 2Y Treasury rate [BASE_FEATURE]",
-    "fred_icsa_chg4w": "4-week change in initial claims [BASE_FEATURE]",
-    "w_copper_gold_ratio": "Weekly copper/gold ratio [BASE_FEATURE]",
-    "w_gold_spy_ratio": "Weekly gold/SPY ratio [BASE_FEATURE]",
-    "w_gold_spy_ratio_zscore": "Weekly gold/SPY z-score [BASE_FEATURE]",
-    "w_dollar_momentum_20d": "Weekly dollar momentum [BASE_FEATURE]",
-    "w_equity_bond_corr_60d": "Weekly stock-bond correlation [BASE_FEATURE]",
-    "w_financials_utilities_ratio": "Weekly risk-on/off sector ratio [BASE_FEATURE]",
-    "w_fred_bamlh0a0hym2_pct252": "Weekly HY spread percentile [BASE_FEATURE]",
-    "w_fred_bamlh0a0hym2_z60": "Weekly HY spread z-score [BASE_FEATURE]",
-    "w_fred_icsa_chg4w": "Weekly initial claims change [BASE_FEATURE]",
-    "w_fred_nfci_chg4w": "Weekly financial conditions change [BASE_FEATURE]",
+    "w_xsec_mom_4w_z": "Weekly cross-sectional momentum z-score [BASE_FEATURE]",
 
     # === MARKET BREADTH (1 BASE_FEATURE) ===
     "w_ad_ratio_universe": "Weekly advance-decline ratio [BASE_FEATURE]",
 
-    # === VOLUME/LIQUIDITY (2 BASE_FEATURES) ===
+    # === LIQUIDITY / VOLUME (2 BASE_FEATURES) ===
     "upper_shadow_ratio": "Upper shadow / range (selling pressure) [BASE_FEATURE]",
     "w_volshock_ema": "Weekly volume shock indicator [BASE_FEATURE]",
 
-    # === BREAKOUT (1 BASE_FEATURE) ===
-    "breakout_up_20d": "Binary: broke above 20-day high [BASE_FEATURE]",
+    # === MACRO / INTERMARKET (6 BASE_FEATURES) ===
+    "copper_gold_zscore": "Copper/Gold z-score (growth indicator) [BASE_FEATURE]",
+    "gold_spy_ratio_zscore": "Gold/SPY z-score (risk-off indicator) [BASE_FEATURE]",
+    "w_equity_bond_corr_60d": "Weekly equity-bond correlation [BASE_FEATURE]",
+    "w_fred_bamlh0a0hym2_z60": "Weekly HY spread z-score [BASE_FEATURE]",
+    "fred_dgs2_chg20d": "20-day change in 2Y Treasury rate [BASE_FEATURE]",
+    "fred_ccsa_z52w": "Continued claims z-score (labor market) [BASE_FEATURE]",
 
     # ==========================================================================
-    # ADDITIONAL FEATURES - Not in BASE_FEATURES but useful for expansion
+    # EXPANSION_CANDIDATES - Features for forward selection (~200 total)
     # ==========================================================================
 
-    # === TREND FEATURES (EXPANSION) ===
+    # === MOMENTUM (EXPANSION) ===
+    "rsi_21": "21-day RSI",
+    "macd_hist_deriv_ema3": "3-day EMA of MACD histogram derivative",
+    "w_rsi_14": "Weekly 14-day RSI",
+    "w_rsi_21": "Weekly 21-day RSI",
+    "w_macd_hist_deriv_ema3": "Weekly MACD histogram derivative",
+    "trend_persist_ema": "EMA-smoothed consecutive up/down days",
+
+    # === TREND SHAPE (EXPANSION) ===
     "trend_score_granular": "Multi-level trend strength (-3 to +3)",
+    "w_trend_score_sign": "Weekly trend score sign",
+    "w_trend_score_granular": "Weekly granular trend score",
+    "w_trend_persist_ema": "Weekly trend persistence",
+    "quiet_trend": "Low volatility trend indicator",
+    "trend_alignment": "Multi-timeframe trend alignment",
+
+    # === TREND SLOPES (EXPANSION) ===
     "pct_slope_ma_10": "10-day MA slope as % of price",
     "pct_slope_ma_30": "30-day MA slope as % of price",
     "pct_slope_ma_50": "50-day MA slope as % of price",
+    "pct_slope_ma_150": "150-day MA slope as % of price",
     "pct_slope_ma_200": "200-day MA slope as % of price",
+    "rv60_slope_norm": "60-day realized vol slope (normalized)",
+    "w_pct_slope_ma_20": "Weekly 20-day MA slope",
+    "w_pct_slope_ma_100": "Weekly 100-day MA slope",
+    "w_rv60_slope_norm": "Weekly 60-day vol slope",
+    "w_trend_score_slope": "Weekly trend score slope",
 
-    # === MOMENTUM FEATURES (EXPANSION) ===
-    "rsi_21": "21-day RSI",
-    "rsi_30": "30-day RSI",
-    "macd_histogram": "MACD histogram (momentum strength)",
-    "macd_hist_deriv_ema3": "3-day EMA of MACD histogram derivative",
-
-    # === VOLATILITY FEATURES (EXPANSION) ===
-    "rv_z_20": "20-day realized vol z-score vs 60-day lookback",
-    "rv_z_60": "60-day realized vol z-score vs 252-day lookback",
-    "rvol_20": "Relative volume vs 20-day average",
-
-    # === PRICE POSITION FEATURES (EXPANSION) ===
+    # === DISTANCE TO MA (EXPANSION) ===
     "pct_dist_ma_100": "% distance from 100-day MA",
-    "pct_dist_ma_200": "% distance from 200-day MA",
     "pct_dist_ma_100_z": "Z-score of 100-day MA distance",
+    "pct_dist_ma_200": "% distance from 200-day MA",
     "pct_dist_ma_200_z": "Z-score of 200-day MA distance",
     "min_pct_dist_ma": "Distance to nearest MA (support/resistance)",
-    "relative_dist_20_50_z": "Z-score of 20-50 MA distance ratio",
+    "relative_dist_20_50": "Relative position between 20/50 MAs",
+    "w_pct_dist_ma_20": "Weekly % distance from 20-day MA",
+    "w_pct_dist_ma_20_z": "Weekly z-scored distance from 20d MA",
+    "w_pct_dist_ma_50_z": "Weekly z-scored distance from 50d MA",
+    "w_pct_dist_ma_100_z": "Weekly z-scored distance from 100d MA",
+    "w_min_pct_dist_ma": "Weekly distance to nearest MA",
+    "w_relative_dist_20_50_z": "Weekly relative position z-score",
 
-    # === RANGE/BREAKOUT FEATURES (EXPANSION) ===
+    # === RANGE/BREAKOUT (EXPANSION) ===
     "pos_in_5d_range": "Position in 5-day high-low range (0-1)",
     "pos_in_10d_range": "Position in 10-day high-low range (0-1)",
     "breakout_up_5d": "Binary: broke above 5-day high",
     "breakout_up_10d": "Binary: broke above 10-day high",
-    "breakout_dn_5d": "Binary: broke below 5-day low",
-    "breakout_dn_10d": "Binary: broke below 10-day low",
+    "breakout_up_20d": "Binary: broke above 20-day high",
     "breakout_dn_20d": "Binary: broke below 20-day low",
-    "range_expansion_5d": "5-day range vs previous 5-day range",
-    "range_expansion_10d": "10-day range vs previous 10-day range",
-    "range_expansion_20d": "20-day range vs previous 20-day range",
+    "range_expansion_20d": "20-day range expansion ratio",
+    "range_z_20d": "20-day range z-score",
+    "w_pos_in_5d_range": "Weekly position in 5d range",
+    "w_pos_in_10d_range": "Weekly position in 10d range",
+    "w_pos_in_20d_range": "Weekly position in 20d range",
+    "w_breakout_up_20d": "Weekly breakout up 20d",
+    "w_breakout_dn_20d": "Weekly breakout down 20d",
+    "w_range_expansion_20d": "Weekly range expansion",
+    "w_range_z_20d": "Weekly range z-score",
+    "gap_atr_ratio": "Gap / ATR ratio",
 
-    # === VOLUME FEATURES (EXPANSION) ===
-    "obv_z_60": "60-day OBV z-score (accumulation/distribution)",
-    "rdollar_vol_20": "Relative dollar volume vs 20-day avg",
-    "volshock_z": "Volume shock z-score (unusual volume)",
-    "volshock_ema": "EMA-smoothed volume shock",
+    # === VOLATILITY (EXPANSION) ===
+    "vol_regime": "Volatility regime (0-1, higher = more volatile)",
+    "rv_ratio_10_60": "10d/60d realized vol ratio",
+    "rv_ratio_20_100": "20d/100d realized vol ratio",
+    "vol_z_20": "20-day volatility z-score",
+    "vol_z_60": "60-day volatility z-score",
+    "rvol_20": "Relative volume vs 20-day average",
+    "vol_regime_cs_median": "Cross-sectional median vol regime",
+    "vol_regime_rel": "Relative vol regime vs median",
+    "w_rv_z_60": "Weekly 60d vol z-score",
+    "w_vol_z_60": "Weekly 60d volatility z-score",
+    "w_rvol_20": "Weekly relative volume",
+    "w_vol_regime": "Weekly volatility regime",
+    "w_vol_regime_ema10": "Weekly smoothed vol regime",
+    "w_vol_regime_rel": "Weekly relative vol regime",
 
-    # === LIQUIDITY FEATURES (EXPANSION) ===
-    "hl_spread_proxy": "High-low spread proxy (intraday volatility)",
-    "cs_spread_est": "Corwin-Schultz spread estimator",
-    "roll_spread_est": "Roll bid-ask spread estimator",
-    "overnight_ratio": "Overnight vs intraday move ratio",
-    "range_efficiency": "Close move / HL range (trend quality)",
-    "lower_shadow_ratio": "Lower shadow / range (buying pressure)",
-    "amihud_illiq": "Amihud illiquidity (price impact per $)",
-    "illiquidity_score": "Composite illiquidity score",
+    # === VIX / IMPLIED VOL (EXPANSION) ===
+    "vix_percentile_252d": "VIX percentile vs 252-day history",
+    "vix_ma20_ratio": "VIX / 20-day MA ratio",
+    "vix_vxn_spread": "VIX-VXN spread (equity vs tech vol)",
+    "vix_change_5d": "5-day VIX change",
+    "vix_change_20d": "20-day VIX change",
+    "vix_regime": "VIX regime (0=low, 1=elevated, 2=high)",
+    "w_vix_percentile_52w": "Weekly VIX percentile (52-week)",
+    "w_vix_zscore_12w": "Weekly VIX z-score (12-week)",
+    "w_vix_regime": "Weekly VIX regime",
+    "w_vix_ma4_ratio": "Weekly VIX vs 4-week MA ratio",
+    "w_vix_change_4w": "Weekly 4-week VIX change",
+    "w_vxn_percentile_252d": "Weekly VXN percentile",
 
-    # === ALPHA/BETA FEATURES (EXPANSION) ===
+    # === ALPHA MOMENTUM (EXPANSION) ===
+    "alpha_mom_spy_60_ema10": "60-day alpha momentum vs SPY",
+    "alpha_mom_spy_120_ema10": "120-day alpha momentum vs SPY",
+    "alpha_mom_qqq_20_ema10": "20-day alpha momentum vs QQQ",
+    "alpha_mom_qqq_60_ema10": "60-day alpha momentum vs QQQ",
+    "alpha_mom_sector_60_ema10": "60-day alpha momentum vs sector",
+    "alpha_mom_combo_20_ema10": "20-day combo alpha momentum",
+    "alpha_mom_combo_60_ema10": "60-day combo alpha momentum",
+    "beta_spy": "Rolling beta vs SPY",
     "beta_qqq": "Rolling beta vs QQQ",
     "beta_sector": "Rolling beta vs sector ETF",
+    "w_alpha_mom_spy_60_ema10": "Weekly 60d alpha vs SPY",
+    "w_alpha_mom_qqq_60_ema10": "Weekly 60d alpha vs QQQ",
+    "w_alpha_mom_sector_60_ema10": "Weekly 60d alpha vs sector",
+    "w_alpha_mom_combo_60_ema10": "Weekly 60d combo alpha",
+    "w_beta_spy": "Weekly beta vs SPY",
+    "w_beta_qqq": "Weekly beta vs QQQ",
+
+    # === FACTOR BETAS (EXPANSION) ===
     "beta_market": "Factor regression: market beta",
     "beta_bestmatch": "Factor regression: best-match ETF beta",
-    "alpha_mom_spy_60_ema10": "60-day alpha momentum vs SPY (EMA smoothed)",
-    "alpha_mom_qqq_20_ema10": "20-day alpha momentum vs QQQ (EMA smoothed)",
-    "alpha_resid_spy": "Residual alpha after SPY regression",
-    "alpha_qqq_vs_spy": "QQQ-relative alpha vs SPY-relative alpha",
-    "residual_cumret": "Cumulative residual return (factor-adjusted momentum)",
-    "residual_vol": "Residual volatility (idiosyncratic risk)",
-    "residual_mean": "Mean residual return",
-    "alpha": "Factor regression alpha (intercept)",
+    "beta_breadth": "Factor regression: breadth beta",
+    "residual_cumret": "Cumulative residual return",
+    "residual_vol": "Residual volatility",
+    "w_beta_market": "Weekly market beta",
+    "w_beta_bestmatch": "Weekly best-match beta",
+    "w_beta_breadth": "Weekly breadth beta",
+    "w_residual_cumret": "Weekly residual cumret",
+    "w_residual_vol": "Weekly residual vol",
 
-    # === RELATIVE STRENGTH FEATURES (EXPANSION) ===
-    "rel_strength_spy": "Relative strength vs SPY (price ratio trend)",
+    # === FACTOR SPREADS (EXPANSION) ===
+    "qqq_spy_cumret_20": "QQQ-SPY 20d cumulative return spread",
+    "qqq_spy_cumret_60": "QQQ-SPY 60d cumulative return spread",
+    "qqq_spy_zscore_60": "QQQ-SPY spread z-score",
+    "qqq_spy_slope_20": "QQQ-SPY spread slope",
+    "rsp_spy_cumret_20": "RSP-SPY 20d cumulative return spread",
+    "rsp_spy_cumret_60": "RSP-SPY 60d cumulative return spread",
+    "rsp_spy_zscore_60": "RSP-SPY spread z-score",
+    "rsp_spy_slope_20": "RSP-SPY spread slope",
+    "bestmatch_spy_cumret_60": "Bestmatch-SPY 60d cumret",
+    "bestmatch_spy_zscore_60": "Bestmatch-SPY z-score",
+    "w_qqq_spy_cumret_12": "Weekly QQQ-SPY 12w cumret",
+    "w_qqq_spy_zscore_12": "Weekly QQQ-SPY z-score",
+    "w_qqq_spy_slope_4": "Weekly QQQ-SPY slope",
+    "w_rsp_spy_cumret_12": "Weekly RSP-SPY 12w cumret",
+    "w_rsp_spy_zscore_12": "Weekly RSP-SPY z-score",
+    "w_rsp_spy_slope_4": "Weekly RSP-SPY slope",
+    "w_bestmatch_spy_cumret_12": "Weekly bestmatch-SPY cumret",
+    "w_bestmatch_spy_zscore_12": "Weekly bestmatch-SPY z-score",
+
+    # === RELATIVE STRENGTH (EXPANSION) ===
+    "rel_strength_spy": "Relative strength vs SPY",
     "rel_strength_spy_zscore": "Z-score of RS vs SPY",
+    "rel_strength_spy_rsi": "RSI of relative strength vs SPY",
     "rel_strength_qqq": "Relative strength vs QQQ",
     "rel_strength_qqq_zscore": "Z-score of RS vs QQQ",
     "rel_strength_sector_zscore": "Z-score of RS vs sector",
-    "rel_strength_sector_ew_norm": "RS vs equal-weight sector (normalized)",
-    "rel_strength_sector_ew_macd": "MACD of RS vs EW sector",
-    "rel_strength_sector_ew_macd_hist": "MACD histogram of RS vs EW sector",
+    "rel_strength_sector_rsi": "RSI of RS vs sector",
+    "rel_strength_sector_vs_market": "Sector RS vs market",
+    "w_rel_strength_spy": "Weekly RS vs SPY",
+    "w_rel_strength_spy_zscore": "Weekly RS vs SPY z-score",
+    "w_rel_strength_qqq": "Weekly RS vs QQQ",
+    "w_rel_strength_sector": "Weekly RS vs sector",
+    "w_rel_strength_sector_zscore": "Weekly RS vs sector z-score",
+    "rel_strength_qqq_spy_spread": "QQQ-SPY relative strength spread",
 
-    # === BREADTH FEATURES (EXPANSION) ===
-    "ad_ratio_ema10": "Advance-decline ratio (10-day EMA)",
-    "ad_ratio_universe": "Universe-wide A/D ratio",
-    "ad_thrust_10d": "10-day A/D thrust (breadth momentum)",
-    "mcclellan_oscillator": "McClellan oscillator (breadth momentum)",
-    "pct_universe_above_ma20": "% of universe above 20-day MA",
-    "pct_universe_above_ma50": "% of universe above 50-day MA",
-
-    # === CROSS-SECTIONAL FEATURES (EXPANSION) ===
-    "vol_regime_cs_median": "Cross-sectional median vol regime",
-    "vol_regime_rel": "Relative vol regime vs median",
+    # === CROSS-SECTIONAL MOMENTUM (EXPANSION) ===
     "xsec_mom_5d_z": "5-day momentum cross-sectional z-score",
     "xsec_mom_60d_z": "60-day momentum cross-sectional z-score",
+    "xsec_mom_5d_sect_neutral_z": "5d sector-neutral momentum z-score",
+    "xsec_mom_20d_sect_neutral_z": "20d sector-neutral momentum z-score",
     "xsec_pct_20d": "20-day return percentile (0-100)",
-    "xsec_pct_20d_sect": "20-day return percentile within sector",
+    "xsec_pct_60d": "60-day return percentile",
+    "w_xsec_mom_1w_z": "Weekly 1w momentum z-score",
+    "w_xsec_mom_13w_z": "Weekly 13w momentum z-score",
+    "w_xsec_mom_4w_sect_neutral_z": "Weekly 4w sector-neutral z-score",
+    "w_xsec_pct_4w": "Weekly 4w percentile",
+    "w_xsec_pct_13w": "Weekly 13w percentile",
+    "w_xsec_pct_4w_sect": "Weekly 4w sector percentile",
 
-    # === VIX/MACRO FEATURES (EXPANSION) ===
-    "vix_percentile_252d": "VIX percentile vs 252-day history",
-    "vix_zscore_60d": "VIX z-score vs 60-day history",
-    "vix_ma20_ratio": "VIX / 20-day MA ratio (term structure)",
-    "vix_vxn_spread": "VIX-VXN spread (equity vs nasdaq vol)",
+    # === LIQUIDITY (EXPANSION) ===
+    "vwap_dist_5d_zscore": "Z-scored distance from 5d VWAP",
+    "vwap_dist_10d_zscore": "Z-scored distance from 10d VWAP",
+    "lower_shadow_ratio": "Lower shadow / range (buying pressure)",
+    "overnight_ratio": "Overnight vs intraday move ratio",
+    "range_efficiency": "Close move / HL range (trend quality)",
+    "rel_volume_20d": "Relative volume vs 20d average",
+    "volume_direction": "Volume-weighted price direction",
+    "pv_divergence_5d": "5-day price-volume divergence",
+    "amihud_illiq_ratio": "Amihud illiquidity ratio",
+    "illiquidity_score": "Composite illiquidity score",
+    "w_vwap_dist_20d_zscore": "Weekly VWAP distance z-score",
+    "w_range_efficiency": "Weekly range efficiency",
+    "w_rel_volume_20d": "Weekly relative volume",
+    "w_illiquidity_score": "Weekly illiquidity score",
 
-    # === FRED MACRO FEATURES (EXPANSION) ===
-    "fred_dgs10": "10-year Treasury yield",
-    "fred_dgs10_chg5d": "5-day change in 10Y yield",
-    "fred_dgs10_chg20d": "20-day change in 10Y yield",
-    "fred_dgs2": "2-year Treasury yield",
-    "fred_dgs2_chg5d": "5-day change in 2Y yield",
-    "fred_t10y2y": "10Y-2Y yield spread (yield curve)",
-    "fred_t10y2y_z60": "Yield curve z-score (60-day)",
-    "fred_bamlh0a0hym2": "High yield OAS spread",
-    "fred_bamlh0a0hym2_z60": "HY spread z-score (credit stress)",
-    "fred_bamlh0a0hym2_pct252": "HY spread percentile (252-day)",
-    "fred_icsa": "Initial jobless claims",
-    "fred_icsa_z52w": "Jobless claims z-score (52-week)",
-    "fred_nfci": "Chicago Fed Financial Conditions Index",
-    "fred_nfci_chg4w": "4-week change in NFCI",
-    "fred_vixcls": "VIX close (from FRED)",
+    # === MARKET BREADTH (EXPANSION) ===
+    "ad_ratio_ema10": "Advance-decline ratio (10-day EMA)",
+    "ad_ratio_universe": "Universe-wide A/D ratio",
+    "mcclellan_oscillator": "McClellan oscillator (breadth momentum)",
+    "w_ad_ratio_ema10": "Weekly A/D ratio EMA",
+    "w_mcclellan_oscillator": "Weekly McClellan oscillator",
+    "w_ad_thrust_4w": "Weekly 4w A/D thrust",
 
-    # === INTERMARKET FEATURES (EXPANSION) ===
-    "gold_spy_ratio_zscore": "Gold/SPY z-score",
-    "dollar_momentum_20d": "Dollar index 20-day momentum",
-    "dollar_percentile_252d": "Dollar percentile (252-day)",
-    "oil_momentum_20d": "Crude oil 20-day momentum",
+    # === INTERMARKET RATIOS (EXPANSION) ===
+    "copper_gold_ratio": "Copper/Gold ratio - growth indicator",
+    "gold_spy_ratio": "Gold/SPY ratio - risk-off indicator",
     "cyclical_defensive_ratio": "Cyclicals vs defensives ratio",
-    "financials_utilities_ratio": "XLF/XLU ratio (rate expectations)",
     "tech_spy_ratio": "Tech/SPY ratio (growth preference)",
-    "equity_bond_corr_60d": "60-day SPY-TLT correlation",
+    "financials_utilities_ratio": "XLF/XLU ratio (rate expectations)",
+    "w_copper_gold_ratio": "Weekly copper/gold ratio",
+    "w_gold_spy_ratio": "Weekly gold/SPY ratio",
+    "w_cyclical_defensive_ratio": "Weekly cyclical/defensive",
+    "w_tech_spy_ratio": "Weekly tech/SPY ratio",
+    "w_financials_utilities_ratio": "Weekly financials/utilities",
+
+    # === MACRO (FRED) (EXPANSION) ===
+    "fred_bamlh0a0hym2_z60": "HY spread 60d z-score",
+    "fred_bamlh0a0hym2_chg20d": "HY spread 20d change",
+    "fred_dgs10_chg20d": "10Y Treasury 20d change",
+    "fred_dgs10_z60": "10Y Treasury 60d z-score",
+    "fred_dgs2_chg5d": "2Y Treasury 5d change",
+    "fred_t10y2y_z60": "Yield curve (10Y-2Y) z-score",
+    "fred_t10y3m_z60": "Yield curve (10Y-3M) z-score",
+    "fred_nfci_chg4w": "Financial conditions 4w change",
+    "fred_nfci_z52w": "Financial conditions 52w z-score",
+    "fred_icsa_chg4w": "Initial claims 4w change",
+    "fred_icsa_z52w": "Initial claims 52w z-score",
+    "fred_ccsa_chg4w": "Continued claims 4w change",
+    "w_fred_bamlh0a0hym2_chg20d": "Weekly HY spread change",
+    "w_fred_dgs10_z60": "Weekly 10Y z-score",
+    "w_fred_dgs2_chg20d": "Weekly 2Y change",
+    "w_fred_t10y2y_z60": "Weekly yield curve z-score",
+    "w_fred_nfci_chg4w": "Weekly NFCI change",
+    "w_fred_icsa_chg4w": "Weekly claims change",
+    "w_fred_icsa_z52w": "Weekly claims z-score",
+    "w_fred_ccsa_z52w": "Weekly continued claims z-score",
+
+    # === VOLUME ANALYSIS (EXPANSION) ===
+    "obv_z_60": "60-day OBV z-score",
+    "rdollar_vol_20": "Relative dollar volume vs 20d avg",
+    "volshock_z": "Volume shock z-score",
+    "volshock_dir": "Volume shock direction",
+    "w_obv_z_60": "Weekly OBV z-score",
+    "w_rdollar_vol_20": "Weekly relative dollar volume",
+    "w_volshock_z": "Weekly volume shock z-score",
+    "w_volshock_dir": "Weekly volume shock direction",
+
+    # === REGIME & CORRELATION (EXPANSION) ===
     "credit_spread_zscore": "Credit spread z-score",
     "yield_curve_zscore": "Yield curve z-score",
+    "equity_bond_corr_60d": "60-day equity-bond correlation",
+    "w_credit_spread_zscore": "Weekly credit spread z-score",
+    "w_yield_curve_zscore": "Weekly yield curve z-score",
+    "w_quiet_trend": "Weekly quiet trend",
+    "w_trend_alignment": "Weekly trend alignment",
+    "dollar_momentum_20d": "Dollar 20-day momentum",
 }
 
 # Feature categories with expected NaN ranges
@@ -580,10 +683,10 @@ def print_summary(features_analysis: Dict, targets_analysis: Dict, base_features
     print("DATA QUALITY REPORT")
     print("=" * 80)
 
-    # === BASE_FEATURES VALIDATION (Golden Reference) ===
+    # === BASE_FEATURES V2 VALIDATION (Golden Reference) ===
     if base_features_analysis:
         print(f"\n{'='*40}")
-        print("BASE_FEATURES VALIDATION (Golden Reference)")
+        print("BASE_FEATURES V2 VALIDATION (~38 curated core features)")
         print(f"{'='*40}")
         valid = base_features_analysis.get("valid", [])
         missing = base_features_analysis.get("missing", [])
@@ -617,10 +720,10 @@ def print_summary(features_analysis: Dict, targets_analysis: Dict, base_features
             for feat, rate in sorted(high_nan_base, key=lambda x: -x[1])[:5]:
                 print(f"   - {feat}: {rate:.1f}%")
 
-    # === EXPANSION_CANDIDATES VALIDATION ===
+    # === EXPANSION_CANDIDATES V2 VALIDATION ===
     if expansion_analysis and "error" not in expansion_analysis:
         print(f"\n{'='*40}")
-        print("EXPANSION_CANDIDATES (Feature Selection Pool)")
+        print("EXPANSION_CANDIDATES V2 (~200 features for forward selection)")
         print(f"{'='*40}")
 
         coverage = expansion_analysis["coverage"]
@@ -819,14 +922,14 @@ def main():
 Examples:
     python run_data_quality.py
     python run_data_quality.py --verbose
-    python run_data_quality.py --features artifacts/features_complete.parquet
+    python run_data_quality.py --features artifacts/features_daily.parquet
         """
     )
     parser.add_argument(
         "--features",
         type=str,
         default="artifacts/features_daily.parquet",
-        help="Path to features parquet file"
+        help="Path to features parquet file (default: features_daily.parquet with filtered output)"
     )
     parser.add_argument(
         "--targets",

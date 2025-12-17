@@ -259,6 +259,70 @@ def _filter_untradeable_securities(df: pd.DataFrame, sym_col: str, desc_col: Opt
     return filtered_df
 
 
+def filter_suspicious_price_symbols(
+    data: Dict[str, pd.DataFrame],
+    max_price: float = 50000.0,
+    min_price: float = 0.01,
+    max_price_range_ratio: float = 10000.0,
+) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
+    """
+    Filter out symbols with suspicious price data (likely unadjusted reverse splits).
+
+    Detection rules:
+    1. Any close price > max_price (default $50k) - extreme price suggests data issue
+    2. Any close price < min_price (default $0.01) - penny stock data often unreliable
+    3. Price range ratio (max/min) > max_price_range_ratio - suggests split adjustment issues
+
+    Args:
+        data: Dict of {metric: DataFrame with symbols as columns}
+        max_price: Maximum allowed close price (default $50k)
+        min_price: Minimum allowed close price (default $0.01)
+        max_price_range_ratio: Maximum allowed ratio of max/min price (default 10000x)
+
+    Returns:
+        Tuple of (filtered_data, list of removed symbols)
+    """
+    if 'Close' not in data or data['Close'].empty:
+        return data, []
+
+    close_df = data['Close']
+    symbols_to_remove = []
+
+    for sym in close_df.columns:
+        prices = close_df[sym].dropna()
+        if len(prices) == 0:
+            continue
+
+        price_max = prices.max()
+        price_min = prices.min()
+
+        # Check for extreme prices
+        if price_max > max_price:
+            symbols_to_remove.append(sym)
+            continue
+
+        # Check for penny stocks
+        if price_min < min_price:
+            symbols_to_remove.append(sym)
+            continue
+
+        # Check for suspicious price range (split adjustment issues)
+        if price_min > 0 and (price_max / price_min) > max_price_range_ratio:
+            symbols_to_remove.append(sym)
+            continue
+
+    if symbols_to_remove:
+        print(f"   ⚠️  Filtering {len(symbols_to_remove)} symbols with suspicious prices: {symbols_to_remove[:5]}{'...' if len(symbols_to_remove) > 5 else ''}")
+        # Filter from all metrics
+        filtered_data = {}
+        for metric, df in data.items():
+            keep_cols = [c for c in df.columns if c not in symbols_to_remove]
+            filtered_data[metric] = df[keep_cols]
+        return filtered_data, symbols_to_remove
+
+    return data, []
+
+
 def _symbols_from_csv(path: str, max_symbols: Optional[int] = None, filter_untradeable: bool = True) -> List[str]:
     """
     Load symbols from CSV, optionally filtering out untradeable securities.
@@ -479,6 +543,12 @@ def load_stock_universe(max_symbols: Optional[int] = None,
             cached = cached_limited
             print(f"📊 Filtered to {len(filtered_symbols)} tradeable symbols (removed SPACs, ADRs, etc.)")
 
+            # Filter symbols with suspicious prices (unadjusted reverse splits, etc.)
+            cached, removed_price = filter_suspicious_price_symbols(cached)
+            if removed_price:
+                # Also remove from sectors
+                sectors = {k: v for k, v in sectors.items() if k not in removed_price}
+
             return cached, sectors
 
         # When not including sectors, still filter out untradeable securities
@@ -490,6 +560,9 @@ def load_stock_universe(max_symbols: Optional[int] = None,
             cached_limited[metric] = df[available_symbols] if available_symbols else df.iloc[:, :0]
         cached = cached_limited
         print(f"📊 Filtered to {len(filtered_symbols)} tradeable symbols")
+
+        # Filter symbols with suspicious prices (unadjusted reverse splits, etc.)
+        cached, _ = filter_suspicious_price_symbols(cached)
 
         return cached
 

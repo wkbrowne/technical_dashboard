@@ -473,10 +473,22 @@ def compute_joint_factor_features_for_symbol(
     factor_names = ['market']
     factor_series = []
 
+    # Helper to align factor returns to target index (handles weekly date mismatches)
+    def align_factor_to_index(factor_idx, factor_vals, target_index):
+        """Align factor returns to target index using ffill/bfill for date mismatches."""
+        factor_series = pd.Series(factor_vals, index=factor_idx, dtype='float64')
+        if len(factor_series) == 0 or len(target_index) == 0:
+            return pd.Series(index=target_index, dtype='float64')
+        # Union indices, ffill/bfill, then select target dates
+        # This handles weekly data where dates may not match exactly
+        combined_idx = factor_series.index.union(target_index).sort_values()
+        filled = factor_series.reindex(combined_idx).ffill().bfill()
+        return filled.reindex(target_index)
+
     # Market factor (SPY) - base factor
     if MARKET_FACTOR in factor_returns:
         mkt_idx, mkt_vals = factor_returns[MARKET_FACTOR]
-        mkt_ret = pd.Series(mkt_vals, index=mkt_idx, dtype='float64').reindex(ret_index)
+        mkt_ret = align_factor_to_index(mkt_idx, mkt_vals, ret_index)
         factor_series.append(mkt_ret)
     else:
         return result  # Need market factor
@@ -484,7 +496,7 @@ def compute_joint_factor_features_for_symbol(
     # Growth spread (QQQ - SPY) - captures growth/tech premium over market
     if GROWTH_FACTOR in factor_returns:
         qqq_idx, qqq_vals = factor_returns[GROWTH_FACTOR]
-        qqq_ret = pd.Series(qqq_vals, index=qqq_idx, dtype='float64').reindex(ret_index)
+        qqq_ret = align_factor_to_index(qqq_idx, qqq_vals, ret_index)
         qqq_spread = qqq_ret - mkt_ret  # Orthogonalize vs market
         factor_series.append(qqq_spread)
         factor_names.append('qqq')
@@ -492,7 +504,7 @@ def compute_joint_factor_features_for_symbol(
     # Best-match spread (bestmatch - SPY) - captures sector/subsector premium over market
     if best_match_etf and best_match_etf in factor_returns:
         bm_idx, bm_vals = factor_returns[best_match_etf]
-        bm_ret = pd.Series(bm_vals, index=bm_idx, dtype='float64').reindex(ret_index)
+        bm_ret = align_factor_to_index(bm_idx, bm_vals, ret_index)
         bm_spread = bm_ret - mkt_ret  # Orthogonalize vs market
         factor_series.append(bm_spread)
         factor_names.append('bestmatch')
@@ -501,7 +513,7 @@ def compute_joint_factor_features_for_symbol(
     rsp_sym, spy_sym = BREADTH_SPREAD
     if rsp_sym in factor_returns and spy_sym in factor_returns:
         rsp_idx, rsp_vals = factor_returns[rsp_sym]
-        rsp_ret = pd.Series(rsp_vals, index=rsp_idx, dtype='float64').reindex(ret_index)
+        rsp_ret = align_factor_to_index(rsp_idx, rsp_vals, ret_index)
         breadth_spread = rsp_ret - mkt_ret  # Use mkt_ret directly (same as SPY)
         factor_series.append(breadth_spread)
         factor_names.append('breadth')

@@ -106,14 +106,24 @@ def _compute_ratio(
     return ratio.rename(name)
 
 
-def _compute_percentile(series: pd.Series, window: int = 252) -> pd.Series:
-    """Compute rolling percentile rank (0-100)."""
-    def pct_rank(x):
-        valid = x.dropna()
-        if len(valid) < 10:
+def _compute_percentile(series: pd.Series, window: int = 252, min_periods: int = 50) -> pd.Series:
+    """Compute rolling percentile rank (0-100) using vectorized operations.
+
+    This uses raw=True for ~100x speedup over raw=False (numpy arrays vs pandas Series).
+    """
+    def pct_rank_raw(x):
+        """Compute percentile rank from raw numpy array."""
+        # x is a numpy array (raw=True), last element is current value
+        if np.isnan(x[-1]):
             return np.nan
-        return (valid.iloc[-1] > valid.iloc[:-1]).mean() * 100
-    return series.rolling(window, min_periods=50).apply(pct_rank, raw=False)
+        valid_mask = ~np.isnan(x[:-1])
+        n_valid = valid_mask.sum()
+        if n_valid < 10:
+            return np.nan
+        # Percentile = fraction of prior values that current value exceeds
+        return (x[-1] > x[:-1][valid_mask]).sum() / n_valid * 100
+
+    return series.rolling(window, min_periods=min_periods).apply(pct_rank_raw, raw=True)
 
 
 def _compute_zscore(series: pd.Series, window: int = 60) -> pd.Series:
