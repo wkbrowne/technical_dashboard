@@ -18,7 +18,7 @@ V2 Feature Set (updated Dec 2024):
 Usage:
     conda run -n stocks_predictor python run_data_quality.py
     conda run -n stocks_predictor python run_data_quality.py --verbose
-    conda run -n stocks_predictor python run_data_quality.py --features artifacts/features_daily.parquet
+    conda run -n stocks_predictor python run_data_quality.py --features artifacts/features_complete.parquet
 """
 
 import argparse
@@ -877,7 +877,7 @@ def print_summary(features_analysis: Dict, targets_analysis: Dict, base_features
             recommendations.append(
                 "Cross-sectional features have elevated NaN rate.\n"
                 "   Check: Sufficient symbols being processed\n"
-                "   Look for: Missing ETF data in stock_data_etf.parquet"
+                "   Look for: Missing ETF data in cache/etfs/stock_data_etf.parquet"
             )
 
     # Target anomalies
@@ -922,14 +922,14 @@ def main():
 Examples:
     python run_data_quality.py
     python run_data_quality.py --verbose
-    python run_data_quality.py --features artifacts/features_daily.parquet
+    python run_data_quality.py --features artifacts/features_complete.parquet
         """
     )
     parser.add_argument(
         "--features",
         type=str,
-        default="artifacts/features_daily.parquet",
-        help="Path to features parquet file (default: features_daily.parquet with filtered output)"
+        default="artifacts/features_filtered.parquet",
+        help="Path to features parquet file (default: features_filtered.parquet, ML-ready curated features)"
     )
     parser.add_argument(
         "--targets",

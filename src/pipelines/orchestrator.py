@@ -26,6 +26,7 @@ from joblib import Parallel, delayed
 # Feature module imports with fallback for both relative and absolute imports
 try:
     # Try relative imports first (when run as module)
+    from .checkpoint import CheckpointManager, CheckpointConfig, get_stage_before
     from ..features.assemble import assemble_indicators_from_wide
     from ..features.single_stock import compute_single_stock_features
     from ..features.cross_sectional import compute_cross_sectional_features, compute_weekly_cross_sectional_features
@@ -586,8 +587,24 @@ def _compute_higher_tf_for_symbol(
                 # First column is datetime but not named 'date'
                 daily_df = daily_df.rename(columns={daily_df.columns[0]: 'date'})
 
-        # Step 1: Resample to higher timeframe
-        resampled = TimeframeResampler.resample_single(daily_df, timeframe, symbol)
+        # Step 1: Get higher timeframe OHLCV data
+        # For WEEKLY timeframe, try cached data first (much faster)
+        resampled = None
+        used_cache = False
+        if timeframe == TimeframeType.WEEKLY:
+            cached_weekly = TimeframeResampler.get_cached_weekly_ohlcv(symbol)
+            if cached_weekly is not None and len(cached_weekly) >= 5:
+                # Use cached weekly data - already has lowercase columns, DatetimeIndex
+                resampled = cached_weekly.reset_index()
+                # Rename index column to week_end for merge_to_daily
+                if resampled.columns[0] not in ('week_end', 'date'):
+                    resampled = resampled.rename(columns={resampled.columns[0]: 'week_end'})
+                used_cache = True
+                logger.debug(f"Using cached weekly data for {symbol}: {len(resampled)} bars")
+
+        # Fall back to inline resampling if no cache
+        if resampled is None:
+            resampled = TimeframeResampler.resample_single(daily_df, timeframe, symbol)
 
         if resampled.empty or len(resampled) < 5:
             # Restore index if we changed it
@@ -909,7 +926,8 @@ def run_pipeline_v2(
     sectors: Optional[Dict[str, str]] = None,
     sector_to_etf: Optional[Dict[str, str]] = None,
     sp500_tickers: Optional[List[str]] = None,
-    full_output: bool = False
+    full_output: bool = False,
+    checkpoint_config: Optional[CheckpointConfig] = None
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Simplified pipeline using new config system.
@@ -933,6 +951,7 @@ def run_pipeline_v2(
         sp500_tickers: List of S&P 500 tickers (for breadth features)
         full_output: If True, primary return is all computed features. If False (default),
             primary return is filtered to curated feature set defined in base_features.py
+        checkpoint_config: CheckpointConfig for enabling staged checkpoints and resumption
 
     Returns:
         Tuple of (features_df, targets_df, features_complete_df, features_filtered_df) where:
@@ -941,9 +960,26 @@ def run_pipeline_v2(
         - features_complete_df: ALL computed features (~600+)
         - features_filtered_df: Curated ML-ready features (~250)
     """
+    import gc
+    from datetime import datetime as dt
+
     # Use ParallelConfig if provided, otherwise create from n_jobs
     if parallel_config is None:
         parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size='auto')
+
+    # Initialize checkpoint manager
+    checkpoint_mgr = None
+    if checkpoint_config is not None and checkpoint_config.enabled:
+        checkpoint_mgr = CheckpointManager(checkpoint_config)
+        resume_stage = checkpoint_mgr.get_resume_stage()
+        if resume_stage:
+            logger.info(f"Checkpoint resumption enabled from stage: {resume_stage}")
+            # Load the checkpoint from the stage before resume point
+            prev_stage = get_stage_before(resume_stage)
+            if prev_stage:
+                logger.info(f"Loading checkpoint from: {prev_stage}")
+                indicators_by_symbol = checkpoint_mgr.load_checkpoint(prev_stage)
+                logger.info(f"Loaded {len(indicators_by_symbol)} symbols from checkpoint")
 
     if feature_config is None:
         feature_config = FeatureConfig.default()
@@ -1019,9 +1055,16 @@ def run_pipeline_v2(
         # Explicitly shut down loky workers to free memory immediately
         shutdown_loky_workers()
 
+    # Checkpoint: 01_single_stock
+    if checkpoint_mgr and not checkpoint_mgr.should_skip_stage("01_single_stock"):
+        stage_start = dt.now()
+        checkpoint_mgr.save_pipeline_state("01_single_stock", "running")
+        checkpoint_mgr.save_checkpoint("01_single_stock", indicators_by_symbol, stage_start)
+        gc.collect()
+
     # Step 2: Compute cross-sectional features (per-symbol features parallelized)
     # Note: Best-match ETF mappings are computed internally using R²-based selection
-    if enabled_cs:
+    if enabled_cs and (not checkpoint_mgr or not checkpoint_mgr.should_skip_stage("02_cross_sectional")):
         with profile_stage("Cross-Sectional Features"):
             compute_cross_sectional_features(
                 indicators_by_symbol,
@@ -1034,14 +1077,29 @@ def run_pipeline_v2(
             # Shut down loky workers after cross-sectional to free memory
             shutdown_loky_workers()
 
+        # Checkpoint: 02_cross_sectional
+        if checkpoint_mgr:
+            stage_start = dt.now()
+            checkpoint_mgr.save_pipeline_state("02_cross_sectional", "running")
+            checkpoint_mgr.save_checkpoint("02_cross_sectional", indicators_by_symbol, stage_start)
+            gc.collect()
+
     # Step 2b: Add daily spread features (QQQ, SPY, QQQ-SPY, RSP-SPY)
     # These are market-level features broadcast to all symbols
-    with profile_stage("Daily Spread Features"):
-        add_spread_features(indicators_by_symbol, lag_days=1)
+    if not checkpoint_mgr or not checkpoint_mgr.should_skip_stage("03_spread_features"):
+        with profile_stage("Daily Spread Features"):
+            add_spread_features(indicators_by_symbol, lag_days=1)
+
+        # Checkpoint: 03_spread_features
+        if checkpoint_mgr:
+            stage_start = dt.now()
+            checkpoint_mgr.save_pipeline_state("03_spread_features", "running")
+            checkpoint_mgr.save_checkpoint("03_spread_features", indicators_by_symbol, stage_start)
+            gc.collect()
 
     # Step 3: Add higher timeframe features (W/M) - compute alongside daily features
     higher_tfs = [tf for tf in timeframes if tf in ['W', 'M']]
-    if higher_tfs:
+    if higher_tfs and (not checkpoint_mgr or not checkpoint_mgr.should_skip_stage("04_weekly_features")):
         with profile_stage(f"Higher Timeframe Features ({','.join(higher_tfs)})"):
             # Use dict-based parallel computation directly (avoids expensive long format conversions)
             indicators_by_symbol = compute_higher_timeframe_features_dict(
@@ -1052,9 +1110,16 @@ def run_pipeline_v2(
             # Shut down loky workers after timeframe processing to free memory
             shutdown_loky_workers()
 
+        # Checkpoint: 04_weekly_features
+        if checkpoint_mgr:
+            stage_start = dt.now()
+            checkpoint_mgr.save_pipeline_state("04_weekly_features", "running")
+            checkpoint_mgr.save_checkpoint("04_weekly_features", indicators_by_symbol, stage_start)
+            gc.collect()
+
     # Step 3b: Add weekly cross-sectional features (alpha, beta, cross-asset, FRED, breadth, relative strength)
     # These are computed on weekly-resampled data and merged back to daily
-    if 'W' in higher_tfs:
+    if 'W' in higher_tfs and (not checkpoint_mgr or not checkpoint_mgr.should_skip_stage("05_weekly_cs")):
         with profile_stage("Weekly Cross-Sectional Features"):
             compute_weekly_cross_sectional_features(
                 indicators_by_symbol,
@@ -1068,22 +1133,45 @@ def run_pipeline_v2(
             # Shut down loky workers after weekly CS features to free memory
             shutdown_loky_workers()
 
-        # Step 3c: Add weekly spread features (QQQ, SPY, QQQ-SPY, RSP-SPY on weekly data)
+        # Checkpoint: 05_weekly_cs
+        if checkpoint_mgr:
+            stage_start = dt.now()
+            checkpoint_mgr.save_pipeline_state("05_weekly_cs", "running")
+            checkpoint_mgr.save_checkpoint("05_weekly_cs", indicators_by_symbol, stage_start)
+            gc.collect()
+
+    # Step 3c: Add weekly spread features (QQQ, SPY, QQQ-SPY, RSP-SPY on weekly data)
+    if 'W' in higher_tfs and (not checkpoint_mgr or not checkpoint_mgr.should_skip_stage("06_weekly_spread")):
         with profile_stage("Weekly Spread Features"):
             add_weekly_spread_features(indicators_by_symbol, prefix="w_")
 
+        # Checkpoint: 06_weekly_spread
+        if checkpoint_mgr:
+            stage_start = dt.now()
+            checkpoint_mgr.save_pipeline_state("06_weekly_spread", "running")
+            checkpoint_mgr.save_checkpoint("06_weekly_spread", indicators_by_symbol, stage_start)
+            gc.collect()
+
     # Step 4: Interpolate NaNs (applies to daily AND higher TF features)
-    with profile_stage("NaN Interpolation"):
-        indicators_by_symbol = interpolate_internal_gaps(
-            indicators_by_symbol,
-            parallel_config=parallel_config
-        )
-        # Shut down loky workers after interpolation to free memory
-        shutdown_loky_workers()
+    if not checkpoint_mgr or not checkpoint_mgr.should_skip_stage("07_interpolated"):
+        with profile_stage("NaN Interpolation"):
+            indicators_by_symbol = interpolate_internal_gaps(
+                indicators_by_symbol,
+                parallel_config=parallel_config
+            )
+            # Shut down loky workers after interpolation to free memory
+            shutdown_loky_workers()
+
+        # Checkpoint: 07_interpolated
+        if checkpoint_mgr:
+            stage_start = dt.now()
+            checkpoint_mgr.save_pipeline_state("07_interpolated", "running")
+            checkpoint_mgr.save_checkpoint("07_interpolated", indicators_by_symbol, stage_start)
+            gc.collect()
 
     # Step 5: Generate targets (after all features computed and interpolated)
     targets_df = None
-    if include_targets:
+    if include_targets and (not checkpoint_mgr or not checkpoint_mgr.should_skip_stage("08_targets")):
         with profile_stage("Triple Barrier Targets"):
             targets_df = _generate_triple_barrier_targets(
                 indicators_by_symbol,
@@ -1092,6 +1180,13 @@ def run_pipeline_v2(
             )
             # Shut down loky workers after target generation to free memory
             shutdown_loky_workers()
+
+        # Checkpoint: 08_targets - save indicators (targets saved separately at end)
+        if checkpoint_mgr:
+            stage_start = dt.now()
+            checkpoint_mgr.save_pipeline_state("08_targets", "running")
+            checkpoint_mgr.save_checkpoint("08_targets", indicators_by_symbol, stage_start)
+            gc.collect()
 
     # Step 6: Convert to final long format (sequential operation - ensure workers are shut down)
     shutdown_loky_workers()  # Ensure all parallel workers are terminated before sequential work
@@ -1124,6 +1219,20 @@ def run_pipeline_v2(
     logger.info(f"Pipeline v2 completed: {len(daily_df_complete)} rows, "
                 f"{len(daily_df_complete.columns)} complete cols, "
                 f"{len(daily_df_filtered.columns)} filtered cols")
+
+    # Final checkpoint: 09_final
+    if checkpoint_mgr:
+        stage_start = dt.now()
+        checkpoint_mgr.save_pipeline_state("09_final", "completed")
+        checkpoint_mgr.save_checkpoint("09_final", indicators_by_symbol, stage_start)
+
+        # Cleanup checkpoints if configured
+        if checkpoint_config.cleanup_on_success:
+            logger.info("Cleaning up intermediate checkpoints...")
+            checkpoint_mgr.cleanup_checkpoints(keep_final=True)
+
+        # Print checkpoint summary
+        checkpoint_mgr.print_checkpoint_summary()
 
     # Return filtered by default (for backward compatibility), or full if requested
     daily_df = daily_df_complete if full_output else daily_df_filtered

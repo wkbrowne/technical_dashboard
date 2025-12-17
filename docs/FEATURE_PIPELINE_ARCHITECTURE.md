@@ -22,11 +22,17 @@ For the high-level ML pipeline (feature selection, hyperparameter tuning, model 
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    WEEKLY DATA GENERATION [NOT YET IMPLEMENTED]                 │
+│                    WEEKLY DATA GENERATION [FULLY IMPLEMENTED]                   │
 ├─────────────────────────────────────────────────────────────────────────────────┤
-│  [PLANNED] Daily OHLCV → Resample W-FRI → cache/stock_data_weekly.parquet       │
-│  [PLANNED] ETF OHLCV   → Resample W-FRI → cache/etf_data_weekly.parquet         │
-│  [CURRENT] Weekly resampling happens inline during feature computation          │
+│  [DONE] --resample-weekly flag → cache/stock_data_weekly.parquet                │
+│  [DONE] --resample-weekly flag → cache/etf_data_weekly.parquet                  │
+│  [DONE] Pipeline auto-loads cached weekly data (skips inline resampling)        │
+│                                                                                  │
+│  Usage:                                                                          │
+│    1. Generate cache: python -m src.cli.download --universe sp500 --resample-weekly
+│    2. Run pipeline: python -m src.cli.compute --timeframes D,W                  │
+│       → Automatically loads cached weekly data if available                     │
+│       → Falls back to inline resampling if cache not found                      │
 │                                                                                  │
 │  Resampling rules:                                                               │
 │  - open: first of week                                                           │
@@ -47,8 +53,8 @@ For the high-level ML pipeline (feature selection, hyperparameter tuning, model 
 │  - volume.py (volume ratios)      │   │  - Weekly cross-asset             │
 │  - distance.py (distance to MA)   │   │  - Weekly alpha momentum          │
 │  - range_breakout.py              │   │                                   │
-│                                   │   │  [CURRENT: resamples inline]      │
-│  Cross-Sectional Features:        │   │  [PLANNED: load cached weekly]    │
+│                                   │   │  [DONE: loads cached weekly]      │
+│  Cross-Sectional Features:        │   │  Falls back to inline if no cache │
 │  - alpha.py (alpha vs benchmarks) │   │                                   │
 │  - xsec.py (cross-sec momentum)   │   │                                   │
 │  - breadth.py (market breadth)    │   │                                   │
@@ -366,17 +372,26 @@ Daily spreads are lagged by 1 day to prevent look-ahead bias.
 
 ### 3.6 Weekly Data Generation
 
-**[NOT YET IMPLEMENTED] Pre-computed weekly files**
+**[PARTIALLY IMPLEMENTED] Pre-computed weekly cache files**
 
-> **Current behavior:** Weekly resampling happens inline during pipeline execution.
-> **Target architecture:** Pre-compute and cache weekly data for reuse.
+> **Status:** Cache generation implemented via `--resample-weekly` flag.
+> **Remaining:** Pipeline integration to load cached weekly data instead of inline resampling.
 
-Instead of computing weekly resampling inline, generate and cache weekly data:
+Generate pre-computed weekly cache files from daily data:
 
-**Command (planned):**
+**Command:**
 ```bash
-python -m src.cli.download --resample-weekly
+# Generate weekly cache for both stocks and ETFs
+python -m src.cli.download --universe all --resample-weekly
+
+# Or generate after download
+python -m src.cli.download --universe sp500 --resample-weekly
+python -m src.cli.download --universe etf --resample-weekly
 ```
+
+**Output Files:**
+- `cache/stock_data_weekly.parquet` - Weekly OHLCV for stocks
+- `cache/etf_data_weekly.parquet` - Weekly OHLCV for ETFs
 
 **Resampling Rules (W-FRI):**
 ```python
@@ -532,10 +547,10 @@ The output should contain:
 
 ## 3.11 Intermediate Checkpoint Architecture
 
-**[NOT YET IMPLEMENTED] Checkpoint system for staged processing**
+**[FULLY IMPLEMENTED] Checkpoint system for staged processing**
 
-> **Current behavior:** Pipeline runs as single monolithic execution with no intermediate saves.
-> **Target architecture:** Output after each thematic step, clear memory, read back for next step.
+> **Implementation:** `src/pipelines/checkpoint.py` (CheckpointManager, CheckpointConfig)
+> **CLI flags:** `--checkpoint-dir`, `--resume-from`, `--cleanup-checkpoints`, `--list-checkpoints`
 
 For large datasets or memory-constrained environments, the pipeline should output intermediate results after each major thematic computation stage. This allows:
 

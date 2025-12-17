@@ -180,6 +180,170 @@ class TimeframeResampler:
         # Keep legacy attribute for backward compatibility
         self.config = TimeframeConfig.from_parallel_config(self.parallel_config)
 
+    # Class-level cache storage for weekly data
+    _weekly_cache: Optional[Dict[str, pd.DataFrame]] = None
+    _weekly_cache_path: Optional[str] = None
+
+    @classmethod
+    def load_weekly_cache(cls, cache_path: str) -> bool:
+        """Load pre-computed weekly cache for all symbols.
+
+        The cache is stored at class level and reused across all symbols.
+        Call this once before processing to enable cache-based weekly data.
+
+        Args:
+            cache_path: Path to weekly parquet cache (e.g., cache/stock_data_weekly.parquet)
+
+        Returns:
+            True if cache was loaded successfully, False otherwise
+        """
+        import os
+        if not os.path.exists(cache_path):
+            logger.info(f"Weekly cache not found at {cache_path}")
+            return False
+
+        try:
+            # Import the loader function
+            try:
+                from ..data.loader import load_weekly_cache as _load_weekly_cache
+            except ImportError:
+                from src.data.loader import load_weekly_cache as _load_weekly_cache
+
+            cache_data = _load_weekly_cache(cache_path)
+            if cache_data:
+                cls._weekly_cache = cache_data
+                cls._weekly_cache_path = cache_path
+                # Log cache info
+                sample_metric = next(iter(cache_data.values()))
+                n_symbols = len(sample_metric.columns)
+                n_weeks = len(sample_metric)
+                logger.info(f"Weekly cache loaded: {n_symbols} symbols, {n_weeks} weeks")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to load weekly cache: {e}")
+            return False
+
+    @classmethod
+    def merge_weekly_cache(cls, cache_path: str) -> bool:
+        """Merge additional weekly cache data into existing cache.
+
+        Use this to add ETF weekly data to stock weekly data, for example.
+
+        Args:
+            cache_path: Path to additional weekly parquet cache
+
+        Returns:
+            True if cache was merged successfully, False otherwise
+        """
+        import os
+        if not os.path.exists(cache_path):
+            logger.info(f"Weekly cache not found at {cache_path}")
+            return False
+
+        if cls._weekly_cache is None:
+            # No existing cache, just load this one
+            return cls.load_weekly_cache(cache_path)
+
+        try:
+            # Import the loader function
+            try:
+                from ..data.loader import load_weekly_cache as _load_weekly_cache
+            except ImportError:
+                from src.data.loader import load_weekly_cache as _load_weekly_cache
+
+            new_cache_data = _load_weekly_cache(cache_path)
+            if new_cache_data:
+                # Merge metrics - add new columns from new cache
+                for metric, new_df in new_cache_data.items():
+                    if metric in cls._weekly_cache:
+                        # Merge columns (symbols) that don't exist
+                        existing_df = cls._weekly_cache[metric]
+                        new_symbols = [s for s in new_df.columns if s not in existing_df.columns]
+                        if new_symbols:
+                            cls._weekly_cache[metric] = pd.concat(
+                                [existing_df, new_df[new_symbols]], axis=1
+                            )
+                    else:
+                        cls._weekly_cache[metric] = new_df
+
+                # Log merge info
+                sample_metric = next(iter(cls._weekly_cache.values()))
+                n_symbols = len(sample_metric.columns)
+                logger.info(f"Weekly cache merged: now {n_symbols} symbols total")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to merge weekly cache: {e}")
+            return False
+
+    @classmethod
+    def clear_weekly_cache(cls) -> None:
+        """Clear the loaded weekly cache to free memory."""
+        cls._weekly_cache = None
+        cls._weekly_cache_path = None
+        logger.info("Weekly cache cleared")
+
+    @classmethod
+    def get_cached_weekly_ohlcv(cls, symbol: str) -> Optional[pd.DataFrame]:
+        """Get weekly OHLCV data for a symbol from cache.
+
+        Args:
+            symbol: Stock symbol
+
+        Returns:
+            DataFrame with weekly OHLCV data (lowercase columns, DatetimeIndex),
+            or None if not in cache
+        """
+        if cls._weekly_cache is None:
+            return None
+
+        # Check if symbol exists in cache
+        sample_metric = next(iter(cls._weekly_cache.values()))
+        if symbol not in sample_metric.columns:
+            return None
+
+        # Build DataFrame from cached metrics
+        ohlcv_data = {}
+        metric_map = {
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'AdjClose': 'adjclose',
+            'Volume': 'volume',
+        }
+
+        for cache_metric, col_name in metric_map.items():
+            if cache_metric in cls._weekly_cache:
+                metric_df = cls._weekly_cache[cache_metric]
+                if symbol in metric_df.columns:
+                    ohlcv_data[col_name] = metric_df[symbol]
+
+        if not ohlcv_data:
+            return None
+
+        # Create DataFrame
+        df = pd.DataFrame(ohlcv_data)
+        df.index.name = 'week_end'
+
+        # Add symbol column
+        df['symbol'] = symbol
+
+        # Add returns
+        if 'close' in df.columns:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                df['ret'] = np.log(pd.to_numeric(df['close'], errors='coerce')).diff()
+
+        # Drop rows where close is NaN
+        if 'close' in df.columns:
+            df = df.dropna(subset=['close'])
+
+        # Optimize dtypes
+        df = cls._optimize_dtypes(df)
+
+        return df
+
     @classmethod
     def resample_single(
         cls,

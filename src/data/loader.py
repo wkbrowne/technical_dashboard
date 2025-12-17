@@ -23,7 +23,7 @@ def _save_long_parquet(data_dict: Dict[str, pd.DataFrame], parquet_path: str) ->
     for metric, df in data_dict.items():
         if not isinstance(df, pd.DataFrame) or df.empty:
             continue
-        stacked = df.stack(dropna=False).reset_index()
+        stacked = df.stack(future_stack=True).reset_index()
         stacked.columns = ['date', 'symbol', 'value']
         stacked['metric'] = metric
         pieces.append(stacked)
@@ -596,7 +596,7 @@ def load_etf_universe(etf_symbols: Optional[List[str]] = None,
                       interval: str = "1d",
                       incremental: bool = True) -> Optional[Dict[str, pd.DataFrame]]:
     """
-    Load ETF OHLCV into dict of wide DataFrames. Caches to *_etf.parquet.
+    Load ETF OHLCV into dict of wide DataFrames. Caches to etfs/stock_data_etf.parquet.
     Choose one of:
       - etf_symbols (list)
       - etf_csv_path (CSV with Symbol column)
@@ -606,9 +606,11 @@ def load_etf_universe(etf_symbols: Optional[List[str]] = None,
         incremental: If True, only fetch missing ETFs and merge with existing cache.
                     If False, re-fetch all ETFs. Default True.
     """
-    # Cache path
-    cache_parquet = (CACHE_FILE.with_name(CACHE_FILE.stem + "_etf.parquet")
-                     if hasattr(CACHE_FILE, "with_name") else str(CACHE_FILE).replace(".pkl", "_etf.parquet"))
+    # Cache path - use etfs/ subfolder
+    cache_dir = CACHE_FILE.parent if hasattr(CACHE_FILE, "parent") else os.path.dirname(str(CACHE_FILE))
+    etf_cache_dir = os.path.join(cache_dir, "etfs")
+    os.makedirs(etf_cache_dir, exist_ok=True)
+    cache_parquet = os.path.join(etf_cache_dir, "stock_data_etf.parquet")
 
     # Resolve target ETF symbols
     if etf_csv_path and os.path.exists(etf_csv_path):
@@ -675,3 +677,133 @@ def load_etf_universe(etf_symbols: Optional[List[str]] = None,
 # Note: VIX/VXN should be downloaded via load_etf_universe() which includes
 # ^VIX and ^VXN in DEFAULT_ETFS. The RapidAPI yahoo-finance15 endpoint
 # supports these symbols. No yfinance fallback is needed.
+
+
+# ---------- Weekly Resampling ----------
+import numpy as np
+
+def resample_daily_to_weekly(
+    data: Dict[str, pd.DataFrame],
+    drop_incomplete_week: bool = True
+) -> Dict[str, pd.DataFrame]:
+    """
+    Resample daily OHLCV data to weekly (W-FRI).
+
+    Resampling rules:
+    - open: first of week
+    - high: max of week
+    - low: min of week
+    - close/adjclose: last of week (Friday)
+    - volume: sum of week
+
+    Args:
+        data: Dict of {metric: wide DataFrame with symbols as columns}
+        drop_incomplete_week: If True, drop the last week if incomplete
+
+    Returns:
+        Dict of {metric: weekly DataFrame with symbols as columns}
+    """
+    if not data:
+        return {}
+
+    # Get the common date index from any metric
+    sample_df = next(iter(data.values()))
+    if sample_df.empty:
+        return {}
+
+    # Ensure DatetimeIndex
+    if not isinstance(sample_df.index, pd.DatetimeIndex):
+        sample_df.index = pd.to_datetime(sample_df.index)
+
+    # Define aggregation rules per metric
+    agg_rules = {
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'AdjClose': 'last',
+        'Volume': 'sum',
+    }
+
+    result = {}
+    for metric, df in data.items():
+        if df.empty:
+            continue
+
+        # Ensure DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df = df.copy()
+            df.index = pd.to_datetime(df.index)
+
+        # Get agg rule for this metric
+        agg_rule = agg_rules.get(metric, 'last')
+
+        # Resample to weekly (Friday end-of-week)
+        weekly_df = df.resample('W-FRI').agg(agg_rule)
+
+        result[metric] = weekly_df
+
+    # Drop incomplete last week if requested
+    if drop_incomplete_week and result:
+        today = pd.Timestamp.now().normalize()
+        # Find last Friday
+        days_since_friday = (today.weekday() - 4) % 7
+        last_friday = today - pd.Timedelta(days=days_since_friday)
+
+        # If today is not Friday, the last week is incomplete
+        if today.weekday() != 4:
+            for metric in result:
+                # Keep only weeks up to and including the previous Friday
+                result[metric] = result[metric][result[metric].index <= last_friday]
+
+    return result
+
+
+def save_weekly_cache(
+    weekly_data: Dict[str, pd.DataFrame],
+    output_path: str
+) -> None:
+    """
+    Save weekly resampled data to parquet in long format.
+
+    Args:
+        weekly_data: Dict of {metric: weekly DataFrame}
+        output_path: Path to save parquet file
+    """
+    _save_long_parquet(weekly_data, output_path)
+    print(f"💾 Saved weekly cache to {output_path}")
+
+
+def load_weekly_cache(cache_path: str) -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    Load pre-computed weekly cache if it exists.
+
+    Args:
+        cache_path: Path to weekly parquet cache
+
+    Returns:
+        Dict of {metric: weekly DataFrame} or None if not found
+    """
+    if not os.path.exists(cache_path):
+        return None
+
+    data = _load_long_parquet(cache_path)
+    if data:
+        print(f"✅ Loaded weekly cache from {cache_path}")
+    return data
+
+
+def get_weekly_cache_path(cache_dir: str, is_etf: bool = False) -> str:
+    """
+    Get the standard path for weekly cache file.
+
+    Args:
+        cache_dir: Base cache directory path (e.g., cache/)
+        is_etf: If True, return ETF weekly cache path in etfs/ subfolder
+
+    Returns:
+        Full path to weekly cache file
+    """
+    subfolder = "etfs" if is_etf else "stocks"
+    filename = "etf_data_weekly.parquet" if is_etf else "stock_data_weekly.parquet"
+    return os.path.join(cache_dir, subfolder, filename)

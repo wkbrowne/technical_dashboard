@@ -848,9 +848,9 @@ def _load_benchmark_etfs_for_weekly(
 
     logger.info(f"Loading {len(etfs_needed)} benchmark ETFs for weekly features: {list(etfs_needed)[:5]}...")
 
-    # Try to load from combined ETF cache file (stock_data_etf.parquet)
+    # Try to load from combined ETF cache file (etfs/stock_data_etf.parquet)
     cache_dir = Path(__file__).parent.parent.parent / "cache"
-    etf_cache_path = cache_dir / "stock_data_etf.parquet"
+    etf_cache_path = cache_dir / "etfs" / "stock_data_etf.parquet"
 
     if not etf_cache_path.exists():
         logger.warning(f"ETF cache not found: {etf_cache_path}")

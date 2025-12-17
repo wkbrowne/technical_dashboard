@@ -74,9 +74,10 @@ def load_cached_data(cache_dir: Path) -> dict:
 
     data = {}
 
-    # Load stock data - prefer newer file (combined vs universe)
-    combined_file = cache_dir / "stock_data_combined.parquet"
-    universe_file = cache_dir / "stock_data_universe.parquet"
+    # Load stock data from stocks/ subfolder - prefer newer file (combined vs universe)
+    stocks_dir = cache_dir / "stocks"
+    combined_file = stocks_dir / "stock_data_combined.parquet"
+    universe_file = stocks_dir / "stock_data_universe.parquet"
 
     # Determine which file to use based on modification time
     stock_file = None
@@ -100,8 +101,9 @@ def load_cached_data(cache_dir: Path) -> dict:
         logger.warning("No stock data found in cache")
         data['stocks'] = pd.DataFrame()
 
-    # Load ETF data (includes VIX/VXN if downloaded via load_etf_universe)
-    etf_file = cache_dir / "stock_data_etf.parquet"
+    # Load ETF data from etfs/ subfolder (includes VIX/VXN if downloaded via load_etf_universe)
+    etfs_dir = cache_dir / "etfs"
+    etf_file = etfs_dir / "stock_data_etf.parquet"
     if etf_file.exists():
         data['etfs'] = pd.read_parquet(etf_file)
         logger.info(f"Loaded {len(data['etfs'])} ETF records")
@@ -291,7 +293,8 @@ def run_feature_pipeline(
     max_stocks: Optional[int] = None,
     n_jobs: int = -1,
     batch_size: int = 16,
-    full_output: bool = False
+    full_output: bool = False,
+    checkpoint_config: Optional['CheckpointConfig'] = None
 ):
     """Run the feature computation pipeline.
 
@@ -306,6 +309,7 @@ def run_feature_pipeline(
         batch_size: Number of symbols per parallel batch
         full_output: If True, output all computed features. If False (default),
             filter to curated feature set (~200 features)
+        checkpoint_config: CheckpointConfig for staged checkpointing
     """
     from src.config.features import FeatureConfig, Timeframe
     from src.config.parallel import ParallelConfig
@@ -313,13 +317,40 @@ def run_feature_pipeline(
     from src.features.single_stock import compute_single_stock_features
     from src.features.cross_sectional import compute_cross_sectional_features
     from src.features.postprocessing import interpolate_internal_gaps
-    from src.features.timeframe import combine_to_long, partition_by_symbol
+    from src.features.timeframe import combine_to_long, partition_by_symbol, TimeframeResampler
     from src.features.sector_mapping import build_enhanced_sector_mappings
+    from src.data.loader import get_weekly_cache_path
     from joblib import Parallel, delayed
 
     # Create unified parallel config
     parallel_config = ParallelConfig(n_jobs=n_jobs, batch_size=batch_size)
     logger.info(f"Parallel config: {parallel_config.summary()}")
+
+    # Try to load pre-computed weekly cache (if available)
+    # This significantly speeds up weekly timeframe processing
+    if 'W' in timeframes:
+        weekly_cache_loaded = False
+
+        # Try stock weekly cache first
+        stock_weekly_path = get_weekly_cache_path(str(cache_dir), is_etf=False)
+        if TimeframeResampler.load_weekly_cache(stock_weekly_path):
+            weekly_cache_loaded = True
+            logger.info(f"Loaded stock weekly cache from {stock_weekly_path}")
+
+        # Also try ETF weekly cache and merge it
+        etf_weekly_path = get_weekly_cache_path(str(cache_dir), is_etf=True)
+        if os.path.exists(etf_weekly_path):
+            if TimeframeResampler.merge_weekly_cache(etf_weekly_path):
+                logger.info(f"Merged ETF weekly cache from {etf_weekly_path}")
+            elif not weekly_cache_loaded:
+                # ETF cache exists but stock cache doesn't - load ETF as primary
+                if TimeframeResampler.load_weekly_cache(etf_weekly_path):
+                    weekly_cache_loaded = True
+                    logger.info(f"Loaded ETF weekly cache from {etf_weekly_path}")
+
+        if not weekly_cache_loaded:
+            logger.info("No weekly cache found - will resample inline (slower)")
+            logger.info("Tip: Run 'python -m src.cli.download --resample-weekly' to generate cache")
 
     start_time = time.time()
 
@@ -424,7 +455,8 @@ def run_feature_pipeline(
             sector_to_etf=sector_to_etf,
             enhanced_mappings=enhanced_mappings,
             sp500_tickers=sp500_tickers,
-            full_output=full_output
+            full_output=full_output,
+            checkpoint_config=checkpoint_config
         )
 
         # Save BOTH complete and filtered feature files
@@ -584,10 +616,51 @@ Examples:
         help="Output all computed features (default: curated subset ~200 features)"
     )
 
+    # Checkpoint arguments
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Enable checkpoints and save to this directory (e.g., artifacts/checkpoints)"
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        choices=[
+            "01_single_stock", "02_cross_sectional", "03_spread_features",
+            "04_weekly_features", "05_weekly_cs", "06_weekly_spread",
+            "07_interpolated", "08_targets", "09_final"
+        ],
+        help="Resume pipeline from a specific checkpoint stage"
+    )
+    parser.add_argument(
+        "--cleanup-checkpoints",
+        action="store_true",
+        help="Remove intermediate checkpoints after successful completion (keeps final)"
+    )
+    parser.add_argument(
+        "--list-checkpoints",
+        action="store_true",
+        help="List available checkpoints and exit"
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Handle --list-checkpoints
+    if args.list_checkpoints:
+        from src.pipelines.checkpoint import CheckpointConfig, CheckpointManager
+        checkpoint_dir = Path(args.checkpoint_dir or "artifacts/checkpoints")
+        if checkpoint_dir.exists():
+            config = CheckpointConfig(enabled=True, checkpoint_dir=checkpoint_dir)
+            mgr = CheckpointManager(config)
+            mgr.print_checkpoint_summary()
+        else:
+            print(f"No checkpoints found at {checkpoint_dir}")
+        sys.exit(0)
 
     # Parse timeframes
     timeframes = [t.strip().upper() for t in args.timeframes.split(",")]
@@ -596,6 +669,20 @@ Examples:
     if invalid:
         logger.error(f"Invalid timeframes: {invalid}. Use D, W, or M.")
         sys.exit(1)
+
+    # Create checkpoint config if any checkpoint options provided
+    checkpoint_config = None
+    if args.checkpoint_dir or args.resume_from:
+        from src.pipelines.checkpoint import CheckpointConfig
+        checkpoint_config = CheckpointConfig.from_args(
+            checkpoint_dir=args.checkpoint_dir,
+            resume_from=args.resume_from,
+            cleanup_checkpoints=args.cleanup_checkpoints
+        )
+        if checkpoint_config.enabled:
+            logger.info(f"Checkpoints enabled: {checkpoint_config.checkpoint_dir}")
+            if args.resume_from:
+                logger.info(f"Resuming from: {args.resume_from}")
 
     run_feature_pipeline(
         config_path=args.config,
@@ -606,7 +693,8 @@ Examples:
         max_stocks=args.max_stocks,
         n_jobs=args.n_jobs,
         batch_size=args.batch_size,
-        full_output=args.full_output
+        full_output=args.full_output,
+        checkpoint_config=checkpoint_config
     )
 
 

@@ -37,11 +37,18 @@ from pathlib import Path
 # Get the project root directory
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
-# Cache file location
-CACHE_FILE = PROJECT_ROOT / "cache" / "stock_data.pkl"
+# Cache directory structure
+CACHE_DIR = PROJECT_ROOT / "cache"
+STOCKS_CACHE_DIR = CACHE_DIR / "stocks"
+ETFS_CACHE_DIR = CACHE_DIR / "etfs"
 
-# Make sure cache directory exists
-CACHE_FILE.parent.mkdir(exist_ok=True)
+# Legacy cache file location (for backward compatibility)
+CACHE_FILE = CACHE_DIR / "stock_data.pkl"
+
+# Make sure cache directories exist
+CACHE_DIR.mkdir(exist_ok=True)
+STOCKS_CACHE_DIR.mkdir(exist_ok=True)
+ETFS_CACHE_DIR.mkdir(exist_ok=True)
 
 # Environment variables and API settings
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
@@ -70,6 +77,9 @@ __all__ = [
     # Parallel configuration
     'ParallelConfig',
     # Global settings
+    'CACHE_DIR',
+    'STOCKS_CACHE_DIR',
+    'ETFS_CACHE_DIR',
     'CACHE_FILE',
     'PROJECT_ROOT',
     'RAPIDAPI_KEY',
