@@ -978,7 +978,118 @@ This feature set **replaces** the prior `breadth.py` logic that depended on exte
 - Does NOT replace per-symbol sector-relative features (alpha, relative strength)
 - Does NOT provide true NYSE advance/decline counts (only sector-level proxy with 11 data points per day)
 
-### 5.4 Date Alignment
+### 5.4 Joint Factor Model (Per-Symbol)
+
+**Module:** [src/features/factor_regression.py](../src/features/factor_regression.py)
+
+The joint factor model computes factor exposures and alpha jointly via multivariate rolling ridge regression. Instead of computing betas one factor at a time (which produces correlated estimates), this approach computes all factor exposures simultaneously, producing cleaner estimates that properly account for factor correlations.
+
+**Orthogonalized 4-Factor Design:**
+
+```
+R_stock = α + β_market × R_SPY
+            + β_qqq × (R_QQQ - R_SPY)
+            + β_bestmatch × (R_bestmatch - R_SPY)
+            + β_breadth × (R_RSP - R_SPY)
+            + ε
+```
+
+| Factor | Formula | Interpretation |
+|--------|---------|----------------|
+| `beta_market` | R_SPY | Broad market exposure |
+| `beta_qqq` | R_QQQ - R_SPY | Growth/tech premium over market |
+| `beta_bestmatch` | R_bestmatch - R_SPY | Sector/subsector premium over market |
+| `beta_breadth` | R_RSP - R_SPY | Equal-weight vs cap-weight spread |
+
+**Why Orthogonalized Factors:**
+
+The spread factors (QQQ-SPY, bestmatch-SPY, RSP-SPY) are orthogonalized versus market to:
+1. Avoid multicollinearity between correlated factors
+2. Provide cleaner interpretation of factor loadings
+3. Isolate the *premium* over market rather than the absolute exposure
+
+For example, `beta_qqq` measures exposure to the *growth premium* (how much more/less the stock moves when QQQ outperforms SPY), not absolute QQQ correlation.
+
+**Best-Match ETF Selection:**
+
+Each stock is matched to TWO best-match ETFs based on highest R² from univariate regression:
+
+| Mapping | Candidates | Purpose |
+|---------|------------|---------|
+| `bestmatch_etf` | Cap-weighted sector/subsector ETFs (XLK, SMH, XBI, etc.) | Sector-relative exposure |
+| `bestmatch_ew_etf` | Equal-weight sector ETFs (RSPT, RSPF, RSPH, etc.) | Remove large-cap concentration |
+
+**Cap-Weighted Candidates (25 ETFs):**
+- Sector: XLK, XLF, XLV, XLE, XLI, XLY, XLP, XLU, XLB, XLC, XLRE
+- Tech subsectors: SMH, IGV, SKYY, HACK
+- Finance: KBE, KRE
+- Healthcare: IBB, XBI, IHE
+- Industrial: ITA, ITB
+- Energy: XOP
+- Consumer: XRT
+- Materials: TAN, URA, LIT, COPX
+
+**Equal-Weight Candidates (10 ETFs):**
+- RSPT (Tech), RSPF (Financials), RSPH (Healthcare), RSPE (Energy)
+- RSPN (Industrials), RSPC (Consumer Disc), RSPS (Consumer Staples)
+- RSPU (Utilities), RSPM (Materials), RSPD (Communication)
+
+**Example:** NVDA matches SMH (semiconductors) rather than XLK (broad tech) because SMH explains more variance.
+
+**Features Output:**
+
+For daily (`beta_*`) and weekly (`w_beta_*`) frequencies:
+
+| Feature | Description |
+|---------|-------------|
+| `alpha` | Regression intercept (idiosyncratic return) |
+| `beta_market` | Market factor loading |
+| `beta_qqq` | Growth premium factor loading |
+| `beta_bestmatch` | Sector/subsector premium factor loading |
+| `beta_breadth` | Equal-weight spread factor loading |
+| `residual_mean` | Rolling mean of regression residuals |
+| `residual_cumret` | Cumulative residual return over window |
+| `residual_vol` | Rolling volatility of residuals |
+
+**Spread Features (from factor regression):**
+
+The factor regression module also computes best-match spread features:
+
+| Feature | Formula | Description |
+|---------|---------|-------------|
+| `bestmatch_spy_cumret_*` | bestmatch - SPY | Cap-weighted sector vs market cumulative return |
+| `bestmatch_spy_zscore_*` | Z-score | Normalized spread level |
+| `bestmatch_spy_slope_*` | OLS slope | Spread momentum direction |
+| `bestmatch_ew_rsp_cumret_*` | bestmatch_ew - RSP | Equal-weight sector vs equal-weight market |
+| `bestmatch_ew_rsp_zscore_*` | Z-score | Normalized EW spread level |
+| `bestmatch_ew_rsp_slope_*` | OLS slope | EW spread momentum direction |
+
+**Configuration:**
+
+```python
+@dataclass
+class FactorRegressionConfig:
+    daily_windows: List[int] = [60]      # 60-day rolling window
+    weekly_windows: List[int] = [12]     # 12-week (~60 days)
+    ridge_alpha: float = 0.01            # L2 regularization
+    min_periods_ratio: float = 0.33      # min_periods = window × ratio
+    min_periods_floor: int = 20          # Absolute minimum observations
+```
+
+**Parallelism:**
+
+Uses stocks_per_worker batching (200 symbols per worker) with factor subsetting:
+- Each worker only receives the factor returns it needs (core factors + batch-specific best-match ETFs)
+- Reduces serialization overhead by ~70% for large universes
+
+**Weekly Computation:**
+
+Weekly factor features handle resampling inside workers to avoid sequential bottleneck:
+1. Factor returns are pre-resampled to weekly in main thread (once)
+2. Each worker resamples its batch of stock returns to weekly in parallel
+3. Results are forward-filled back to daily index
+
+### 5.5 Date Alignment
 
 Weekly features have date alignment challenges:
 

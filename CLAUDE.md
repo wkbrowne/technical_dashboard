@@ -56,7 +56,6 @@ src/
 │
 ├── features/               # Feature computation
 │   ├── base.py             # BaseFeature, CrossSectionalFeature ABCs
-│   ├── registry.py         # Feature factory and registration
 │   ├── timeframe.py        # Unified D/W/M resampling
 │   ├── single_stock.py     # Orchestrates single-stock features
 │   ├── cross_sectional.py  # Orchestrates cross-sectional features
@@ -67,7 +66,8 @@ src/
 │   ├── range_breakout.py   # ATR, ranges, breakouts
 │   ├── alpha.py            # Alpha momentum vs market/sectors
 │   ├── relstrength.py      # Relative strength features
-│   ├── breadth.py          # Market breadth indicators
+│   ├── sector_breadth.py   # Sector ETF breadth proxy features
+│   ├── factor_regression.py # Joint factor model (beta, alpha)
 │   ├── xsec.py             # Cross-sectional momentum
 │   ├── target_generation.py # Triple barrier targets
 │   └── postprocessing.py   # NaN interpolation, lags
@@ -125,7 +125,7 @@ pytest tests/test_base_features.py -v
 
 ## Adding New Features
 
-Features are computed directly in `single_stock.py` (single-stock) or `cross_sectional.py` (cross-sectional). The registry is legacy and rarely used.
+Features are computed directly in `single_stock.py` (single-stock) or `cross_sectional.py` (cross-sectional).
 
 ### Step 1: Create the feature function
 
@@ -495,6 +495,11 @@ These files are superseded by the new architecture but kept for reference:
 - `src/features/weekly_multiprocessing.py` - Best patterns extracted to timeframe.py
 - `src/features/pipeline.py` - Use single_stock.py directly
 - `src/features/runner.py` - Use CLI commands instead
+
+**Removed Files (no longer exist):**
+
+- `src/features/registry.py` - Removed; pipeline calls feature functions directly
+- `src/features/breadth.py` - Replaced by sector_breadth.py (Sector ETF Breadth Proxy)
 
 ## Environment Setup
 
