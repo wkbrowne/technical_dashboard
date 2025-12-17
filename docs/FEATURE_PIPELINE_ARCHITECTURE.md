@@ -22,10 +22,11 @@ For the high-level ML pipeline (feature selection, hyperparameter tuning, model 
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           WEEKLY DATA GENERATION                                 │
+│                    WEEKLY DATA GENERATION [NOT YET IMPLEMENTED]                 │
 ├─────────────────────────────────────────────────────────────────────────────────┤
-│  Daily OHLCV  →  Resample to W-FRI  →  cache/stock_data_weekly.parquet          │
-│  ETF OHLCV    →  Resample to W-FRI  →  cache/etf_data_weekly.parquet            │
+│  [PLANNED] Daily OHLCV → Resample W-FRI → cache/stock_data_weekly.parquet       │
+│  [PLANNED] ETF OHLCV   → Resample W-FRI → cache/etf_data_weekly.parquet         │
+│  [CURRENT] Weekly resampling happens inline during feature computation          │
 │                                                                                  │
 │  Resampling rules:                                                               │
 │  - open: first of week                                                           │
@@ -46,13 +47,13 @@ For the high-level ML pipeline (feature selection, hyperparameter tuning, model 
 │  - volume.py (volume ratios)      │   │  - Weekly cross-asset             │
 │  - distance.py (distance to MA)   │   │  - Weekly alpha momentum          │
 │  - range_breakout.py              │   │                                   │
-│                                   │   │  Uses: cache/stock_data_weekly    │
-│  Cross-Sectional Features:        │   │        cache/etf_data_weekly      │
+│                                   │   │  [CURRENT: resamples inline]      │
+│  Cross-Sectional Features:        │   │  [PLANNED: load cached weekly]    │
 │  - alpha.py (alpha vs benchmarks) │   │                                   │
-│  - xsec.py (cross-sec momentum)   │   │  Output: artifacts/features_weekly│
+│  - xsec.py (cross-sec momentum)   │   │                                   │
 │  - breadth.py (market breadth)    │   │                                   │
 │                                   │   │                                   │
-│  Output: artifacts/features_daily │   │                                   │
+│                                   │   │                                   │
 └───────────────────────────────────┘   └───────────────────────────────────┘
                     │                                   │
                     └─────────────────┬─────────────────┘
@@ -365,11 +366,14 @@ Daily spreads are lagged by 1 day to prevent look-ahead bias.
 
 ### 3.6 Weekly Data Generation
 
-**NEW ARCHITECTURE: Pre-computed weekly files**
+**[NOT YET IMPLEMENTED] Pre-computed weekly files**
+
+> **Current behavior:** Weekly resampling happens inline during pipeline execution.
+> **Target architecture:** Pre-compute and cache weekly data for reuse.
 
 Instead of computing weekly resampling inline, generate and cache weekly data:
 
-**Command:**
+**Command (planned):**
 ```bash
 python -m src.cli.download --resample-weekly
 ```
@@ -413,7 +417,12 @@ Similarly, daily files must NOT contain partially completed days:
 
 ### 3.7 Weekly Feature Computation
 
-**Uses:** Pre-computed `stock_data_weekly.parquet` and `etf_data_weekly.parquet`
+**[PARTIAL]** Currently computes weekly features inline from daily data.
+
+> **Current behavior:** Weekly features are computed by resampling daily data during pipeline execution.
+> **Target architecture:** Load from pre-computed `stock_data_weekly.parquet` and `etf_data_weekly.parquet`.
+
+**Uses (planned):** Pre-computed `stock_data_weekly.parquet` and `etf_data_weekly.parquet`
 
 **Weekly-Only Features:**
 - `w_rsi_14`, `w_rsi_21` - Weekly RSI
@@ -523,7 +532,10 @@ The output should contain:
 
 ## 3.11 Intermediate Checkpoint Architecture
 
-**RECOMMENDED: Output after each thematic step, clear memory, read back for next step.**
+**[NOT YET IMPLEMENTED] Checkpoint system for staged processing**
+
+> **Current behavior:** Pipeline runs as single monolithic execution with no intermediate saves.
+> **Target architecture:** Output after each thematic step, clear memory, read back for next step.
 
 For large datasets or memory-constrained environments, the pipeline should output intermediate results after each major thematic computation stage. This allows:
 
