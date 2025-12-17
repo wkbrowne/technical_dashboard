@@ -47,6 +47,8 @@ try:
         ParallelConfig, setup_loky_executor, shutdown_loky_workers,
         parallel_stage, get_memory_mb, calculate_workers_from_items
     )
+    # Feature output filtering
+    from ..feature_selection.base_features import filter_output_columns, get_output_features
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.assemble import assemble_indicators_from_wide
@@ -70,6 +72,8 @@ except ImportError:
         ParallelConfig, setup_loky_executor, shutdown_loky_workers,
         parallel_stage, get_memory_mb, calculate_workers_from_items
     )
+    # Feature output filtering
+    from src.feature_selection.base_features import filter_output_columns, get_output_features
 
 logger = logging.getLogger(__name__)
 
@@ -904,7 +908,8 @@ def run_pipeline_v2(
     parallel_config: Optional[ParallelConfig] = None,
     sectors: Optional[Dict[str, str]] = None,
     sector_to_etf: Optional[Dict[str, str]] = None,
-    sp500_tickers: Optional[List[str]] = None
+    sp500_tickers: Optional[List[str]] = None,
+    full_output: bool = False
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Simplified pipeline using new config system.
@@ -926,6 +931,8 @@ def run_pipeline_v2(
         sectors: Dict mapping symbol -> sector name (for cross-sectional features)
         sector_to_etf: Dict mapping sector name -> ETF symbol (for alpha/relative strength)
         sp500_tickers: List of S&P 500 tickers (for breadth features)
+        full_output: If True, output all computed features. If False (default),
+            filter to curated feature set defined in base_features.py
 
     Returns:
         Tuple of (features_df, targets_df)
@@ -1087,6 +1094,16 @@ def run_pipeline_v2(
     print(f"\n>>> [Final Assembly] Converting to long format...", flush=True)
     daily_df = combine_to_long(indicators_by_symbol)
     print(f"<<< [Final Assembly] Done: {len(daily_df):,} rows, {len(daily_df.columns)} columns", flush=True)
+
+    # Step 6b: Filter to curated output features (unless full_output=True)
+    if not full_output:
+        cols_before = len(daily_df.columns)
+        daily_df = filter_output_columns(daily_df, keep_all=False)
+        cols_after = len(daily_df.columns)
+        filtered_count = cols_before - cols_after
+        if filtered_count > 0:
+            print(f">>> [Output Filtering] Filtered {filtered_count} intermediate columns, keeping {cols_after}", flush=True)
+            logger.info(f"Filtered output to curated features: {cols_before} -> {cols_after} columns")
 
     # Step 7: Shut down loky workers to free memory
     shutdown_loky_workers()

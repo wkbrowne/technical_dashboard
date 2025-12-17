@@ -290,7 +290,8 @@ def run_feature_pipeline(
     include_targets: bool = True,
     max_stocks: Optional[int] = None,
     n_jobs: int = -1,
-    batch_size: int = 16
+    batch_size: int = 16,
+    full_output: bool = False
 ):
     """Run the feature computation pipeline.
 
@@ -303,6 +304,8 @@ def run_feature_pipeline(
         max_stocks: Maximum number of stocks to process
         n_jobs: Number of parallel jobs
         batch_size: Number of symbols per parallel batch
+        full_output: If True, output all computed features. If False (default),
+            filter to curated feature set (~200 features)
     """
     from src.config.features import FeatureConfig, Timeframe
     from src.config.parallel import ParallelConfig
@@ -420,7 +423,8 @@ def run_feature_pipeline(
             sectors=sectors,
             sector_to_etf=sector_to_etf,
             enhanced_mappings=enhanced_mappings,
-            sp500_tickers=sp500_tickers
+            sp500_tickers=sp500_tickers,
+            full_output=full_output
         )
 
         # Save features
@@ -562,6 +566,11 @@ Examples:
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--full-output",
+        action="store_true",
+        help="Output all computed features (default: curated subset ~200 features)"
+    )
 
     args = parser.parse_args()
 
@@ -584,7 +593,8 @@ Examples:
         include_targets=not args.no_targets,
         max_stocks=args.max_stocks,
         n_jobs=args.n_jobs,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        full_output=args.full_output
     )
 
 
