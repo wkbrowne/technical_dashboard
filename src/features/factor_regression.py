@@ -42,11 +42,19 @@ try:
 except ImportError:
     from src.config.parallel import calculate_workers_from_items, DEFAULT_STOCKS_PER_WORKER
 
-# Import spread features for bestmatch-SPY spread computation
+# Import spread features for bestmatch spread computation
 try:
-    from .spread_features import compute_bestmatch_spread_features, DAILY_WINDOWS as SPREAD_DAILY_WINDOWS
+    from .spread_features import (
+        compute_bestmatch_spread_features,
+        compute_bestmatch_ew_spread_features,
+        DAILY_WINDOWS as SPREAD_DAILY_WINDOWS
+    )
 except ImportError:
-    from src.features.spread_features import compute_bestmatch_spread_features, DAILY_WINDOWS as SPREAD_DAILY_WINDOWS
+    from src.features.spread_features import (
+        compute_bestmatch_spread_features,
+        compute_bestmatch_ew_spread_features,
+        DAILY_WINDOWS as SPREAD_DAILY_WINDOWS
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +165,7 @@ def _resample_factor_returns_to_weekly(
 
 
 def _get_required_factors_for_batch(
-    work_items: List[Tuple[str, pd.Index, np.ndarray, Optional[str]]],
+    work_items: List[Tuple[str, pd.Index, np.ndarray, Optional[str], Optional[str]]],
     all_factor_returns: Dict[str, Tuple[pd.Index, np.ndarray]]
 ) -> Dict[str, Tuple[pd.Index, np.ndarray]]:
     """
@@ -167,7 +175,7 @@ def _get_required_factors_for_batch(
     instead of the entire factor returns dictionary.
 
     Args:
-        work_items: List of (symbol, ret_index, ret_values, best_match_etf) tuples
+        work_items: List of (symbol, ret_index, ret_values, best_match_etf, best_match_ew_etf) tuples
         all_factor_returns: Complete factor returns dictionary
 
     Returns:
@@ -176,10 +184,12 @@ def _get_required_factors_for_batch(
     # Core factors always needed
     required = {MARKET_FACTOR, GROWTH_FACTOR, BREADTH_SPREAD[0], BREADTH_SPREAD[1]}
 
-    # Add best-match ETFs for symbols in this batch
+    # Add best-match ETFs (cap-weighted and equal-weight) for symbols in this batch
     for item in work_items:
-        if len(item) >= 4 and item[3]:  # best_match_etf
+        if len(item) >= 4 and item[3]:  # best_match_etf (cap-weighted)
             required.add(item[3])
+        if len(item) >= 5 and item[4]:  # best_match_ew_etf (equal-weight)
+            required.add(item[4])
 
     # Extract only required factors
     subset = {}
@@ -438,7 +448,8 @@ def compute_joint_factor_features_for_symbol(
     factor_returns: Dict[str, Tuple[pd.Index, np.ndarray]],
     best_match_etf: Optional[str],
     config: FactorRegressionConfig,
-    frequency: str = 'daily'
+    frequency: str = 'daily',
+    best_match_ew_etf: Optional[str] = None
 ) -> Dict[str, pd.Series]:
     """
     Compute joint factor regression features for a single symbol.
@@ -448,9 +459,10 @@ def compute_joint_factor_features_for_symbol(
         ret_index: DatetimeIndex for returns
         ret_values: Return values array
         factor_returns: Dict of factor name -> (index, values) tuples
-        best_match_etf: Best-match reference ETF for this stock (or None)
+        best_match_etf: Best-match reference ETF for this stock (cap-weighted, or None)
         config: FactorRegressionConfig
         frequency: 'daily' or 'weekly'
+        best_match_ew_etf: Best-match equal-weight ETF for this stock (or None)
 
     Returns:
         Dict of feature_name -> pd.Series
@@ -557,7 +569,7 @@ def compute_joint_factor_features_for_symbol(
                 feat_vals, index=ret_index, dtype='float32'
             )
 
-    # Compute bestmatch-SPY spread features if best_match_etf is available
+    # Compute bestmatch-SPY spread features if best_match_etf is available (cap-weighted)
     if best_match_etf and best_match_etf in factor_returns and MARKET_FACTOR in factor_returns:
         bm_idx, bm_vals = factor_returns[best_match_etf]
         bm_ret = pd.Series(bm_vals, index=bm_idx, dtype='float64')
@@ -577,18 +589,44 @@ def compute_joint_factor_features_for_symbol(
         )
         result.update(spread_features)
 
+    # Compute equal-weight bestmatch-RSP spread features if best_match_ew_etf is available
+    # This captures sector performance in equal-weight terms (removes large-cap concentration)
+    rsp_sym = BREADTH_SPREAD[0]  # RSP
+    if best_match_ew_etf and best_match_ew_etf in factor_returns and rsp_sym in factor_returns:
+        ew_idx, ew_vals = factor_returns[best_match_ew_etf]
+        ew_ret = pd.Series(ew_vals, index=ew_idx, dtype='float64')
+        rsp_idx, rsp_vals = factor_returns[rsp_sym]
+        rsp_ret = pd.Series(rsp_vals, index=rsp_idx, dtype='float64')
+
+        # Use appropriate windows based on frequency
+        spread_windows = SPREAD_DAILY_WINDOWS if frequency == 'daily' else (4, 12, 24)
+
+        # Compute spread features (bestmatch_ew - RSP)
+        ew_spread_features = compute_bestmatch_ew_spread_features(
+            stock_ret_index=ret_index,
+            bestmatch_ew_ret=ew_ret,
+            rsp_ret=rsp_ret,
+            windows=spread_windows,
+            prefix=prefix
+        )
+        result.update(ew_spread_features)
+
     # Store best-match info
     if best_match_etf:
         # Store as a constant series (for reference, not ML feature)
         result[f'{prefix}bestmatch_etf'] = pd.Series(
             best_match_etf, index=ret_index, dtype='object'
         )
+    if best_match_ew_etf:
+        result[f'{prefix}bestmatch_ew_etf'] = pd.Series(
+            best_match_ew_etf, index=ret_index, dtype='object'
+        )
 
     return result
 
 
 def compute_factor_features_batch(
-    work_items: List[Tuple[str, pd.Index, np.ndarray, Optional[str]]],
+    work_items: List[Tuple[str, pd.Index, np.ndarray, Optional[str], Optional[str]]],
     factor_returns: Dict[str, Tuple[pd.Index, np.ndarray]],
     config: FactorRegressionConfig,
     frequency: str = 'daily'
@@ -597,7 +635,7 @@ def compute_factor_features_batch(
     Process a batch of symbols for factor feature computation.
 
     Args:
-        work_items: List of (symbol, ret_index, ret_values, best_match_etf) tuples
+        work_items: List of (symbol, ret_index, ret_values, best_match_etf, best_match_ew_etf) tuples
         factor_returns: Pre-extracted factor returns
         config: FactorRegressionConfig
         frequency: 'daily' or 'weekly'
@@ -606,17 +644,23 @@ def compute_factor_features_batch(
         List of (symbol, features_dict) tuples
     """
     results = []
-    for sym, ret_index, ret_values, best_match_etf in work_items:
+    for item in work_items:
+        # Support both old 4-tuple and new 5-tuple format for backwards compatibility
+        if len(item) == 5:
+            sym, ret_index, ret_values, best_match_etf, best_match_ew_etf = item
+        else:
+            sym, ret_index, ret_values, best_match_etf = item
+            best_match_ew_etf = None
         features = compute_joint_factor_features_for_symbol(
             sym, ret_index, ret_values, factor_returns,
-            best_match_etf, config, frequency
+            best_match_etf, config, frequency, best_match_ew_etf
         )
         results.append((sym, features))
     return results
 
 
 def compute_factor_features_batch_weekly(
-    work_items: List[Tuple[str, pd.Index, np.ndarray, Optional[str]]],
+    work_items: List[Tuple[str, pd.Index, np.ndarray, Optional[str], Optional[str]]],
     factor_returns: Dict[str, Tuple[pd.Index, np.ndarray]],
     config: FactorRegressionConfig
 ) -> List[Tuple[str, Dict[str, pd.Series]]]:
@@ -627,7 +671,7 @@ def compute_factor_features_batch_weekly(
     resampling in the main thread. Each worker resamples its own stocks.
 
     Args:
-        work_items: List of (symbol, daily_ret_index, daily_ret_values, best_match_etf) tuples
+        work_items: List of (symbol, daily_ret_index, daily_ret_values, best_match_etf, best_match_ew_etf) tuples
                    NOTE: Daily data, NOT pre-resampled weekly data
         factor_returns: Pre-extracted factor returns (already resampled to weekly)
         config: FactorRegressionConfig
@@ -636,7 +680,14 @@ def compute_factor_features_batch_weekly(
         List of (symbol, features_dict) tuples
     """
     results = []
-    for sym, daily_ret_index, daily_ret_values, best_match_etf in work_items:
+    for item in work_items:
+        # Support both old 4-tuple and new 5-tuple format for backwards compatibility
+        if len(item) == 5:
+            sym, daily_ret_index, daily_ret_values, best_match_etf, best_match_ew_etf = item
+        else:
+            sym, daily_ret_index, daily_ret_values, best_match_etf = item
+            best_match_ew_etf = None
+
         # Resample this stock's daily returns to weekly INSIDE the worker
         weekly_index, weekly_values, _ = _resample_returns_to_weekly(
             daily_ret_index, daily_ret_values
@@ -644,7 +695,7 @@ def compute_factor_features_batch_weekly(
 
         features = compute_joint_factor_features_for_symbol(
             sym, weekly_index, weekly_values, factor_returns,
-            best_match_etf, config, 'weekly'
+            best_match_etf, config, 'weekly', best_match_ew_etf
         )
         results.append((sym, features))
     return results
@@ -655,7 +706,8 @@ def add_joint_factor_features(
     best_match_mappings: Optional[Dict[str, str]] = None,
     config: Optional[FactorRegressionConfig] = None,
     frequency: str = 'daily',
-    n_jobs: int = -1
+    n_jobs: int = -1,
+    best_match_ew_mappings: Optional[Dict[str, str]] = None
 ) -> None:
     """
     Add joint factor regression features to all symbols.
@@ -665,10 +717,11 @@ def add_joint_factor_features(
 
     Args:
         indicators_by_symbol: Dict of symbol -> DataFrame (modified in place)
-        best_match_mappings: Dict of symbol -> best-match ETF symbol
+        best_match_mappings: Dict of symbol -> best-match cap-weighted ETF symbol
         config: FactorRegressionConfig (None for defaults)
         frequency: 'daily' or 'weekly'
         n_jobs: Number of parallel jobs (-1 for all cores)
+        best_match_ew_mappings: Dict of symbol -> best-match equal-weight ETF symbol
     """
     from joblib import Parallel, delayed
 
@@ -680,10 +733,12 @@ def add_joint_factor_features(
     # Pre-extract factor returns
     factor_returns: Dict[str, Tuple[pd.Index, np.ndarray]] = {}
 
-    # All potential factor ETFs
+    # All potential factor ETFs (cap-weighted + equal-weight)
     factor_etfs = {MARKET_FACTOR, GROWTH_FACTOR, BREADTH_SPREAD[0], BREADTH_SPREAD[1]}
     if best_match_mappings:
         factor_etfs.update(set(best_match_mappings.values()))
+    if best_match_ew_mappings:
+        factor_etfs.update(set(best_match_ew_mappings.values()))
 
     for etf in factor_etfs:
         if etf not in indicators_by_symbol:
@@ -714,14 +769,15 @@ def add_joint_factor_features(
 
         ret = pd.to_numeric(df['ret'], errors='coerce')
         best_match = best_match_mappings.get(sym) if best_match_mappings else None
+        best_match_ew = best_match_ew_mappings.get(sym) if best_match_ew_mappings else None
 
         if frequency == 'weekly':
             # Store daily index for mapping results back later
             # Pass DAILY data to workers - they will resample in parallel
             daily_indices[sym] = ret.index
-            work_items.append((sym, ret.index, ret.values, best_match))
+            work_items.append((sym, ret.index, ret.values, best_match, best_match_ew))
         else:
-            work_items.append((sym, ret.index, ret.values, best_match))
+            work_items.append((sym, ret.index, ret.values, best_match, best_match_ew))
 
     n_symbols = len(work_items)
     logger.info(f"Computing factor features for {n_symbols} symbols")

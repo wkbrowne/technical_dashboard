@@ -2,6 +2,9 @@
 
 This document describes the architecture for the momentum trading ML pipeline, including component responsibilities, update frequencies, and operational guidelines.
 
+**Related Documentation:**
+- [Feature Pipeline Architecture](docs/FEATURE_PIPELINE_ARCHITECTURE.md) - Technical details on feature computation, parallelism, and data formats
+
 ## Pipeline Overview
 
 ```

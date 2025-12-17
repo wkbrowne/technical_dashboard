@@ -414,7 +414,7 @@ def run_feature_pipeline(
 
         # Use the new pipeline_v2 for feature computation
         logger.info("Running feature pipeline v2...")
-        features_df, targets_df = run_pipeline_v2(
+        features_df, targets_df, features_complete, features_filtered = run_pipeline_v2(
             indicators_by_symbol=indicators_by_symbol,
             feature_config=config,
             timeframes=timeframes,
@@ -427,10 +427,16 @@ def run_feature_pipeline(
             full_output=full_output
         )
 
-        # Save features
-        daily_output = output_dir / "features_daily.parquet"
-        features_df.to_parquet(daily_output, index=False)
-        logger.info(f"Saved features to {daily_output}")
+        # Save BOTH complete and filtered feature files
+        # 1. Complete file with ALL features (~600+)
+        complete_output = output_dir / "features_complete.parquet"
+        features_complete.to_parquet(complete_output, index=False)
+        logger.info(f"Saved complete features ({len(features_complete.columns)} cols) to {complete_output}")
+
+        # 2. Filtered file with curated ML-ready features (~250)
+        filtered_output = output_dir / "features_filtered.parquet"
+        features_filtered.to_parquet(filtered_output, index=False)
+        logger.info(f"Saved filtered features ({len(features_filtered.columns)} cols) to {filtered_output}")
 
         # Count features by timeframe
         daily_features = [c for c in features_df.columns
@@ -473,6 +479,12 @@ def run_feature_pipeline(
         print(f"Total features:     {len(daily_features) + len(weekly_features) + len(monthly_features)}")
         if targets_df is not None and not targets_df.empty:
             print(f"Targets generated:  {len(targets_df):,}")
+        print("")
+        print("Output Files:")
+        print(f"  features_complete.parquet:  {len(features_complete.columns)} cols (ALL features)")
+        print(f"  features_filtered.parquet:  {len(features_filtered.columns)} cols (ML-ready)")
+        if targets_df is not None and not targets_df.empty:
+            print(f"  targets_triple_barrier.parquet")
         print(f"Output directory:   {output_dir}")
         print(f"Total time:         {elapsed:.1f}s")
         print("=" * 50)

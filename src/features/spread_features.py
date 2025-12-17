@@ -347,6 +347,43 @@ def compute_bestmatch_spread_features(
     return _compute_spread_metrics(spread, 'bestmatch_spy', windows, prefix)
 
 
+def compute_bestmatch_ew_spread_features(
+    stock_ret_index: pd.Index,
+    bestmatch_ew_ret: pd.Series,
+    rsp_ret: pd.Series,
+    windows: Tuple[int, ...] = DAILY_WINDOWS,
+    prefix: str = ""
+) -> Dict[str, pd.Series]:
+    """Compute equal-weight bestmatch-RSP spread features for a single symbol.
+
+    Parallel to compute_bestmatch_spread_features but in equal-weight space:
+    - bestmatch-SPY: cap-weighted sector vs cap-weighted market
+    - bestmatch_ew-RSP: equal-weight sector vs equal-weight market
+
+    This captures relative performance of a stock's sector in equal-weight terms,
+    removing large-cap concentration effects.
+
+    Args:
+        stock_ret_index: Date index to align results to
+        bestmatch_ew_ret: Best-match equal-weight ETF return series (e.g., RSPT)
+        rsp_ret: RSP (S&P 500 Equal Weight) return series
+        windows: Rolling windows
+        prefix: Feature name prefix
+
+    Returns:
+        Dict of feature_name -> pd.Series
+    """
+    # Align returns
+    bestmatch_aligned = bestmatch_ew_ret.reindex(stock_ret_index)
+    rsp_aligned = rsp_ret.reindex(stock_ret_index)
+
+    # Compute spread (equal-weight sector - equal-weight market)
+    spread = bestmatch_aligned - rsp_aligned
+
+    # Compute metrics with distinct name
+    return _compute_spread_metrics(spread, 'bestmatch_ew_rsp', windows, prefix)
+
+
 def compute_bestmatch_spread_features_weekly(
     daily_index: pd.Index,
     bestmatch_ret_daily: pd.Series,

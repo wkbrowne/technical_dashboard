@@ -931,11 +931,15 @@ def run_pipeline_v2(
         sectors: Dict mapping symbol -> sector name (for cross-sectional features)
         sector_to_etf: Dict mapping sector name -> ETF symbol (for alpha/relative strength)
         sp500_tickers: List of S&P 500 tickers (for breadth features)
-        full_output: If True, output all computed features. If False (default),
-            filter to curated feature set defined in base_features.py
+        full_output: If True, primary return is all computed features. If False (default),
+            primary return is filtered to curated feature set defined in base_features.py
 
     Returns:
-        Tuple of (features_df, targets_df)
+        Tuple of (features_df, targets_df, features_complete_df, features_filtered_df) where:
+        - features_df: Primary output (filtered if full_output=False, complete if True)
+        - targets_df: Triple barrier targets (or None if include_targets=False)
+        - features_complete_df: ALL computed features (~600+)
+        - features_filtered_df: Curated ML-ready features (~250)
     """
     # Use ParallelConfig if provided, otherwise create from n_jobs
     if parallel_config is None:
@@ -1092,33 +1096,38 @@ def run_pipeline_v2(
     # Step 6: Convert to final long format (sequential operation - ensure workers are shut down)
     shutdown_loky_workers()  # Ensure all parallel workers are terminated before sequential work
     print(f"\n>>> [Final Assembly] Converting to long format...", flush=True)
-    daily_df = combine_to_long(indicators_by_symbol)
-    print(f"<<< [Final Assembly] Done: {len(daily_df):,} rows, {len(daily_df.columns)} columns", flush=True)
+    daily_df_complete = combine_to_long(indicators_by_symbol)
+    print(f"<<< [Final Assembly] Done: {len(daily_df_complete):,} rows, {len(daily_df_complete.columns)} columns", flush=True)
 
-    # Step 6b: Filter to curated output features (unless full_output=True)
-    if not full_output:
-        cols_before = len(daily_df.columns)
-        daily_df = filter_output_columns(daily_df, keep_all=False)
-        cols_after = len(daily_df.columns)
-        filtered_count = cols_before - cols_after
-        if filtered_count > 0:
-            print(f">>> [Output Filtering] Filtered {filtered_count} intermediate columns, keeping {cols_after}", flush=True)
-            logger.info(f"Filtered output to curated features: {cols_before} -> {cols_after} columns")
+    # Step 6b: Create filtered version for ML training
+    # ALWAYS create both: full output (features_complete) and filtered (features_filtered)
+    cols_before = len(daily_df_complete.columns)
+    daily_df_filtered = filter_output_columns(daily_df_complete, keep_all=False)
+    cols_after = len(daily_df_filtered.columns)
+    filtered_count = cols_before - cols_after
+    if filtered_count > 0:
+        print(f">>> [Output Filtering] Filtered {filtered_count} intermediate columns, keeping {cols_after}", flush=True)
+        logger.info(f"Filtered output to curated features: {cols_before} -> {cols_after} columns")
 
     # Step 7: Shut down loky workers to free memory
     shutdown_loky_workers()
 
     print(f"\n{'='*60}", flush=True)
     print(f"PIPELINE V2 COMPLETE", flush=True)
-    print(f"  Rows: {len(daily_df):,}", flush=True)
-    print(f"  Columns: {len(daily_df.columns)}", flush=True)
+    print(f"  Rows: {len(daily_df_complete):,}", flush=True)
+    print(f"  Complete columns: {len(daily_df_complete.columns)}", flush=True)
+    print(f"  Filtered columns: {len(daily_df_filtered.columns)}", flush=True)
     if targets_df is not None:
         print(f"  Targets: {len(targets_df):,}", flush=True)
     print(f"{'='*60}\n", flush=True)
 
-    logger.info(f"Pipeline v2 completed: {len(daily_df)} rows, {len(daily_df.columns)} columns")
+    logger.info(f"Pipeline v2 completed: {len(daily_df_complete)} rows, "
+                f"{len(daily_df_complete.columns)} complete cols, "
+                f"{len(daily_df_filtered.columns)} filtered cols")
 
-    return daily_df, targets_df
+    # Return filtered by default (for backward compatibility), or full if requested
+    daily_df = daily_df_complete if full_output else daily_df_filtered
+    return daily_df, targets_df, daily_df_complete, daily_df_filtered
 
 
 def run_pipeline(
@@ -1257,14 +1266,21 @@ def run_pipeline(
                 logger.info("Continuing with daily features only...")
                 final_features = None
     
-    # File I/O operations (group remaining saves together)  
+    # File I/O operations (group remaining saves together)
     with profile_stage("File I/O Operations"):
-        # Save complete feature set if weekly features were added
+        # Save BOTH complete and filtered feature sets
         if final_features is not None:
+            # 1. Complete file with ALL features (~600+)
             complete_features_path = output_dir / "features_complete.parquet"
             final_features.to_parquet(complete_features_path, index=False)
-            logger.info(f"Saved complete feature set to {complete_features_path}")
-            
+            logger.info(f"Saved complete feature set ({len(final_features.columns)} cols) to {complete_features_path}")
+
+            # 2. Filtered file with curated ML-ready features (~250)
+            filtered_features = filter_output_columns(final_features, keep_all=False)
+            filtered_features_path = output_dir / "features_filtered.parquet"
+            filtered_features.to_parquet(filtered_features_path, index=False)
+            logger.info(f"Saved filtered feature set ({len(filtered_features.columns)} cols) to {filtered_features_path}")
+
             # Save in long format for legacy compatibility
             save_long_parquet(indicators_by_symbol, out_path=output_dir / "features_long.parquet")
         
@@ -1288,14 +1304,19 @@ def run_pipeline(
     
     # Summary
     if include_weekly and final_features is not None:
-        daily_feature_count = len([col for col in final_features.columns 
+        daily_feature_count = len([col for col in final_features.columns
                                  if not col.startswith('w_') and col not in ['symbol', 'date']])
         weekly_feature_count = len([col for col in final_features.columns if col.startswith('w_')])
+        filtered_count = len(filtered_features.columns) if 'filtered_features' in dir() else 0
         logger.info(f"Pipeline completed successfully!")
         logger.info(f"  - Daily features: {daily_feature_count}")
         logger.info(f"  - Weekly features: {weekly_feature_count}")
-        logger.info(f"  - Total features: {daily_feature_count + weekly_feature_count}")
+        logger.info(f"  - Complete features: {len(final_features.columns)}")
+        logger.info(f"  - Filtered features: {filtered_count}")
         logger.info(f"  - Symbols processed: {final_features['symbol'].nunique()}")
+        logger.info(f"  - Output files:")
+        logger.info(f"      features_complete.parquet (ALL features)")
+        logger.info(f"      features_filtered.parquet (ML-ready)")
         logger.info(f"  - Outputs saved to {output_dir}")
     else:
         logger.info(f"Pipeline completed. Daily features and targets saved to {output_dir}")

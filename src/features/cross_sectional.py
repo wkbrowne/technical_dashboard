@@ -667,6 +667,7 @@ def compute_cross_sectional_features(
 
     # 5) Joint factor regression betas (market, QQQ, best-match, breadth)
     # Computes all betas jointly via multivariate ridge regression for cleaner estimates
+    # Also computes bestmatch-SPY spread (cap-weighted) and bestmatch_ew-RSP spread (equal-weight)
     logger.info("Computing joint factor regression features (daily)...")
     factor_config = FactorRegressionConfig()
     add_joint_factor_features(
@@ -674,7 +675,8 @@ def compute_cross_sectional_features(
         best_match_mappings=best_match_mappings,
         config=factor_config,
         frequency='daily',
-        n_jobs=n_jobs
+        n_jobs=n_jobs,
+        best_match_ew_mappings=best_match_ew_mappings
     )
     logger.debug("  ✓ Joint factor features (daily) completed")
 
@@ -686,7 +688,8 @@ def compute_cross_sectional_features(
         best_match_mappings=best_match_mappings,
         config=factor_config,
         frequency='weekly',
-        n_jobs=n_jobs
+        n_jobs=n_jobs,
+        best_match_ew_mappings=best_match_ew_mappings
     )
     logger.debug("  ✓ Joint factor features (weekly) completed")
 
@@ -808,6 +811,118 @@ def compute_cross_sectional_features_safe(
         return False
 
 
+def _load_benchmark_etfs_for_weekly(
+    weekly_by_symbol: Dict[str, pd.DataFrame],
+    market_symbol: str = "SPY",
+    qqq_symbol: str = "QQQ",
+    sector_to_etf: Optional[Dict[str, str]] = None,
+) -> None:
+    """
+    Load benchmark ETFs from cache and resample to weekly for cross-sectional features.
+
+    This ensures QQQ, SPY, and sector ETFs are available in weekly_by_symbol even when
+    they're not part of the stock universe (indicators_by_symbol).
+
+    Args:
+        weekly_by_symbol: Dict to add ETF data to (modified in place)
+        market_symbol: Market benchmark symbol (default: SPY)
+        qqq_symbol: Tech benchmark symbol (default: QQQ)
+        sector_to_etf: Dict mapping sector name -> ETF symbol
+    """
+    from pathlib import Path
+
+    # Collect all ETFs we need
+    etfs_needed = set()
+    if market_symbol not in weekly_by_symbol:
+        etfs_needed.add(market_symbol)
+    if qqq_symbol not in weekly_by_symbol:
+        etfs_needed.add(qqq_symbol)
+    if sector_to_etf:
+        for etf in sector_to_etf.values():
+            if etf not in weekly_by_symbol:
+                etfs_needed.add(etf)
+
+    if not etfs_needed:
+        logger.debug("All benchmark ETFs already in weekly_by_symbol")
+        return
+
+    logger.info(f"Loading {len(etfs_needed)} benchmark ETFs for weekly features: {list(etfs_needed)[:5]}...")
+
+    # Try to load from combined ETF cache file (stock_data_etf.parquet)
+    cache_dir = Path(__file__).parent.parent.parent / "cache"
+    etf_cache_path = cache_dir / "stock_data_etf.parquet"
+
+    if not etf_cache_path.exists():
+        logger.warning(f"ETF cache not found: {etf_cache_path}")
+        return
+
+    try:
+        etf_cache_df = pd.read_parquet(etf_cache_path)
+    except Exception as e:
+        logger.warning(f"Failed to load ETF cache: {e}")
+        return
+
+    # The ETF cache is in long format: date, symbol, value, metric
+    # We need to pivot to wide format for each symbol
+    loaded_count = 0
+    for etf_sym in etfs_needed:
+        try:
+            etf_data = etf_cache_df[etf_cache_df['symbol'] == etf_sym]
+            if len(etf_data) == 0:
+                logger.debug(f"ETF {etf_sym} not found in cache")
+                continue
+
+            # Pivot from long to wide format
+            etf_df = etf_data.pivot_table(index='date', columns='metric', values='value')
+
+            # Normalize column names to lowercase
+            etf_df.columns = [c.lower() for c in etf_df.columns]
+
+            # Ensure DatetimeIndex
+            if not isinstance(etf_df.index, pd.DatetimeIndex):
+                etf_df.index = pd.to_datetime(etf_df.index)
+            etf_df = etf_df.sort_index()
+
+            # Resample to weekly (Friday close)
+            if 'adjclose' not in etf_df.columns and 'close' not in etf_df.columns:
+                logger.debug(f"ETF {etf_sym} has no adjclose or close column")
+                continue
+
+            agg_rules = {}
+            if 'open' in etf_df.columns:
+                agg_rules['open'] = lambda x: x.iloc[0] if len(x) > 0 else np.nan
+            if 'high' in etf_df.columns:
+                agg_rules['high'] = 'max'
+            if 'low' in etf_df.columns:
+                agg_rules['low'] = 'min'
+            if 'close' in etf_df.columns:
+                agg_rules['close'] = lambda x: x.iloc[-1] if len(x) > 0 else np.nan
+            if 'adjclose' in etf_df.columns:
+                agg_rules['adjclose'] = lambda x: x.iloc[-1] if len(x) > 0 else np.nan
+            if 'volume' in etf_df.columns:
+                agg_rules['volume'] = 'sum'
+
+            weekly_df = etf_df[list(agg_rules.keys())].resample('W-FRI').agg(agg_rules)
+            weekly_df = weekly_df.dropna(subset=['adjclose'] if 'adjclose' in weekly_df.columns else ['close'])
+
+            # Compute returns
+            if 'adjclose' in weekly_df.columns:
+                weekly_df['ret'] = weekly_df['adjclose'].pct_change()
+            elif 'close' in weekly_df.columns:
+                weekly_df['ret'] = weekly_df['close'].pct_change()
+
+            if len(weekly_df) >= 10:
+                weekly_by_symbol[etf_sym] = weekly_df
+                loaded_count += 1
+                logger.debug(f"Loaded ETF {etf_sym}: {len(weekly_df)} weekly rows, ret NaN: {weekly_df['ret'].isna().sum()}")
+
+        except Exception as e:
+            logger.debug(f"Failed to load ETF {etf_sym}: {e}")
+            continue
+
+    logger.info(f"Loaded {loaded_count} benchmark ETFs for weekly features")
+
+
 def compute_weekly_cross_sectional_features(
     indicators_by_symbol: Dict[str, pd.DataFrame],
     market_symbol: str = "SPY",
@@ -905,6 +1020,15 @@ def compute_weekly_cross_sectional_features(
     if len(weekly_by_symbol) < 10:
         logger.warning("Insufficient weekly data for cross-sectional features")
         return
+
+    # Step 1.5: Load benchmark ETFs (QQQ, sector ETFs) if not already in weekly_by_symbol
+    # These ETFs may not be in indicators_by_symbol since that contains stocks only
+    _load_benchmark_etfs_for_weekly(
+        weekly_by_symbol,
+        market_symbol=market_symbol,
+        qqq_symbol=qqq_symbol,
+        sector_to_etf=sector_to_etf
+    )
 
     # Step 2: Compute weekly cross-asset features
     logger.info("Computing weekly cross-asset features...")
@@ -1230,6 +1354,16 @@ def _add_weekly_alpha_features(
     - w_alpha_mom_combo_{20,60}_ema10
     - w_alpha_resid_spy, w_alpha_resid_qqq
     """
+    # Helper to align series to target index with ffill/bfill (handles weekly date mismatches)
+    def align_to_index(series: pd.Series, target_index: pd.Index) -> pd.Series:
+        """Align series to target index using ffill/bfill for date mismatches."""
+        if len(series) == 0 or len(target_index) == 0:
+            return pd.Series(index=target_index, dtype='float64')
+        # Union indices, ffill/bfill, then select target dates
+        combined_idx = series.index.union(target_index).sort_values()
+        filled = series.reindex(combined_idx).ffill().bfill()
+        return filled.reindex(target_index)
+
     # Get market returns
     if market_symbol not in weekly_by_symbol:
         logger.warning(f"Market symbol {market_symbol} not in weekly data")
@@ -1246,8 +1380,17 @@ def _add_weekly_alpha_features(
     qqq_ret = None
     if qqq_symbol in weekly_by_symbol:
         qqq_df = weekly_by_symbol[qqq_symbol]
+        logger.info(f"QQQ found in weekly_by_symbol, columns: {list(qqq_df.columns)[:10]}, shape: {qqq_df.shape}")
         if 'ret' in qqq_df.columns:
             qqq_ret = pd.to_numeric(qqq_df['ret'], errors='coerce')
+            logger.info(f"QQQ ret loaded, NaN: {qqq_ret.isna().sum()}/{len(qqq_ret)}")
+        else:
+            logger.warning(f"QQQ has no 'ret' column! Available columns: {list(qqq_df.columns)}")
+    else:
+        logger.warning(f"QQQ ({qqq_symbol}) not in weekly_by_symbol! Keys: {list(weekly_by_symbol.keys())[:5]}...")
+
+    # Log summary of QQQ status at INFO level
+    logger.info(f"QQQ ret status: {'AVAILABLE' if qqq_ret is not None else 'NOT AVAILABLE'}")
 
     # Build sector returns dict
     sector_rets = {}
@@ -1274,10 +1417,11 @@ def _add_weekly_alpha_features(
 
         stock_ret = pd.to_numeric(df['ret'], errors='coerce')
 
-        # Align returns with SPY
+        # Align returns with SPY using union + ffill approach for weekly date mismatches
+        spy_aligned = align_to_index(spy_ret, stock_ret.index)
         aligned = pd.DataFrame({
             'stock': stock_ret,
-            'spy': spy_ret
+            'spy': spy_aligned
         }).dropna()
 
         if len(aligned) < beta_window:
@@ -1290,11 +1434,11 @@ def _add_weekly_alpha_features(
             cov = aligned['stock'].rolling(beta_window, min_periods=beta_window//2).cov(aligned['spy'])
             var = aligned['spy'].rolling(beta_window, min_periods=beta_window//2).var()
             beta = cov / var.replace(0, np.nan)
-            new_features[f'{prefix}beta_spy'] = beta.reindex(df.index).astype('float32')
+            new_features[f'{prefix}beta_spy'] = align_to_index(beta, df.index).astype('float32')
 
             # Alpha residual (stock return - beta * market return)
             alpha_resid = aligned['stock'] - beta * aligned['spy']
-            new_features[f'{prefix}alpha_resid_spy'] = alpha_resid.reindex(df.index).astype('float32')
+            new_features[f'{prefix}alpha_resid_spy'] = align_to_index(alpha_resid, df.index).astype('float32')
 
             # Alpha momentum for multiple windows
             for win in alpha_windows:
@@ -1302,7 +1446,7 @@ def _add_weekly_alpha_features(
                     alpha_cum = alpha_resid.rolling(win, min_periods=win//2).sum()
                     alpha_mom = alpha_cum.ewm(span=ema_span, min_periods=1).mean()
                     days_equiv = win * 5  # Convert weeks to approx days
-                    new_features[f'{prefix}alpha_mom_spy_{days_equiv}_ema10'] = alpha_mom.reindex(df.index).astype('float32')
+                    new_features[f'{prefix}alpha_mom_spy_{days_equiv}_ema10'] = align_to_index(alpha_mom, df.index).astype('float32')
 
         except Exception as e:
             logger.debug(f"SPY alpha computation failed for {sym}: {e}")
@@ -1311,20 +1455,22 @@ def _add_weekly_alpha_features(
         # Alpha vs QQQ if available
         if qqq_ret is not None:
             try:
+                # Align QQQ returns to stock index before alignment
+                qqq_aligned = align_to_index(qqq_ret, stock_ret.index)
                 aligned_qqq = pd.DataFrame({
                     'stock': stock_ret,
-                    'spy': spy_ret,
-                    'qqq': qqq_ret
+                    'spy': spy_aligned,
+                    'qqq': qqq_aligned
                 }).dropna()
 
                 if len(aligned_qqq) >= beta_window:
                     cov_qqq = aligned_qqq['stock'].rolling(beta_window, min_periods=beta_window//2).cov(aligned_qqq['qqq'])
                     var_qqq = aligned_qqq['qqq'].rolling(beta_window, min_periods=beta_window//2).var()
                     beta_qqq = cov_qqq / var_qqq.replace(0, np.nan)
-                    new_features[f'{prefix}beta_qqq'] = beta_qqq.reindex(df.index).astype('float32')
+                    new_features[f'{prefix}beta_qqq'] = align_to_index(beta_qqq, df.index).astype('float32')
 
                     alpha_qqq = aligned_qqq['stock'] - beta_qqq * aligned_qqq['qqq']
-                    new_features[f'{prefix}alpha_resid_qqq'] = alpha_qqq.reindex(df.index).astype('float32')
+                    new_features[f'{prefix}alpha_resid_qqq'] = align_to_index(alpha_qqq, df.index).astype('float32')
 
                     # Alpha momentum vs QQQ for different windows
                     for win in [4, 12]:  # 20, 60 days equiv
@@ -1332,7 +1478,7 @@ def _add_weekly_alpha_features(
                             alpha_cum = alpha_qqq.rolling(win, min_periods=win//2).sum()
                             alpha_mom = alpha_cum.ewm(span=ema_span, min_periods=1).mean()
                             days_equiv = win * 5
-                            new_features[f'{prefix}alpha_mom_qqq_{days_equiv}_ema10'] = alpha_mom.reindex(df.index).astype('float32')
+                            new_features[f'{prefix}alpha_mom_qqq_{days_equiv}_ema10'] = align_to_index(alpha_mom, df.index).astype('float32')
 
                     # Alpha spread (longer window for stability)
                     cov_spy = aligned_qqq['stock'].rolling(beta_window, min_periods=beta_window//2).cov(aligned_qqq['spy'])
@@ -1342,7 +1488,7 @@ def _add_weekly_alpha_features(
 
                     alpha_spread = alpha_spy_qqq.rolling(12, min_periods=6).sum() - alpha_qqq.rolling(12, min_periods=6).sum()
                     alpha_spread_ema = alpha_spread.ewm(span=ema_span, min_periods=1).mean()
-                    new_features[f'{prefix}alpha_mom_qqq_spread_60_ema10'] = alpha_spread_ema.reindex(df.index).astype('float32')
+                    new_features[f'{prefix}alpha_mom_qqq_spread_60_ema10'] = align_to_index(alpha_spread_ema, df.index).astype('float32')
 
             except Exception as e:
                 logger.debug(f"QQQ alpha computation failed for {sym}: {e}")
@@ -1605,10 +1751,14 @@ def _merge_weekly_cs_to_daily(
     prefix: str = "w_"
 ) -> None:
     """Merge weekly cross-sectional features back to daily data."""
-    # Identify weekly CS feature columns (those that start with prefix)
-    sample_sym = next(iter(weekly_by_symbol.keys()))
-    sample_weekly = weekly_by_symbol[sample_sym]
-    weekly_cs_cols = [c for c in sample_weekly.columns if c.startswith(prefix)]
+    # Identify weekly CS feature columns across ALL symbols (not just first one)
+    # Different symbols may have different features (e.g., ETFs don't have w_beta_qqq)
+    weekly_cs_cols_set = set()
+    for sym, weekly_df in weekly_by_symbol.items():
+        for col in weekly_df.columns:
+            if col.startswith(prefix):
+                weekly_cs_cols_set.add(col)
+    weekly_cs_cols = sorted(weekly_cs_cols_set)
 
     if not weekly_cs_cols:
         logger.warning("No weekly cross-sectional features to merge")
