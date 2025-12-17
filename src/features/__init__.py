@@ -5,7 +5,6 @@ This package contains modules for computing various technical indicators and fea
 
 Core Components:
 - base: BaseFeature and CrossSectionalFeature abstract base classes
-- registry: Feature registration and factory
 - timeframe: Unified D/W/M resampling and merge
 - single_stock: Orchestrates single-stock feature computation
 - cross_sectional: Orchestrates cross-sectional feature computation
@@ -18,7 +17,7 @@ Feature Modules:
 - volume: Volume-based features
 - alpha: Alpha momentum features
 - relstrength: Relative strength features
-- breadth: Market breadth features
+- sector_breadth: Sector ETF breadth proxy features
 - xsec: Cross-sectional momentum features
 
 Support:
@@ -31,14 +30,6 @@ Support:
 from .single_stock import compute_single_stock_features, compute_single_stock_features_safe
 from .cross_sectional import compute_cross_sectional_features, compute_cross_sectional_features_safe
 from .base import BaseFeature, CrossSectionalFeature, FeatureError, ValidationError
-from .registry import (
-    FEATURE_REGISTRY,
-    register_feature,
-    get_feature,
-    create_feature,
-    list_features,
-    list_all_features,
-)
 from .timeframe import (
     TimeframeType,
     TimeframeConfig,
@@ -58,13 +49,6 @@ __all__ = [
     'CrossSectionalFeature',
     'FeatureError',
     'ValidationError',
-    # Registry
-    'FEATURE_REGISTRY',
-    'register_feature',
-    'get_feature',
-    'create_feature',
-    'list_features',
-    'list_all_features',
     # Timeframe
     'TimeframeType',
     'TimeframeConfig',
