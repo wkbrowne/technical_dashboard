@@ -1392,7 +1392,7 @@ class LooseTightPipeline:
         print(f"  ├{'─' * 66}┤")
         print(f"  │ Stage: {stage:20s}  Features: {n_features:3d}                   │")
         print(f"  ├{'─' * 10}┬{'─' * 12}┬{'─' * 12}┬{'─' * 10}┬{'─' * 17}┤")
-        print(f"  │ {'Metric':^8} │ {'Mean':^10} │ {'Std':^10} │ {'Better':^8} │ {'Interpretation':^15} │")
+        print(f"  │ {'Metric':^8} │ {'Mean':^10} │ {'Std':^10} │ {'Goal':^8} │ {'Interpretation':^15} │")
         print(f"  ├{'─' * 10}┼{'─' * 12}┼{'─' * 12}┼{'─' * 10}┼{'─' * 17}┤")
 
         # Metric definitions with interpretations
