@@ -296,10 +296,11 @@ FEATURE_CATEGORIES = {
         "w_xsec_mom_4w_z",
     ],
     "alpha": [
-        "beta_spy",
-        "beta_qqq",
+        "beta_spy_simple",      # Simple rolling cov/var (cross_sectional.py)
+        "beta_qqq_simple",      # Simple rolling cov/var (cross_sectional.py)
         "beta_sector",
-        "w_beta_spy",
+        "w_beta_spy_simple",    # Weekly simple rolling cov/var
+        "w_beta_qqq_simple",    # Weekly simple rolling cov/var
         "alpha_mom_spy_20_ema10",
         "alpha_mom_spy_60_ema10",
         "alpha_mom_qqq_20_ema10",
@@ -307,8 +308,9 @@ FEATURE_CATEGORIES = {
         "alpha_resid_spy",
         "alpha_qqq_vs_spy",
         "w_alpha_mom_spy_20_ema10",
-        # Factor regression
+        # Factor regression (joint 4-factor model)
         "beta_market",
+        "beta_qqq",          # Growth premium from joint model
         "beta_bestmatch",
         "beta_breadth",
         "residual_cumret",
@@ -536,25 +538,28 @@ EXPANSION_CANDIDATES = {
         "alpha_mom_sector_60_ema10",
         "alpha_mom_combo_20_ema10",
         "alpha_mom_combo_60_ema10",
-        "beta_spy",
-        "beta_qqq",
+        "beta_spy_simple",       # Simple rolling cov/var (cross_sectional.py)
+        "beta_qqq_simple",       # Simple rolling cov/var (cross_sectional.py)
         "beta_sector",
         "w_alpha_mom_spy_60_ema10",
         "w_alpha_mom_qqq_60_ema10",
         "w_alpha_mom_sector_60_ema10",
         "w_alpha_mom_combo_60_ema10",
-        "w_beta_spy",
-        "w_beta_qqq",
+        "w_beta_spy_simple",     # Weekly simple rolling cov/var
+        "w_beta_qqq_simple",     # Weekly simple rolling cov/var
     ],
 
-    # --- Factor Betas (joint regression) (10) ---
+    # --- Factor Betas (joint regression) (12) ---
+    # From factor_regression.py - orthogonalized 4-factor model
     "factor_betas": [
-        "beta_market",
-        "beta_bestmatch",
-        "beta_breadth",
+        "beta_market",       # Broad market exposure (SPY)
+        "beta_qqq",          # Growth premium (QQQ-SPY spread)
+        "beta_bestmatch",    # Sector/subsector premium (best-match ETF - SPY)
+        "beta_breadth",      # Equal-weight premium (RSP-SPY)
         "residual_cumret",
         "residual_vol",
         "w_beta_market",
+        "w_beta_qqq",
         "w_beta_bestmatch",
         "w_beta_breadth",
         "w_residual_cumret",

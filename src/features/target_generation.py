@@ -590,14 +590,8 @@ def generate_targets_parallel(
                 f"(~{chunk_size} symbols/chunk, {actual_workers} workers)")
     logger.info(f"Data subsetting: {total_rows} total rows -> {avg_rows_per_chunk:.0f} avg rows/chunk")
 
-    # Reset the loky executor pool to avoid stale state from previous parallel operations
-    # This fixes the '_ReusablePoolExecutor' object has no attribute '_temp_folder_manager' error
-    try:
-        from joblib.externals.loky import get_reusable_executor
-        get_reusable_executor().shutdown(wait=True)
-    except Exception:
-        pass  # Ignore if executor doesn't exist or can't be shut down
-    gc.collect()
+    # Note: Worker lifecycle is managed entirely by joblib - we do not explicitly
+    # manage worker processes (see Section 4 of FEATURE_PIPELINE_ARCHITECTURE.md)
 
     # Process chunks in parallel - each worker receives only its pre-filtered data
     try:

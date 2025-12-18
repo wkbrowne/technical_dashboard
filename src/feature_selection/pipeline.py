@@ -37,9 +37,10 @@ from .base_features import (
     get_expansion_candidates,
 )
 from .config import (
-    CVConfig, MetricConfig, ModelConfig, SearchConfig, SubsetResult
+    CVConfig, MetricConfig, MetricType, ModelConfig, SearchConfig, SubsetResult
 )
 from .evaluation import SubsetEvaluator
+from .display import StatsDisplay
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,7 @@ def _evaluate_subset_joblib(
     cv_config: CVConfig,
     metric_config: MetricConfig,
     search_config: SearchConfig,
+    sample_weight: Optional[pd.Series] = None,
 ) -> Optional[SubsetResult]:
     """Evaluate a feature subset (joblib worker)."""
     try:
@@ -139,6 +141,7 @@ def _evaluate_subset_joblib(
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=search_config,
+            sample_weight=sample_weight,
         )
         return evaluator.evaluate(features)
     except Exception as e:
@@ -155,6 +158,7 @@ def _evaluate_addition_joblib(
     cv_config: CVConfig,
     metric_config: MetricConfig,
     search_config: SearchConfig,
+    sample_weight: Optional[pd.Series] = None,
 ) -> Tuple[str, Optional[SubsetResult]]:
     """Evaluate adding a candidate feature (joblib worker)."""
     try:
@@ -165,6 +169,7 @@ def _evaluate_addition_joblib(
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=search_config,
+            sample_weight=sample_weight,
         )
         test_features = list(current_features) + [candidate]
         result = evaluator.evaluate(test_features)
@@ -183,6 +188,7 @@ def _evaluate_removal_joblib(
     cv_config: CVConfig,
     metric_config: MetricConfig,
     search_config: SearchConfig,
+    sample_weight: Optional[pd.Series] = None,
 ) -> Tuple[str, Optional[SubsetResult]]:
     """Evaluate removing a feature (joblib worker)."""
     try:
@@ -193,6 +199,7 @@ def _evaluate_removal_joblib(
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=search_config,
+            sample_weight=sample_weight,
         )
         test_features = [f for f in current_features if f != feature_to_remove]
         result = evaluator.evaluate(test_features)
@@ -212,6 +219,7 @@ def _evaluate_swap_joblib(
     cv_config: CVConfig,
     metric_config: MetricConfig,
     search_config: SearchConfig,
+    sample_weight: Optional[pd.Series] = None,
 ) -> Tuple[str, str, Optional[SubsetResult]]:
     """Evaluate swapping features (joblib worker)."""
     try:
@@ -222,6 +230,7 @@ def _evaluate_swap_joblib(
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=search_config,
+            sample_weight=sample_weight,
         )
         test_features = [f for f in current_features if f != f_out] + [f_in]
         result = evaluator.evaluate(test_features)
@@ -337,6 +346,10 @@ class LooseTightPipeline:
         # Data references (set during run)
         self._X: Optional[pd.DataFrame] = None
         self._y: Optional[pd.Series] = None
+        self._sample_weight: Optional[pd.Series] = None
+
+        # Statistics display
+        self._stats_display: Optional[StatsDisplay] = None
 
         # Checkpointing
         self._checkpoint_dir = Path('artifacts/feature_selection')
@@ -569,6 +582,7 @@ class LooseTightPipeline:
         X: pd.DataFrame,
         y: pd.Series,
         verbose: bool = True,
+        sample_weight: Optional[pd.Series] = None,
     ) -> 'LooseTightPipeline':
         """Run the complete pipeline.
 
@@ -576,6 +590,9 @@ class LooseTightPipeline:
             X: Feature DataFrame
             y: Target Series
             verbose: Whether to print progress
+            sample_weight: Optional sample weights for training (e.g., from overlap inverse).
+                          These weights down-weight overlapping trajectories from triple
+                          barrier targets to reduce the influence of correlated samples.
 
         Returns:
             self for chaining
@@ -583,6 +600,7 @@ class LooseTightPipeline:
         self._X = X
         self._y = y
         self._verbose = verbose
+        self._sample_weight = sample_weight
 
         # Get base features that exist in the data
         base_features = [f for f in get_base_features() if f in X.columns]
@@ -607,8 +625,12 @@ class LooseTightPipeline:
             print(f"STEP 1: Base Features")
             print(f"  Features: {len(current_features)}")
             print(f"  Metric: {baseline_result.metric_main:.4f} ± {baseline_result.metric_std:.4f}")
+            self._print_extended_metrics("1_base_features", baseline_result, len(current_features))
             print(f"  [Checkpoint saved]")
             print()
+
+        # Store baseline for comparison
+        initial_baseline = baseline_result
 
         # STEP 1b: Optional base feature elimination (quick pruning)
         if self.config.run_base_elimination:
@@ -617,9 +639,11 @@ class LooseTightPipeline:
             self._record_snapshot("1b_base_elimination", current_features, result)
             self._save_checkpoint("1b_base_elimination", current_features, result)
             if verbose:
+                self._print_comparison_table(initial_baseline, result, "Base Elimination")
                 print(f"  [Checkpoint saved]")
 
         # STEP 2: Loose forward selection
+        pre_forward_result = self._evaluate_subset(list(current_features), use_all_cores=True)
         current_features, result = self._loose_forward_selection(
             current_features, all_expansion
         )
@@ -627,18 +651,24 @@ class LooseTightPipeline:
         self._record_snapshot("2_loose_forward", current_features, result)
         self._save_checkpoint("2_loose_forward", current_features, result)
         if verbose:
+            self._print_extended_metrics("2_loose_forward", result, len(current_features))
+            self._print_comparison_table(pre_forward_result, result, "Loose Forward Selection")
             print(f"  [Checkpoint saved]")
 
         # STEP 3: Strict backward elimination
+        pre_backward_result = result
         current_features, result = self._strict_backward_elimination(current_features)
         self._completed_stages.append("3_strict_backward")
         self._record_snapshot("3_strict_backward", current_features, result)
         self._save_checkpoint("3_strict_backward", current_features, result)
         if verbose:
+            self._print_extended_metrics("3_strict_backward", result, len(current_features))
+            self._print_comparison_table(pre_backward_result, result, "Strict Backward Elimination")
             print(f"  [Checkpoint saved]")
 
         # STEP 4: Light interaction pass (optional)
         if self.config.run_interactions:
+            pre_interaction_result = result
             current_features, result = self._light_interaction_pass(
                 current_features, all_expansion
             )
@@ -646,9 +676,12 @@ class LooseTightPipeline:
             self._record_snapshot("4_interactions", current_features, result)
             self._save_checkpoint("4_interactions", current_features, result)
             if verbose:
+                self._print_extended_metrics("4_interactions", result, len(current_features))
+                self._print_comparison_table(pre_interaction_result, result, "Interaction Pass")
                 print(f"  [Checkpoint saved]")
 
         # STEP 5: Hill climbing / swapping
+        pre_swap_result = result
         current_features, result = self._hill_climbing_swapping(
             current_features, all_expansion
         )
@@ -656,29 +689,26 @@ class LooseTightPipeline:
         self._record_snapshot("5_swapping", current_features, result)
         self._save_checkpoint("5_swapping", current_features, result)
         if verbose:
+            self._print_extended_metrics("5_swapping", result, len(current_features))
+            self._print_comparison_table(pre_swap_result, result, "Hill Climbing / Swapping")
             print(f"  [Checkpoint saved]")
 
         # STEP 6: Final cleanup pass
+        pre_cleanup_result = result
         current_features, result = self._final_cleanup(current_features)
         self._completed_stages.append("6_final_cleanup")
         self._record_snapshot("6_final_cleanup", current_features, result)
         self._save_checkpoint("6_final_cleanup", current_features, result)
         if verbose:
+            self._print_extended_metrics("6_final_cleanup", result, len(current_features))
+            self._print_comparison_table(pre_cleanup_result, result, "Final Cleanup")
             print(f"  [Checkpoint saved]")
 
         # STEP 7: Select best subset seen anywhere
         self._select_best_subset()
 
         if verbose:
-            print(f"\n{'='*70}")
-            print("PIPELINE COMPLETE")
-            print(f"{'='*70}")
-            print(f"\nBest subset found at stage: {self.best_snapshot.stage}")
-            print(f"Features: {len(self.best_snapshot.features)}")
-            print(f"Metric: {self.best_snapshot.metric_mean:.4f} ± {self.best_snapshot.metric_std:.4f}")
-            print(f"\nFeature list:")
-            for i, f in enumerate(sorted(self.best_snapshot.features), 1):
-                print(f"  {i:2d}. {f}")
+            self._print_final_summary(initial_baseline, result)
 
         return self
 
@@ -719,7 +749,8 @@ class LooseTightPipeline:
             delayed(_evaluate_removal_joblib)(
                 self._X, self._y, features_list, f,
                 self.model_config, self.cv_config,
-                self.metric_config, self.search_config
+                self.metric_config, self.search_config,
+                self._sample_weight
             )
             for f in features_list
         )
@@ -823,7 +854,8 @@ class LooseTightPipeline:
                 delayed(_evaluate_addition_joblib)(
                     self._X, self._y, list(current_set), cand,
                     self.model_config, self.cv_config,
-                    self.metric_config, self.search_config
+                    self.metric_config, self.search_config,
+                    self._sample_weight
                 )
                 for cand in remaining
             )
@@ -910,7 +942,8 @@ class LooseTightPipeline:
                 delayed(_evaluate_removal_joblib)(
                     self._X, self._y, features_list, f,
                     self.model_config, self.cv_config,
-                    self.metric_config, self.search_config
+                    self.metric_config, self.search_config,
+                    self._sample_weight
                 )
                 for f in features_list
             )
@@ -1132,7 +1165,8 @@ class LooseTightPipeline:
                 delayed(_evaluate_swap_joblib)(
                     self._X, self._y, list(current_set), f_out, f_in,
                     self.model_config, self.cv_config,
-                    self.metric_config, self.search_config
+                    self.metric_config, self.search_config,
+                    self._sample_weight
                 )
                 for f_out, f_in in swap_candidates
             )
@@ -1248,6 +1282,7 @@ class LooseTightPipeline:
             cv_config=self.cv_config,
             metric_config=self.metric_config,
             search_config=self.search_config,
+            sample_weight=self._sample_weight,
         )
         return evaluator.evaluate(features)
 
@@ -1270,6 +1305,169 @@ class LooseTightPipeline:
         # Update best if this is better
         if self.best_snapshot is None or snapshot.metric_mean > self.best_snapshot.metric_mean:
             self.best_snapshot = snapshot
+
+    def _print_final_summary(self, initial_baseline: SubsetResult, final_result: SubsetResult):
+        """Print final summary with all stages and overall improvement.
+
+        Args:
+            initial_baseline: Initial baseline result (base features).
+            final_result: Final result after all stages.
+        """
+        if not self._verbose:
+            return
+
+        print()
+        print(f"\n{'=' * 80}")
+        print(f"{'PIPELINE COMPLETE - FINAL SUMMARY':^80}")
+        print(f"{'=' * 80}")
+
+        # Stage progression table
+        print()
+        print("  STAGE PROGRESSION")
+        print(f"  ┌{'─' * 25}┬{'─' * 10}┬{'─' * 12}┬{'─' * 12}┬{'─' * 12}┬{'─' * 5}┐")
+        print(f"  │ {'Stage':<23} │ {'Features':^8} │ {'AUC':^10} │ {'AUPR':^10} │ {'Brier':^10} │ {'Best':^3} │")
+        print(f"  ├{'─' * 25}┼{'─' * 10}┼{'─' * 12}┼{'─' * 12}┼{'─' * 12}┼{'─' * 5}┤")
+
+        for snapshot in self.snapshots:
+            is_best = snapshot == self.best_snapshot
+            best_marker = '★' if is_best else ' '
+
+            # Get metrics from the snapshot (we need to re-evaluate for extended metrics)
+            # For now, show primary metric
+            print(f"  │ {snapshot.stage:<23} │ {len(snapshot.features):^8} │ {snapshot.metric_mean:^10.4f} │ {'─':^10} │ {'─':^10} │ {best_marker:^3} │")
+
+        print(f"  └{'─' * 25}┴{'─' * 10}┴{'─' * 12}┴{'─' * 12}┴{'─' * 12}┴{'─' * 5}┘")
+
+        # Best result details
+        print()
+        print(f"  BEST RESULT: {self.best_snapshot.stage}")
+        print(f"  {'─' * 40}")
+        print(f"  Features: {len(self.best_snapshot.features)}")
+        print(f"  Primary Metric (AUC): {self.best_snapshot.metric_mean:.4f} ± {self.best_snapshot.metric_std:.4f}")
+
+        # Overall improvement
+        if initial_baseline.metric_main > 0:
+            improvement = final_result.metric_main - initial_baseline.metric_main
+            pct_improvement = 100 * improvement / initial_baseline.metric_main
+            sign = '+' if improvement > 0 else ''
+            print()
+            print(f"  OVERALL IMPROVEMENT (vs Base Features)")
+            print(f"  {'─' * 40}")
+            print(f"  AUC: {initial_baseline.metric_main:.4f} → {final_result.metric_main:.4f} ({sign}{improvement:.4f}, {sign}{pct_improvement:.1f}%)")
+
+            # Extended metrics improvement
+            for metric_key in ['aupr', 'brier', 'log_loss']:
+                if metric_key in initial_baseline.secondary_metrics and metric_key in final_result.secondary_metrics:
+                    base_val = initial_baseline.secondary_metrics[metric_key][0]
+                    final_val = final_result.secondary_metrics[metric_key][0]
+                    delta = final_val - base_val
+                    sign = '+' if delta > 0 else ''
+                    print(f"  {metric_key.upper()}: {base_val:.4f} → {final_val:.4f} ({sign}{delta:.4f})")
+
+        # Feature list
+        print()
+        print(f"  SELECTED FEATURES ({len(self.best_snapshot.features)} total)")
+        print(f"  {'─' * 40}")
+        for i, f in enumerate(sorted(self.best_snapshot.features), 1):
+            print(f"  {i:3d}. {f}")
+
+        print()
+        print(f"{'=' * 80}")
+
+    def _print_extended_metrics(self, stage: str, result: SubsetResult, n_features: int):
+        """Print extended metrics table for a stage result.
+
+        Args:
+            stage: Stage name.
+            result: SubsetResult with secondary_metrics containing extended metrics.
+            n_features: Number of features in subset.
+        """
+        if not self._verbose:
+            return
+
+        # Header
+        print()
+        print(f"  ┌{'─' * 66}┐")
+        print(f"  │ {'METRICS SUMMARY':^64} │")
+        print(f"  ├{'─' * 66}┤")
+        print(f"  │ Stage: {stage:20s}  Features: {n_features:3d}                   │")
+        print(f"  ├{'─' * 10}┬{'─' * 12}┬{'─' * 12}┬{'─' * 10}┬{'─' * 17}┤")
+        print(f"  │ {'Metric':^8} │ {'Mean':^10} │ {'Std':^10} │ {'Better':^8} │ {'Interpretation':^15} │")
+        print(f"  ├{'─' * 10}┼{'─' * 12}┼{'─' * 12}┼{'─' * 10}┼{'─' * 17}┤")
+
+        # Metric definitions with interpretations
+        metrics_info = [
+            ('auc', '↑ higher', 'Discrimination'),
+            ('aupr', '↑ higher', 'Prec-Recall'),
+            ('brier', '↓ lower', 'Calibration'),
+            ('log_loss', '↓ lower', 'Likelihood'),
+        ]
+
+        for metric_key, direction, interpretation in metrics_info:
+            if metric_key in result.secondary_metrics:
+                mean, std = result.secondary_metrics[metric_key]
+                # Format with appropriate precision
+                mean_str = f"{mean:.4f}"
+                std_str = f"{std:.4f}"
+                print(f"  │ {metric_key.upper():^8} │ {mean_str:^10} │ {std_str:^10} │ {direction:^8} │ {interpretation:^15} │")
+            else:
+                print(f"  │ {metric_key.upper():^8} │ {'N/A':^10} │ {'N/A':^10} │ {direction:^8} │ {interpretation:^15} │")
+
+        print(f"  └{'─' * 10}┴{'─' * 12}┴{'─' * 12}┴{'─' * 10}┴{'─' * 17}┘")
+        print()
+
+    def _print_comparison_table(self, baseline: SubsetResult, current: SubsetResult, stage: str):
+        """Print comparison table between baseline and current results.
+
+        Args:
+            baseline: Baseline result for comparison.
+            current: Current result.
+            stage: Stage name.
+        """
+        if not self._verbose:
+            return
+
+        print()
+        print(f"  ┌{'─' * 72}┐")
+        print(f"  │ {'COMPARISON: ' + stage:^70} │")
+        print(f"  ├{'─' * 10}┬{'─' * 14}┬{'─' * 14}┬{'─' * 14}┬{'─' * 15}┤")
+        print(f"  │ {'Metric':^8} │ {'Baseline':^12} │ {'Current':^12} │ {'Delta':^12} │ {'Status':^13} │")
+        print(f"  ├{'─' * 10}┼{'─' * 14}┼{'─' * 14}┼{'─' * 14}┼{'─' * 15}┤")
+
+        # Metric definitions
+        metrics_info = [
+            ('auc', True),      # higher is better
+            ('aupr', True),     # higher is better
+            ('brier', False),   # lower is better
+            ('log_loss', False), # lower is better
+        ]
+
+        for metric_key, higher_better in metrics_info:
+            base_val = baseline.secondary_metrics.get(metric_key, (np.nan, np.nan))[0]
+            curr_val = current.secondary_metrics.get(metric_key, (np.nan, np.nan))[0]
+
+            if np.isnan(base_val) or np.isnan(curr_val):
+                print(f"  │ {metric_key.upper():^8} │ {'N/A':^12} │ {'N/A':^12} │ {'N/A':^12} │ {'─':^13} │")
+                continue
+
+            delta = curr_val - base_val
+            # Determine if improved
+            if higher_better:
+                improved = delta > 0.0001
+                worsened = delta < -0.0001
+            else:
+                improved = delta < -0.0001
+                worsened = delta > 0.0001
+
+            status = "✓ Improved" if improved else ("✗ Worsened" if worsened else "─ Same")
+
+            sign = '+' if delta > 0 else ''
+            delta_str = f"{sign}{delta:.4f}"
+
+            print(f"  │ {metric_key.upper():^8} │ {base_val:^12.4f} │ {curr_val:^12.4f} │ {delta_str:^12} │ {status:^13} │")
+
+        print(f"  └{'─' * 10}┴{'─' * 14}┴{'─' * 14}┴{'─' * 14}┴{'─' * 15}┘")
+        print()
 
     # =========================================================================
     # Results Access
@@ -1313,6 +1511,7 @@ def run_loose_tight_selection(
     y: pd.Series,
     n_jobs: int = 8,
     verbose: bool = True,
+    sample_weight: Optional[pd.Series] = None,
     **config_kwargs,
 ) -> LooseTightPipeline:
     """
@@ -1323,6 +1522,7 @@ def run_loose_tight_selection(
         y: Target Series
         n_jobs: Number of parallel workers
         verbose: Whether to print progress
+        sample_weight: Optional sample weights for training (e.g., from overlap inverse)
         **config_kwargs: Additional config parameters
 
     Returns:
@@ -1330,5 +1530,5 @@ def run_loose_tight_selection(
     """
     config = LooseTightConfig(n_jobs=n_jobs, **config_kwargs)
     pipeline = LooseTightPipeline(pipeline_config=config)
-    pipeline.run(X, y, verbose=verbose)
+    pipeline.run(X, y, verbose=verbose, sample_weight=sample_weight)
     return pipeline

@@ -24,6 +24,8 @@ class TaskType(Enum):
 class MetricType(Enum):
     """Supported evaluation metrics."""
     AUC = "auc"
+    AUPR = "aupr"  # Area Under Precision-Recall curve
+    BRIER = "brier"  # Brier score (calibration)
     LOG_LOSS = "log_loss"
     IC = "ic"  # Information coefficient (Spearman correlation)
     PRECISION_AT_K = "precision_at_k"

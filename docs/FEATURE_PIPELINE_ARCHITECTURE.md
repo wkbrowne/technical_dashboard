@@ -1089,6 +1089,25 @@ Weekly factor features handle resampling inside workers to avoid sequential bott
 2. Each worker resamples its batch of stock returns to weekly in parallel
 3. Results are forward-filled back to daily index
 
+**Beta Feature Naming Convention:**
+
+Two beta computation methods exist with distinct names:
+
+| Feature | Method | Module | Description |
+|---------|--------|--------|-------------|
+| `beta_market` / `w_beta_market` | Joint factor (orthogonalized) | `factor_regression.py` | Market beta from 4-factor ridge regression |
+| `beta_qqq` / `w_beta_qqq` | Joint factor (orthogonalized) | `factor_regression.py` | Growth premium (QQQ-SPY spread exposure) |
+| `beta_spy_simple` / `w_beta_spy_simple` | Simple rolling cov/var | `cross_sectional.py` | Univariate beta vs SPY |
+| `beta_qqq_simple` / `w_beta_qqq_simple` | Simple rolling cov/var | `cross_sectional.py` | Univariate beta vs QQQ |
+
+**Key Differences:**
+
+- **Joint factor betas** (`beta_market`, `beta_qqq`, etc.): Orthogonalized and computed simultaneously via ridge regression. `beta_qqq` measures exposure to the *growth premium* (QQQ outperformance vs SPY), not absolute QQQ correlation.
+
+- **Simple betas** (`beta_spy_simple`, `beta_qqq_simple`): Traditional univariate rolling cov/var. `beta_qqq_simple` measures absolute correlation to QQQ returns.
+
+Both are useful: joint factor betas provide cleaner factor attribution, simple betas provide intuitive market sensitivity measures.
+
 ### 5.5 Date Alignment
 
 Weekly features have date alignment challenges:
@@ -1166,6 +1185,23 @@ weekly_df.loc[friday_date, 'feature']  # Contains Friday data!
 direction='backward'  # in merge_asof
 ```
 
+**5. Suspicious Price Data:**
+```python
+# Bug: Symbols with unadjusted reverse splits have extreme prices
+# Example: SMX showed max price of $217M (should be ~$150 after adjustment)
+# These corrupt features and target generation
+
+# Detection criteria (applied at multiple points):
+max_price > 50000        # Extreme price
+min_price < 0.01         # Penny stock artifacts
+max/min ratio > 1000     # Unadjusted split (normal stocks rarely exceed 100x)
+
+# Filtering locations (defense-in-depth):
+# 1. src/data/loader.py:filter_suspicious_price_symbols() - data load time
+# 2. src/cli/compute.py:_filter_suspicious_symbols() - CLI entry point
+# 3. src/pipelines/orchestrator.py:_generate_triple_barrier_targets() - final check
+```
+
 ---
 
 ## 7. Target Generation
@@ -1231,16 +1267,48 @@ weight_final = clip(overlap × class_balance, 0.01, 10.0)
 weight_final = weight_final × n_samples / sum(weight_final)
 ```
 
-### 7.3 Target File Output
+### 7.3 Price Validation (Defense-in-Depth)
+
+Target generation includes final-stage price validation to catch symbols with suspicious prices that may have slipped through earlier filters. This is a defense-in-depth measure since corrupted prices produce meaningless targets.
+
+**Validation Criteria:**
+```python
+# Skip symbol if ANY of these are true:
+max_price > 50000           # Extreme price (likely data error)
+min_price < 0.01            # Penny stock artifacts
+max_price / min_price > 1000  # Unadjusted reverse split
+```
+
+**Location:** `src/pipelines/orchestrator.py:_generate_triple_barrier_targets()`
+
+**Why This Matters:**
+- `entry_px` values of $217M produce meaningless barrier levels
+- ATR calculated from corrupt prices amplifies the problem
+- Extreme values skew class weights and corrupt model training
+
+**Symptoms of Missing Validation:**
+```
+ANOMALIES:
+- entry_px: max value 217880880 (suspiciously large)
+- top: max value 299464722 (suspiciously large)
+```
+
+### 7.4 Target File Output
 
 **Output:** `artifacts/targets_triple_barrier.parquet`
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `symbol` | string | Stock symbol |
-| `date` | datetime | Entry date |
+| `t0` | datetime | Entry date |
+| `t_hit` | datetime | Barrier hit date |
 | `hit` | int8 | Barrier hit: 1=upper, 0=lower, -1=time |
-| `days_to_hit` | int16 | Trading days until barrier |
+| `entry_px` | float32 | Entry price (adjclose) |
+| `top` | float32 | Upper barrier price |
+| `bot` | float32 | Lower barrier price |
+| `h_used` | int16 | Trading days until barrier |
+| `price_hit` | float32 | Price at barrier hit |
+| `ret_from_entry` | float32 | Return from entry to hit |
 | `n_overlapping_trajs` | int16 | Overlapping trade count |
 | `weight_overlap` | float32 | Overlap uniqueness weight |
 | `weight_class_balance` | float32 | Class frequency weight |

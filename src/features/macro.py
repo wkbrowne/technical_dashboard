@@ -352,6 +352,7 @@ def add_weekly_vix_features(
     - w_vix_change_4w: 4-week change in VIX
     - w_vix_ema4: 4-week EMA of VIX
     - w_vxn_level: Weekly closing VXN level
+    - w_vxn_percentile_252d: 52-week percentile rank for VXN (0-100)
     - w_vix_vxn_spread: Weekly VIX - VXN spread
     - w_vix_vxn_ratio: Weekly VIX/VXN ratio
 
@@ -423,6 +424,8 @@ def add_weekly_vix_features(
     # VXN weekly features if available
     if has_vxn:
         weekly_features['w_vxn_level'] = vxn_weekly.rename('w_vxn_level')
+        # 52-week percentile for VXN (named w_vxn_percentile_252d for consistency with daily naming)
+        weekly_features['w_vxn_percentile_252d'] = _fast_rolling_percentile(vxn_weekly, window=52, min_periods=12).rename('w_vxn_percentile_252d')
         weekly_features['w_vix_vxn_spread'] = (vix_weekly - vxn_weekly).rename('w_vix_vxn_spread')
         weekly_features['w_vix_vxn_ratio'] = (vix_weekly / vxn_weekly.replace(0, np.nan)).rename('w_vix_vxn_ratio')
 

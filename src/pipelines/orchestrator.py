@@ -45,8 +45,7 @@ try:
     # Config system
     from ..config.features import FeatureConfig, FeatureSpec, Timeframe
     from ..config.parallel import (
-        ParallelConfig, setup_loky_executor, shutdown_loky_workers,
-        parallel_stage, get_memory_mb, calculate_workers_from_items
+        ParallelConfig, parallel_stage, get_memory_mb, calculate_workers_from_items
     )
     # Feature output filtering
     from ..feature_selection.base_features import filter_output_columns, get_output_features
@@ -70,8 +69,7 @@ except ImportError:
     # Config system
     from src.config.features import FeatureConfig, FeatureSpec, Timeframe
     from src.config.parallel import (
-        ParallelConfig, setup_loky_executor, shutdown_loky_workers,
-        parallel_stage, get_memory_mb, calculate_workers_from_items
+        ParallelConfig, parallel_stage, get_memory_mb, calculate_workers_from_items
     )
     # Feature output filtering
     from src.feature_selection.base_features import filter_output_columns, get_output_features
@@ -486,15 +484,24 @@ def _generate_triple_barrier_targets(
         # Create long format record for this symbol
         symbol_data = df[['adjclose', 'high', 'low', 'atr14']].copy()
         symbol_data = symbol_data.dropna()
-        
+
         if symbol_data.empty:
             continue
-            
+
+        # Defense-in-depth: skip symbols with suspicious prices that may have slipped through
+        # This catches unadjusted reverse splits, data errors, etc.
+        max_price = symbol_data['adjclose'].max()
+        min_price = symbol_data['adjclose'].min()
+        if max_price > 50000 or min_price < 0.01 or (min_price > 0 and max_price / min_price > 1000):
+            logger.warning(f"Skipping {symbol} in target generation: suspicious prices "
+                          f"(min={min_price:.2f}, max={max_price:.2f})")
+            continue
+
         # Add symbol column and rename for target generation
         symbol_data['symbol'] = symbol
         symbol_data['date'] = symbol_data.index
         symbol_data = symbol_data.rename(columns={'adjclose': 'close', 'atr14': 'atr'})
-        
+
         long_format_data.append(symbol_data[['symbol', 'date', 'close', 'high', 'low', 'atr']])
     
     if not long_format_data:
@@ -833,7 +840,7 @@ def compute_higher_timeframe_features_dict(
                 f"({chunk_size} stocks/worker, {n_workers} workers)")
 
     # Single parallel job that computes ALL timeframes for each symbol batch
-    # NOTE: Don't call setup_loky_executor() here - it corrupts executor state in joblib 1.5+
+    # Worker lifecycle is managed by joblib - see FEATURE_PIPELINE_ARCHITECTURE.md Section 4
     batch_results = Parallel(
         n_jobs=n_workers,
         backend='loky',
@@ -1035,8 +1042,7 @@ def run_pipeline_v2(
                    f"({chunk_size} stocks/worker, {n_workers} workers)")
 
         # Process batches in parallel
-        # NOTE: Don't call setup_loky_executor() here - it corrupts executor state in joblib 1.5+
-        # Let Parallel manage its own executor lifecycle
+        # Worker lifecycle is managed by joblib - see FEATURE_PIPELINE_ARCHITECTURE.md Section 4
         batch_results = Parallel(
             n_jobs=n_workers,
             backend='loky',
@@ -1051,9 +1057,6 @@ def run_pipeline_v2(
         for batch in batch_results:
             for sym, df in batch:
                 indicators_by_symbol[sym] = df
-
-        # Explicitly shut down loky workers to free memory immediately
-        shutdown_loky_workers()
 
     # Checkpoint: 01_single_stock
     if checkpoint_mgr and not checkpoint_mgr.should_skip_stage("01_single_stock"):
@@ -1074,8 +1077,6 @@ def run_pipeline_v2(
                 sp500_tickers=sp500_tickers,
                 n_jobs=parallel_config.n_jobs
             )
-            # Shut down loky workers after cross-sectional to free memory
-            shutdown_loky_workers()
 
         # Checkpoint: 02_cross_sectional
         if checkpoint_mgr:
@@ -1107,8 +1108,6 @@ def run_pipeline_v2(
                 timeframes=higher_tfs,
                 parallel_config=parallel_config
             )
-            # Shut down loky workers after timeframe processing to free memory
-            shutdown_loky_workers()
 
         # Checkpoint: 04_weekly_features
         if checkpoint_mgr:
@@ -1130,8 +1129,6 @@ def run_pipeline_v2(
                 sectors=sectors,
                 sector_to_etf=sector_to_etf,
             )
-            # Shut down loky workers after weekly CS features to free memory
-            shutdown_loky_workers()
 
         # Checkpoint: 05_weekly_cs
         if checkpoint_mgr:
@@ -1159,8 +1156,6 @@ def run_pipeline_v2(
                 indicators_by_symbol,
                 parallel_config=parallel_config
             )
-            # Shut down loky workers after interpolation to free memory
-            shutdown_loky_workers()
 
         # Checkpoint: 07_interpolated
         if checkpoint_mgr:
@@ -1178,8 +1173,6 @@ def run_pipeline_v2(
                 triple_barrier_config,
                 parallel_config=parallel_config
             )
-            # Shut down loky workers after target generation to free memory
-            shutdown_loky_workers()
 
         # Checkpoint: 08_targets - save indicators (targets saved separately at end)
         if checkpoint_mgr:
@@ -1188,11 +1181,15 @@ def run_pipeline_v2(
             checkpoint_mgr.save_checkpoint("08_targets", indicators_by_symbol, stage_start)
             gc.collect()
 
-    # Step 6: Convert to final long format (sequential operation - ensure workers are shut down)
-    shutdown_loky_workers()  # Ensure all parallel workers are terminated before sequential work
+    # Step 6: Convert to final long format
     print(f"\n>>> [Final Assembly] Converting to long format...", flush=True)
     daily_df_complete = combine_to_long(indicators_by_symbol)
     print(f"<<< [Final Assembly] Done: {len(daily_df_complete):,} rows, {len(daily_df_complete.columns)} columns", flush=True)
+
+    # Memory cleanup: indicators_by_symbol is no longer needed after combine_to_long
+    # (checkpoint already saved, final output is in daily_df_complete)
+    del indicators_by_symbol
+    gc.collect()
 
     # Step 6b: Create filtered version for ML training
     # ALWAYS create both: full output (features_complete) and filtered (features_filtered)
@@ -1203,9 +1200,6 @@ def run_pipeline_v2(
     if filtered_count > 0:
         print(f">>> [Output Filtering] Filtered {filtered_count} intermediate columns, keeping {cols_after}", flush=True)
         logger.info(f"Filtered output to curated features: {cols_before} -> {cols_after} columns")
-
-    # Step 7: Shut down loky workers to free memory
-    shutdown_loky_workers()
 
     print(f"\n{'='*60}", flush=True)
     print(f"PIPELINE V2 COMPLETE", flush=True)
@@ -1220,11 +1214,12 @@ def run_pipeline_v2(
                 f"{len(daily_df_complete.columns)} complete cols, "
                 f"{len(daily_df_filtered.columns)} filtered cols")
 
-    # Final checkpoint: 09_final
+    # Final checkpoint: 09_final (state only, no data - indicators already deleted for memory)
     if checkpoint_mgr:
         stage_start = dt.now()
         checkpoint_mgr.save_pipeline_state("09_final", "completed")
-        checkpoint_mgr.save_checkpoint("09_final", indicators_by_symbol, stage_start)
+        # Note: Not saving indicators_by_symbol here - it was deleted for memory optimization
+        # The final output is already in daily_df_complete/daily_df_filtered
 
         # Cleanup checkpoints if configured
         if checkpoint_config.cleanup_on_success:
@@ -1390,8 +1385,7 @@ def run_pipeline(
             filtered_features.to_parquet(filtered_features_path, index=False)
             logger.info(f"Saved filtered feature set ({len(filtered_features.columns)} cols) to {filtered_features_path}")
 
-            # Save in long format for legacy compatibility
-            save_long_parquet(indicators_by_symbol, out_path=output_dir / "features_long.parquet")
+            # Note: features_long.parquet removed - redundant with features_complete.parquet
         
         # Save triple barrier targets if generated
         if not targets_df.empty:
@@ -1489,7 +1483,7 @@ if __name__ == "__main__":
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout)
         ]

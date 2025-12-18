@@ -56,6 +56,55 @@ def compute_log_loss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         return np.inf
 
 
+def compute_aupr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute Area Under Precision-Recall Curve.
+
+    AUPR is more informative than AUC for imbalanced datasets, as it focuses
+    on the positive class performance.
+
+    Args:
+        y_true: True binary labels.
+        y_pred: Predicted probabilities or scores.
+
+    Returns:
+        AUPR score (0-1, higher is better).
+    """
+    from sklearn.metrics import average_precision_score
+
+    # Handle edge cases
+    if len(np.unique(y_true)) < 2:
+        return 0.0
+
+    try:
+        return average_precision_score(y_true, y_pred)
+    except ValueError:
+        return 0.0
+
+
+def compute_brier(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute Brier score (calibration metric).
+
+    Brier score measures the mean squared error between predicted probabilities
+    and actual outcomes. Lower is better (perfect calibration = 0).
+
+    Args:
+        y_true: True binary labels.
+        y_pred: Predicted probabilities.
+
+    Returns:
+        Brier score (0-1, lower is better).
+    """
+    from sklearn.metrics import brier_score_loss
+
+    # Clip predictions to valid probability range
+    y_pred = np.clip(y_pred, 0, 1)
+
+    try:
+        return brier_score_loss(y_true, y_pred)
+    except ValueError:
+        return 1.0
+
+
 def compute_ic(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Compute Information Coefficient (Spearman rank correlation).
 
@@ -202,6 +251,10 @@ def get_metric_function(metric_type: MetricType, task_type: TaskType) -> callabl
     """
     if metric_type == MetricType.AUC:
         return compute_auc
+    elif metric_type == MetricType.AUPR:
+        return compute_aupr
+    elif metric_type == MetricType.BRIER:
+        return compute_brier
     elif metric_type == MetricType.LOG_LOSS:
         return compute_log_loss
     elif metric_type == MetricType.IC:
@@ -223,7 +276,9 @@ def is_higher_better(metric_type: MetricType) -> bool:
     Returns:
         True if higher is better, False if lower is better.
     """
-    return metric_type != MetricType.LOG_LOSS
+    # Lower is better for these metrics
+    lower_is_better = {MetricType.LOG_LOSS, MetricType.BRIER}
+    return metric_type not in lower_is_better
 
 
 class MetricComputer:

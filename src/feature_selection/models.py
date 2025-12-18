@@ -40,7 +40,9 @@ class GBMWrapper:
         y_train: Union[pd.Series, np.ndarray],
         X_val: Optional[Union[pd.DataFrame, np.ndarray]] = None,
         y_val: Optional[Union[pd.Series, np.ndarray]] = None,
-        feature_names: Optional[List[str]] = None
+        feature_names: Optional[List[str]] = None,
+        sample_weight: Optional[Union[pd.Series, np.ndarray]] = None,
+        sample_weight_val: Optional[Union[pd.Series, np.ndarray]] = None
     ) -> 'GBMWrapper':
         """Train the model.
 
@@ -50,6 +52,8 @@ class GBMWrapper:
             X_val: Validation features (for early stopping).
             y_val: Validation labels.
             feature_names: List of feature names.
+            sample_weight: Sample weights for training data (e.g., from overlap inverse).
+            sample_weight_val: Sample weights for validation data.
 
         Returns:
             self for chaining.
@@ -65,11 +69,13 @@ class GBMWrapper:
         # Convert to numpy if needed
         X_train_arr = X_train.values if isinstance(X_train, pd.DataFrame) else X_train
         y_train_arr = y_train.values if isinstance(y_train, pd.Series) else y_train
+        weight_train_arr = sample_weight.values if isinstance(sample_weight, pd.Series) else sample_weight
+        weight_val_arr = sample_weight_val.values if isinstance(sample_weight_val, pd.Series) else sample_weight_val
 
         if self.config.model_type == ModelType.LIGHTGBM:
-            self._train_lightgbm(X_train_arr, y_train_arr, X_val, y_val)
+            self._train_lightgbm(X_train_arr, y_train_arr, X_val, y_val, weight_train_arr, weight_val_arr)
         else:
-            self._train_xgboost(X_train_arr, y_train_arr, X_val, y_val)
+            self._train_xgboost(X_train_arr, y_train_arr, X_val, y_val, weight_train_arr, weight_val_arr)
 
         return self
 
@@ -78,16 +84,19 @@ class GBMWrapper:
         X_train: np.ndarray,
         y_train: np.ndarray,
         X_val: Optional[Union[pd.DataFrame, np.ndarray]],
-        y_val: Optional[Union[pd.Series, np.ndarray]]
+        y_val: Optional[Union[pd.Series, np.ndarray]],
+        sample_weight: Optional[np.ndarray] = None,
+        sample_weight_val: Optional[np.ndarray] = None
     ):
         """Train LightGBM model."""
         import lightgbm as lgb
 
         params = self.config.get_model_params()
 
-        # Create datasets
+        # Create datasets with sample weights
         train_data = lgb.Dataset(
             X_train, label=y_train,
+            weight=sample_weight,
             feature_name=self.feature_names,
             free_raw_data=True
         )
@@ -100,6 +109,7 @@ class GBMWrapper:
             y_val_arr = y_val.values if isinstance(y_val, pd.Series) else y_val
             val_data = lgb.Dataset(
                 X_val_arr, label=y_val_arr,
+                weight=sample_weight_val,
                 reference=train_data,
                 free_raw_data=True
             )
@@ -132,21 +142,23 @@ class GBMWrapper:
         X_train: np.ndarray,
         y_train: np.ndarray,
         X_val: Optional[Union[pd.DataFrame, np.ndarray]],
-        y_val: Optional[Union[pd.Series, np.ndarray]]
+        y_val: Optional[Union[pd.Series, np.ndarray]],
+        sample_weight: Optional[np.ndarray] = None,
+        sample_weight_val: Optional[np.ndarray] = None
     ):
         """Train XGBoost model."""
         import xgboost as xgb
 
         params = self.config.get_model_params()
 
-        # Create DMatrix
-        dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self.feature_names)
+        # Create DMatrix with sample weights
+        dtrain = xgb.DMatrix(X_train, label=y_train, weight=sample_weight, feature_names=self.feature_names)
 
         evals = [(dtrain, 'train')]
         if X_val is not None and y_val is not None:
             X_val_arr = X_val.values if isinstance(X_val, pd.DataFrame) else X_val
             y_val_arr = y_val.values if isinstance(y_val, pd.Series) else y_val
-            dval = xgb.DMatrix(X_val_arr, label=y_val_arr, feature_names=self.feature_names)
+            dval = xgb.DMatrix(X_val_arr, label=y_val_arr, weight=sample_weight_val, feature_names=self.feature_names)
             evals.append((dval, 'valid'))
 
         # Train

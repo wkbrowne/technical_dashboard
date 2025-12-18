@@ -50,7 +50,7 @@ except ImportError:
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
     force=True  # Ensure handler is reconfigured with line buffering
 )
 logger = logging.getLogger(__name__)
@@ -61,11 +61,13 @@ for handler in logging.root.handlers:
         handler.stream = sys.stderr  # Use line-buffered stderr
 
 
-def load_cached_data(cache_dir: Path) -> dict:
+def load_cached_data(cache_dir: Path, filter_suspicious: bool = True) -> dict:
     """Load cached stock data from parquet files.
 
     Args:
         cache_dir: Directory containing cached data
+        filter_suspicious: If True, filter out symbols with suspicious prices
+            (unadjusted reverse splits, extreme prices). Default True.
 
     Returns:
         Dict with 'stocks' and 'etfs' DataFrames
@@ -97,6 +99,10 @@ def load_cached_data(cache_dir: Path) -> dict:
     if stock_file and stock_file.exists():
         data['stocks'] = pd.read_parquet(stock_file)
         logger.info(f"Loaded {len(data['stocks'])} stock records from {stock_file.name}")
+
+        # Filter symbols with suspicious prices (unadjusted reverse splits, etc.)
+        if filter_suspicious and not data['stocks'].empty:
+            data['stocks'] = _filter_suspicious_symbols(data['stocks'])
     else:
         logger.warning("No stock data found in cache")
         data['stocks'] = pd.DataFrame()
@@ -118,6 +124,59 @@ def load_cached_data(cache_dir: Path) -> dict:
         data['etfs'] = pd.DataFrame()
 
     return data
+
+
+def _filter_suspicious_symbols(
+    df: pd.DataFrame,
+    max_price: float = 50000.0,
+    min_price: float = 0.01,
+    max_price_range_ratio: float = 1000.0
+) -> pd.DataFrame:
+    """Filter out symbols with suspicious price data from long-format DataFrame.
+
+    Detection rules:
+    1. Any close price > max_price (default $50k) - extreme price suggests data issue
+    2. Any close price < min_price (default $0.01) - penny stock data often unreliable
+    3. Price range ratio (max/min) > max_price_range_ratio - suggests split adjustment issues
+
+    Args:
+        df: Long-format DataFrame with columns: date, symbol, value, metric
+        max_price: Maximum allowed close price (default $50k)
+        min_price: Minimum allowed close price (default $0.01)
+        max_price_range_ratio: Maximum allowed ratio of max/min price (default 1000x)
+
+    Returns:
+        Filtered DataFrame with suspicious symbols removed
+    """
+    if 'symbol' not in df.columns or 'metric' not in df.columns:
+        logger.warning("Cannot filter: missing symbol or metric columns")
+        return df
+
+    # Get close prices only
+    close_df = df[df['metric'] == 'Close']
+    if close_df.empty:
+        return df
+
+    original_symbols = df['symbol'].nunique()
+
+    # Vectorized computation using groupby (much faster than per-symbol loop)
+    price_stats = close_df.groupby('symbol')['value'].agg(['min', 'max'])
+    price_stats['ratio'] = price_stats['max'] / price_stats['min'].replace(0, float('nan'))
+
+    # Identify symbols to remove
+    max_price_mask = price_stats['max'] > max_price
+    min_price_mask = price_stats['min'] < min_price
+    ratio_mask = price_stats['ratio'] > max_price_range_ratio
+
+    symbols_to_remove = price_stats[max_price_mask | min_price_mask | ratio_mask].index.tolist()
+
+    if symbols_to_remove:
+        logger.info(f"⚠️  Filtering {len(symbols_to_remove)} symbols with suspicious prices: "
+                    f"{symbols_to_remove[:5]}{'...' if len(symbols_to_remove) > 5 else ''}")
+        df = df[~df['symbol'].isin(symbols_to_remove)]
+        logger.info(f"📊 Reduced from {original_symbols} to {df['symbol'].nunique()} symbols")
+
+    return df
 
 
 def _pivot_long_to_wide(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:

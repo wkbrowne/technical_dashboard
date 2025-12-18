@@ -16,6 +16,7 @@ This script:
 """
 
 import gc
+import json
 import os
 import sys
 import time
@@ -74,25 +75,43 @@ def compute_scale_pos_weight(y: pd.Series) -> float:
 def load_and_prepare_data(
     max_symbols: int = 200,
     binary_target: bool = True,
-    min_samples_per_symbol: int = 100
-) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    min_samples_per_symbol: int = 100,
+    use_filtered_features: bool = True
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series, pd.Series]:
     """Load and prepare data for feature selection.
 
     Args:
         max_symbols: Maximum number of symbols to include (for memory).
         binary_target: If True, convert to binary (up=1 vs down=0), excluding neutral.
         min_samples_per_symbol: Minimum samples required per symbol.
+        use_filtered_features: If True, load pre-filtered features from features_filtered.parquet.
 
     Returns:
-        Tuple of (X, y, regime) DataFrames/Series.
+        Tuple of (X, y, sample_weight, sector, symbol) DataFrames/Series.
+        - sector: Sector labels for each sample (for sector-stratified evaluation)
+        - symbol: Symbol labels for each sample (for debugging)
     """
-    print("Loading features...")
-    features = pd.read_parquet('artifacts/features_daily.parquet')
+    # Choose feature file
+    if use_filtered_features:
+        feature_file = 'artifacts/features_filtered.parquet'
+        print(f"Loading filtered features from {feature_file}...")
+    else:
+        feature_file = 'artifacts/features_daily.parquet'
+        print(f"Loading raw features from {feature_file}...")
+
+    features = pd.read_parquet(feature_file)
     print(f"  Features shape: {features.shape}")
 
     print("Loading targets...")
     targets = pd.read_parquet('artifacts/targets_triple_barrier.parquet')
     print(f"  Targets shape: {targets.shape}")
+
+    # Check for sample weights
+    has_weights = 'weight_final' in targets.columns
+    if not has_weights:
+        print("  WARNING: 'weight_final' column not found in targets!")
+        print("           Sample weighting will be DISABLED.")
+        print("           Re-run target generation to enable overlap inverse weighting.")
 
     # Merge features with targets
     print("Merging features with targets...")
@@ -113,9 +132,13 @@ def load_and_prepare_data(
     features = features[features['symbol'].isin(valid_symbols)].copy()
     targets = targets[targets['symbol'].isin(valid_symbols)].copy()
 
-    # Merge
+    # Merge - include weight_final only if available
+    target_cols = ['symbol', 'date', 'hit']
+    if has_weights:
+        target_cols.append('weight_final')
+
     merged = features.merge(
-        targets[['symbol', 'date', 'hit', 'weight_final']],
+        targets[target_cols],
         on=['symbol', 'date'],
         how='inner'
     )
@@ -140,35 +163,76 @@ def load_and_prepare_data(
     # Define feature columns (exclude metadata and target-related)
     exclude_cols = {
         'symbol', 'date', 'close', 'open', 'high', 'low', 'volume', 'adjclose',
-        'hit', 'weight_final', 'target'
+        'hit', 'weight_final', 'target', 'sector'
     }
     feature_cols = [c for c in merged.columns if c not in exclude_cols]
 
-    # Extract regime (volatility regime if available)
-    regime = None
-    if 'vol_regime' in merged.columns:
-        regime = merged['vol_regime'].copy()
+    # Load sector labels from universe CSV for sector-stratified evaluation
+    sector = None
+    symbol_series = merged['symbol'].copy()
+    universe_files = list(Path('cache').glob('US universe*.csv'))
+    if universe_files:
+        universe_file = universe_files[0]
+        print(f"Loading sector labels from {universe_file}...")
+        try:
+            universe = pd.read_csv(universe_file)
+            if 'Symbol' in universe.columns and 'Sector' in universe.columns:
+                sector_map = dict(zip(universe['Symbol'], universe['Sector']))
+                merged['sector'] = merged['symbol'].map(sector_map)
+                # Fill missing sectors with 'Unknown'
+                merged['sector'] = merged['sector'].fillna('Unknown')
+                sector = merged['sector'].copy()
+                sector_counts = sector.value_counts()
+                print(f"  Sectors loaded: {len(sector_counts)} unique sectors")
+                print(f"  Sector distribution:")
+                for sec, count in sector_counts.head(5).items():
+                    print(f"    {sec}: {count:,} samples ({100*count/len(sector):.1f}%)")
+                if len(sector_counts) > 5:
+                    print(f"    ... and {len(sector_counts) - 5} more sectors")
+            else:
+                print(f"  WARNING: Universe file missing Symbol/Sector columns")
+        except Exception as e:
+            print(f"  WARNING: Could not load sector labels: {e}")
+    else:
+        print("  WARNING: No universe CSV found in cache/, sector-stratified evaluation disabled")
 
-    # Create X and y
+    # Create X, y, and sample_weight
     X = merged[feature_cols].copy()
     y = merged['target'].copy()
+
+    # Extract sample weights if available
+    sample_weight = None
+    if has_weights:
+        sample_weight = merged['weight_final'].copy()
 
     # Set date as index for time-series CV
     X.index = merged['date']
     y.index = merged['date']
-    if regime is not None:
-        regime.index = merged['date']
+    if sample_weight is not None:
+        sample_weight.index = merged['date']
+    if sector is not None:
+        sector.index = merged['date']
+    symbol_series.index = merged['date']
 
     print(f"\nFinal data:")
     print(f"  X shape: {X.shape}")
     print(f"  y distribution: {y.value_counts().to_dict()}")
     print(f"  Date range: {X.index.min()} to {X.index.max()}")
+    if sample_weight is not None:
+        print(f"  Sample weight range: [{sample_weight.min():.3f}, {sample_weight.max():.3f}]")
+        print(f"  Sample weight mean: {sample_weight.mean():.3f}")
+    else:
+        print(f"  Sample weights: DISABLED (no weight_final in targets)")
+    if sector is not None:
+        print(f"  Sector-stratified evaluation: ENABLED ({sector.nunique()} sectors)")
+    else:
+        print(f"  Sector-stratified evaluation: DISABLED (no sector labels)")
 
     # Clean up
     del features, targets, merged
     gc.collect()
 
-    return X, y, regime
+    return X, y, sample_weight, sector, symbol_series
 
 
 def prefilter_features(
@@ -199,7 +263,8 @@ def run_feature_selection(
     X: pd.DataFrame,
     y: pd.Series,
     features: list[str],
-    regime: pd.Series = None,
+    sample_weight: pd.Series = None,
+    sector: pd.Series = None,
     n_folds: int = 5,
     n_jobs: int = 8,
     scale_pos_weight: float = None,
@@ -221,7 +286,8 @@ def run_feature_selection(
         X: Feature DataFrame.
         y: Target Series.
         features: List of feature names to consider.
-        regime: Optional regime labels (unused in loose-tight).
+        sample_weight: Sample weights from triple barrier (overlap inverse weighting).
+        sector: Sector labels for sector-stratified evaluation.
         n_folds: Number of CV folds.
         n_jobs: Number of parallel jobs.
         scale_pos_weight: LightGBM class weight (n_neg/n_pos). None for no weighting.
@@ -238,8 +304,12 @@ def run_feature_selection(
     print(f"Samples: {len(X)}")
     print(f"CV Folds: {n_folds}")
     print(f"Parallel Jobs: {n_jobs}")
+    if sample_weight is not None:
+        print(f"Sample Weighting: ENABLED (overlap inverse)")
     if scale_pos_weight is not None:
         print(f"Class Balancing: scale_pos_weight={scale_pos_weight:.3f}")
+    if sector is not None:
+        print(f"Sector-Stratified Evaluation: ENABLED ({sector.nunique()} sectors)")
     print()
 
     # Validate base features
@@ -299,10 +369,10 @@ def run_feature_selection(
         random_state=42,
     )
 
-    # Configure metrics
+    # Configure metrics - track multiple metrics for comprehensive evaluation
     metric_config = MetricConfig(
         primary_metric=MetricType.AUC,
-        secondary_metrics=[MetricType.LOG_LOSS],
+        secondary_metrics=[MetricType.AUPR, MetricType.LOG_LOSS],
         tail_quantile=0.1,
     )
 
@@ -344,9 +414,14 @@ def run_feature_selection(
         pipeline_config=pipeline_config,
     )
 
+    # Subset sample weights to match X_subset index
+    sample_weight_subset = None
+    if sample_weight is not None:
+        sample_weight_subset = sample_weight.loc[X_subset.index]
+
     print("\nStarting pipeline training...")
     start_time = time.time()
-    pipeline.run(X_subset, y, verbose=True)
+    pipeline.run(X_subset, y, verbose=True, sample_weight=sample_weight_subset)
     elapsed = time.time() - start_time
 
     print(f"\nFeature selection completed in {elapsed/60:.1f} minutes")
@@ -397,10 +472,11 @@ def main():
     print()
 
     # Load and prepare data - use all symbols
-    X, y, regime = load_and_prepare_data(
+    X, y, sample_weight, sector, symbol = load_and_prepare_data(
         max_symbols=args.max_symbols,
         binary_target=True,
-        min_samples_per_symbol=5
+        min_samples_per_symbol=5,
+        use_filtered_features=True
     )
 
     # Compute scale_pos_weight if balanced mode
@@ -444,7 +520,8 @@ def main():
         pipeline = run_feature_selection(
             X, y,
             features=valid_features,
-            regime=regime,
+            sample_weight=sample_weight,
+            sector=sector,
             n_folds=args.n_folds,
             n_jobs=args.n_jobs,
             scale_pos_weight=scale_pos_weight,
@@ -469,6 +546,99 @@ def main():
     print(f"  Stage: {pipeline.best_snapshot.stage}")
     print(f"  Features: {len(best_features)}")
     print(f"  AUC: {best_metric[0]:.4f} +/- {best_metric[1]:.4f}")
+
+    # Re-evaluate best features to get extended metrics for final summary
+    print("\n  Evaluating final metrics on best subset...")
+    from src.feature_selection.evaluation import SubsetEvaluator
+    from src.feature_selection.config import SearchConfig
+
+    # Use the pipeline's config to re-evaluate (with sector for stratified metrics)
+    final_evaluator = SubsetEvaluator(
+        X=X[valid_features].copy(),
+        y=y,
+        model_config=pipeline.model_config,
+        cv_config=pipeline.cv_config,
+        metric_config=pipeline.metric_config,
+        search_config=SearchConfig(),
+        sample_weight=sample_weight.loc[X.index] if sample_weight is not None else None,
+        regime=sector.loc[X.index] if sector is not None else None,  # Pass sector for stratified metrics
+    )
+    final_result = final_evaluator.evaluate(best_features)
+
+    # Print extended metrics table
+    print()
+    print("  ┌────────────────────────────────────────────────────────────┐")
+    print("  │              FINAL METRICS SUMMARY                         │")
+    print("  ├────────────┬────────────┬────────────┬────────────────────┤")
+    print("  │  Metric    │    Mean    │    Std     │   Interpretation   │")
+    print("  ├────────────┼────────────┼────────────┼────────────────────┤")
+
+    # Print each metric
+    metrics_to_show = [
+        ('auc', 'AUC', '↑ Discrimination'),
+        ('aupr', 'AUPR', '↑ Prec-Recall'),
+        ('brier', 'Brier', '↓ Calibration'),
+        ('log_loss', 'LogLoss', '↓ Likelihood'),
+    ]
+
+    for key, display_name, interpretation in metrics_to_show:
+        if key in final_result.secondary_metrics:
+            mean, std = final_result.secondary_metrics[key]
+            print(f"  │ {display_name:^10} │ {mean:^10.4f} │ {std:^10.4f} │ {interpretation:^18} │")
+        else:
+            print(f"  │ {display_name:^10} │ {'N/A':^10} │ {'N/A':^10} │ {interpretation:^18} │")
+
+    print("  └────────────┴────────────┴────────────┴────────────────────┘")
+
+    # Print sector-stratified metrics with concentration warning
+    if final_result.regime_metrics and sector is not None:
+        sector_auc_values = list(final_result.regime_metrics.values())
+        sector_auc_std = np.std(sector_auc_values) if len(sector_auc_values) > 1 else 0.0
+        sector_auc_mean = np.mean(sector_auc_values)
+
+        print()
+        print("  ┌────────────────────────────────────────────────────────────┐")
+        print("  │              SECTOR-STRATIFIED AUC                         │")
+        print("  ├─────────────────────────────┬──────────────────────────────┤")
+        print(f"  │ {'Sector':<27} │ {'AUC':^28} │")
+        print("  ├─────────────────────────────┼──────────────────────────────┤")
+
+        # Sort sectors by AUC (descending)
+        sorted_sectors = sorted(final_result.regime_metrics.items(), key=lambda x: x[1], reverse=True)
+        for sec_name, sec_auc in sorted_sectors:
+            # Highlight if significantly different from mean
+            indicator = ''
+            if sec_auc > sector_auc_mean + sector_auc_std:
+                indicator = ' ▲'  # Above average
+            elif sec_auc < sector_auc_mean - sector_auc_std:
+                indicator = ' ▼'  # Below average
+            print(f"  │ {sec_name:<27} │ {sec_auc:^26.4f}{indicator} │")
+
+        print("  ├─────────────────────────────┴──────────────────────────────┤")
+        print(f"  │ {'Mean':27} │ {sector_auc_mean:^28.4f} │")
+        print(f"  │ {'Std Dev':27} │ {sector_auc_std:^28.4f} │")
+        print("  └────────────────────────────────────────────────────────────┘")
+
+        # Concentration warning
+        CONCENTRATION_THRESHOLD = 0.03
+        if sector_auc_std > CONCENTRATION_THRESHOLD:
+            print()
+            print("  ⚠️  WARNING: High sector AUC variance detected!")
+            print(f"     Sector AUC Std Dev ({sector_auc_std:.4f}) > threshold ({CONCENTRATION_THRESHOLD})")
+            print("     This may indicate the model concentrates on specific sectors.")
+            print("     Consider adding more cross-sectional features to BASE_FEATURES.")
+
+            # Show best/worst sectors
+            if len(sorted_sectors) >= 2:
+                best_sec, best_auc = sorted_sectors[0]
+                worst_sec, worst_auc = sorted_sectors[-1]
+                print(f"     Best sector:  {best_sec} (AUC: {best_auc:.4f})")
+                print(f"     Worst sector: {worst_sec} (AUC: {worst_auc:.4f})")
+                print(f"     Spread: {best_auc - worst_auc:.4f}")
+        else:
+            print()
+            print(f"  ✓ Sector coverage looks consistent (Std Dev: {sector_auc_std:.4f} < {CONCENTRATION_THRESHOLD})")
+
     print()
     print("Selected features:")
     for f in sorted(best_features):
@@ -499,6 +669,65 @@ def main():
         for feat in sorted(best_features):
             f.write(f"{feat}\n")
     print(f"Selected features list saved to {output_dir}/selected_features.txt")
+
+    # Build extended metrics dict for JSON output
+    extended_metrics = {}
+    for key in ['auc', 'aupr', 'brier', 'log_loss']:
+        if key in final_result.secondary_metrics:
+            mean, std = final_result.secondary_metrics[key]
+            extended_metrics[key] = {"mean": round(mean, 6), "std": round(std, 6)}
+
+    # Build sector metrics dict for JSON output
+    sector_metrics = {}
+    sector_concentration_warning = False
+    if final_result.regime_metrics and sector is not None:
+        sector_auc_values = list(final_result.regime_metrics.values())
+        sector_auc_std = np.std(sector_auc_values) if len(sector_auc_values) > 1 else 0.0
+        sector_auc_mean = np.mean(sector_auc_values)
+        CONCENTRATION_THRESHOLD = 0.03
+
+        sector_metrics = {
+            "by_sector": {sec: round(auc, 6) for sec, auc in final_result.regime_metrics.items()},
+            "mean": round(sector_auc_mean, 6),
+            "std": round(sector_auc_std, 6),
+            "concentration_threshold": CONCENTRATION_THRESHOLD,
+            "concentration_warning": sector_auc_std > CONCENTRATION_THRESHOLD
+        }
+        sector_concentration_warning = sector_auc_std > CONCENTRATION_THRESHOLD
+
+    # Save selection_summary.json with complete results
+    selection_summary = {
+        "best_stage": pipeline.best_snapshot.stage,
+        "n_features": len(best_features),
+        "metric_mean": best_metric[0],
+        "metric_std": best_metric[1],
+        "extended_metrics": extended_metrics,
+        "sector_metrics": sector_metrics,
+        "sector_concentration_warning": sector_concentration_warning,
+        "features": sorted(best_features),
+        "stages": [
+            {
+                "stage": s.stage,
+                "n_features": len(s.features),
+                "metric_mean": s.metric_mean,
+                "metric_std": s.metric_std,
+                "is_best": s == pipeline.best_snapshot
+            }
+            for s in pipeline.snapshots
+        ],
+        "config": {
+            "n_folds": args.n_folds,
+            "n_jobs": args.n_jobs,
+            "balanced": args.balanced,
+            "prune_base": args.prune_base,
+            "max_symbols": args.max_symbols,
+            "sample_weighting": "overlap_inverse" if sample_weight is not None else "disabled",
+            "sector_stratified": sector is not None
+        }
+    }
+    with open(output_dir / 'selection_summary.json', 'w') as f:
+        json.dump(selection_summary, f, indent=2)
+    print(f"Selection summary saved to {output_dir}/selection_summary.json")
 
     return pipeline
 

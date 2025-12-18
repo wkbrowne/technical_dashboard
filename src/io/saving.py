@@ -77,15 +77,15 @@ def save_long_parquet(
         return
     
     # Collect all DataFrames with symbol and date columns
+    # Memory-optimized: use reset_index() instead of .copy() + index assignment
     parts = []
     for sym, df in indicators_by_symbol.items():
         if df.empty:
             continue
-            
-        # Make a copy and add metadata columns
-        x = df.copy()
+
+        # reset_index creates a new DataFrame (no copy needed)
+        x = df.reset_index(names='date')
         x["symbol"] = sym
-        x["date"] = x.index
         parts.append(x)
     
     if not parts:

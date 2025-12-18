@@ -263,7 +263,7 @@ def filter_suspicious_price_symbols(
     data: Dict[str, pd.DataFrame],
     max_price: float = 50000.0,
     min_price: float = 0.01,
-    max_price_range_ratio: float = 10000.0,
+    max_price_range_ratio: float = 1000.0,
 ) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     """
     Filter out symbols with suspicious price data (likely unadjusted reverse splits).
@@ -272,12 +272,14 @@ def filter_suspicious_price_symbols(
     1. Any close price > max_price (default $50k) - extreme price suggests data issue
     2. Any close price < min_price (default $0.01) - penny stock data often unreliable
     3. Price range ratio (max/min) > max_price_range_ratio - suggests split adjustment issues
+       A normal stock might see 50-100x over 5+ years (e.g., NVDA went from ~$1 to ~$150).
+       1000x+ typically indicates unadjusted reverse splits or data errors.
 
     Args:
         data: Dict of {metric: DataFrame with symbols as columns}
         max_price: Maximum allowed close price (default $50k)
         min_price: Minimum allowed close price (default $0.01)
-        max_price_range_ratio: Maximum allowed ratio of max/min price (default 10000x)
+        max_price_range_ratio: Maximum allowed ratio of max/min price (default 1000x)
 
     Returns:
         Tuple of (filtered_data, list of removed symbols)
@@ -493,26 +495,43 @@ def load_stock_universe(max_symbols: Optional[int] = None,
     - Prefers *_combined.parquet (created by download CLI) if it exists and is newer
     - Falls back to *_universe.parquet (legacy cache format)
     """
-    # Cache paths - check both legacy and combined formats
+    # Cache paths - check stocks/ subfolder first (new structure), then base dir (legacy)
     cache_dir = CACHE_FILE.parent if hasattr(CACHE_FILE, "parent") else os.path.dirname(str(CACHE_FILE))
     cache_stem = CACHE_FILE.stem if hasattr(CACHE_FILE, "stem") else os.path.splitext(os.path.basename(str(CACHE_FILE)))[0]
 
+    # New subfolder structure (stocks/stock_data_*.parquet)
+    stocks_dir = os.path.join(cache_dir, "stocks")
+    stocks_universe_parquet = os.path.join(stocks_dir, f"{cache_stem}_universe.parquet")
+    stocks_combined_parquet = os.path.join(stocks_dir, f"{cache_stem}_combined.parquet")
+
+    # Legacy structure (cache/stock_data_*.parquet)
     universe_parquet = os.path.join(cache_dir, f"{cache_stem}_universe.parquet")
     combined_parquet = os.path.join(cache_dir, f"{cache_stem}_combined.parquet")
 
-    # Determine cache preference order (prefer combined if newer)
+    # Determine cache preference order:
+    # 1. stocks/ subfolder files (new structure from download CLI)
+    # 2. base cache dir files (legacy structure)
+    # Within each location, prefer combined > universe, and newer > older
     cache_preference = []
-    if os.path.exists(combined_parquet) and os.path.exists(universe_parquet):
-        combined_mtime = os.path.getmtime(combined_parquet)
-        universe_mtime = os.path.getmtime(universe_parquet)
-        if combined_mtime > universe_mtime:
-            cache_preference = [combined_parquet, universe_parquet]
-        else:
-            cache_preference = [universe_parquet, combined_parquet]
-    elif os.path.exists(combined_parquet):
-        cache_preference = [combined_parquet]
-    elif os.path.exists(universe_parquet):
-        cache_preference = [universe_parquet]
+
+    # Check stocks/ subfolder first (new structure)
+    stocks_candidates = []
+    if os.path.exists(stocks_combined_parquet):
+        stocks_candidates.append((stocks_combined_parquet, os.path.getmtime(stocks_combined_parquet)))
+    if os.path.exists(stocks_universe_parquet):
+        stocks_candidates.append((stocks_universe_parquet, os.path.getmtime(stocks_universe_parquet)))
+    # Sort by modification time (newest first)
+    stocks_candidates.sort(key=lambda x: -x[1])
+    cache_preference.extend([p for p, _ in stocks_candidates])
+
+    # Then check legacy base cache dir
+    legacy_candidates = []
+    if os.path.exists(combined_parquet):
+        legacy_candidates.append((combined_parquet, os.path.getmtime(combined_parquet)))
+    if os.path.exists(universe_parquet):
+        legacy_candidates.append((universe_parquet, os.path.getmtime(universe_parquet)))
+    legacy_candidates.sort(key=lambda x: -x[1])
+    cache_preference.extend([p for p, _ in legacy_candidates])
 
     # Try cache files in preference order (OHLCV only; sectors always re-read from CSV for freshness)
     cached = None
@@ -582,8 +601,9 @@ def load_stock_universe(max_symbols: Optional[int] = None,
         print("❌ no stock data fetched");
         return (None, sectors) if include_sectors else None
 
-    # Save to universe cache (default location for API-fetched data)
-    save_path = universe_parquet
+    # Save to stocks/ subfolder (new standard location)
+    os.makedirs(stocks_dir, exist_ok=True)
+    save_path = stocks_universe_parquet
     print(f"💾 stocks: writing {save_path}")
     _save_long_parquet(data, save_path)
     return (data, sectors) if include_sectors else data

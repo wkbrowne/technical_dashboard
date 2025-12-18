@@ -215,7 +215,8 @@ def _compute_alpha_for_symbol(
         mkt_idx, mkt_vals = benchmarks[market_symbol]
         mkt_ret = pd.Series(mkt_vals, index=mkt_idx, dtype='float64').reindex(ret_index)
         beta_mkt, alpha_mkt = _rolling_beta_alpha(r, mkt_ret, win=beta_win)
-        result['beta_spy'] = beta_mkt
+        # Note: beta_spy_simple is univariate cov/var, distinct from beta_market (joint factor model)
+        result['beta_spy_simple'] = beta_mkt
         result['alpha_resid_spy'] = alpha_mkt
 
         # Create momentum features from market alpha
@@ -229,8 +230,9 @@ def _compute_alpha_for_symbol(
     if qqq_symbol in benchmarks:
         qqq_idx, qqq_vals = benchmarks[qqq_symbol]
         qqq_ret = pd.Series(qqq_vals, index=qqq_idx, dtype='float64').reindex(ret_index)
-        beta_qqq, alpha_qqq = _rolling_beta_alpha(r, qqq_ret, win=beta_win)
-        result['beta_qqq'] = beta_qqq
+        beta_qqq_val, alpha_qqq = _rolling_beta_alpha(r, qqq_ret, win=beta_win)
+        # Note: beta_qqq_simple is univariate cov/var, distinct from beta_qqq (joint factor model)
+        result['beta_qqq_simple'] = beta_qqq_val
         result['alpha_resid_qqq'] = alpha_qqq
 
         # Create momentum features from QQQ alpha
@@ -295,10 +297,10 @@ def add_alpha_momentum_features(
     This function is parallelized across symbols using joblib.
 
     Features added (if benchmarks available):
-    - beta_spy, alpha_resid_spy: CAPM beta/alpha residuals vs market
+    - beta_spy_simple, alpha_resid_spy: Univariate CAPM beta/alpha vs market (cov/var method)
     - alpha_mom_spy_ema{ema_span}: EMA of market alpha residuals
     - alpha_mom_spy_{w}_ema{ema_span}: EMA of {w}-day cumulative market alpha
-    - beta_qqq, alpha_resid_qqq: CAPM beta/alpha residuals vs QQQ (growth factor)
+    - beta_qqq_simple, alpha_resid_qqq: Univariate CAPM beta/alpha vs QQQ (cov/var method)
     - alpha_mom_qqq_ema{ema_span}: EMA of QQQ alpha residuals
     - alpha_mom_qqq_{w}_ema{ema_span}: EMA of {w}-day cumulative QQQ alpha
     - alpha_qqq_vs_spy: Difference in alpha (QQQ - SPY) capturing growth vs value tilt
@@ -307,6 +309,9 @@ def add_alpha_momentum_features(
     - alpha_mom_sector_ema{ema_span}: EMA of sector alpha residuals
     - alpha_mom_sector_{w}_ema{ema_span}: EMA of {w}-day cumulative sector alpha
     - alpha_mom_combo_*: Blended features (50/50 market/sector) if both exist
+
+    Note: beta_spy_simple and beta_qqq_simple use simple rolling cov/var, distinct from
+    beta_market and beta_qqq in factor_regression.py which use orthogonalized joint regression.
 
     Args:
         indicators_by_symbol: Dictionary of symbol DataFrames (modified in place)

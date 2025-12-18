@@ -4,10 +4,14 @@ Unified parallel processing configuration for the feature pipeline.
 This module provides a single configuration class that controls parallelization
 across all pipeline stages, ensuring consistent behavior and easy tuning.
 
+Worker Lifecycle:
+- Worker lifecycle (spawning, pooling, shutdown) is managed entirely by joblib
+- We do NOT explicitly manage worker processes
+- See Section 4 of FEATURE_PIPELINE_ARCHITECTURE.md
+
 Memory Management:
-- Uses context managers for all parallel execution to ensure cleanup
 - Bounded batch scheduling to prevent memory explosion
-- Explicit worker shutdown with kill_workers=True for immediate termination
+- gc.collect() between batches for memory cleanup
 
 Diagnostics:
 - Progress logging with task counts, active workers, and ETA
@@ -189,94 +193,20 @@ def get_memory_safe_workers(
     return safe_workers
 
 
-def setup_loky_executor(n_workers: int = -1, timeout: int = 10) -> None:
-    """
-    Pre-configure the loky executor with a short idle timeout.
-
-    NOTE: In joblib 1.5+, calling get_reusable_executor() before Parallel
-    can corrupt executor state, causing '_temp_folder_manager' errors.
-    This function is now a no-op - let joblib.Parallel manage its own executor.
-
-    Args:
-        n_workers: Number of worker processes (-1 for all cores)
-        timeout: Idle timeout in seconds before workers auto-terminate
-    """
-    # No-op in joblib 1.5+ to avoid executor state corruption
-    # joblib.Parallel manages its own executor lifecycle now
-    logger.debug(f"setup_loky_executor: no-op (joblib 1.5+ compatibility)")
-
-
-def shutdown_loky_workers(verbose: bool = False) -> None:
-    """
-    Shutdown loky executor workers to free memory.
-
-    Call this after completing parallel processing sections to release
-    worker processes that would otherwise persist and consume memory.
-
-    NOTE: In joblib 1.5+, calling get_reusable_executor() can corrupt executor
-    state, causing '_temp_folder_manager' errors. We now only do garbage
-    collection and let joblib manage its own lifecycle.
-
-    Args:
-        verbose: If True, print worker count info for debugging
-    """
-    workers_before = 0
-    if _HAS_PSUTIL and verbose:
-        try:
-            import psutil
-            current = psutil.Process()
-            workers_before = len([c for c in current.children(recursive=True)
-                                 if 'loky' in ' '.join(c.cmdline()).lower() or 'spawn' in c.name().lower()])
-        except Exception:
-            pass
-
-    # In joblib 1.5+, avoid calling get_reusable_executor() as it corrupts state
-    # causing '_ReusablePoolExecutor' object has no attribute '_temp_folder_manager' errors.
-    # Just let joblib manage executor lifecycle naturally.
-    logger.debug("shutdown_loky_workers: skipping executor shutdown (joblib 1.5+ compatibility)")
-
-    # Also terminate any joblib-managed workers via internal cleanup
-    try:
-        from joblib import parallel
-        if hasattr(parallel, '_DEFAULT_POOL') and parallel._DEFAULT_POOL is not None:
-            parallel._DEFAULT_POOL.terminate()
-            parallel._DEFAULT_POOL = None
-            logger.debug("Terminated joblib default pool")
-    except Exception as e:
-        logger.debug(f"Could not terminate joblib pool: {e}")
-
-    # Force garbage collection after worker shutdown
-    gc.collect()
-
-    if _HAS_PSUTIL and verbose:
-        try:
-            import psutil
-            current = psutil.Process()
-            workers_after = len([c for c in current.children(recursive=True)
-                                if 'loky' in ' '.join(c.cmdline()).lower() or 'spawn' in c.name().lower()])
-            if workers_before > 0 or workers_after > 0:
-                logger.info(f"Worker cleanup: {workers_before} -> {workers_after}")
-        except Exception:
-            pass
-
-
 @contextmanager
 def parallel_stage(
     stage_name: str,
     n_workers: int = -1,
-    timeout: int = 10,
-    cleanup: bool = True
 ) -> Generator[None, None, None]:
     """
     Context manager for a parallel processing stage.
 
-    Ensures proper setup and cleanup of loky workers, preventing memory leaks.
+    Note: Worker lifecycle is managed entirely by joblib - we do not explicitly
+    manage worker processes. This context manager just provides timing/memory logging.
 
     Args:
         stage_name: Name of the stage (for logging)
-        n_workers: Number of workers (-1 for all cores)
-        timeout: Idle timeout for workers
-        cleanup: Whether to shutdown workers on exit (default: True)
+        n_workers: Number of workers (-1 for all cores), for logging only
 
     Example:
         with parallel_stage("Feature Computation", n_workers=8):
@@ -286,15 +216,11 @@ def parallel_stage(
     start_mem = get_memory_mb()
 
     logger.info(f"[{stage_name}] Starting (workers={n_workers}, mem={start_mem:.0f}MB)")
-    setup_loky_executor(n_workers=n_workers, timeout=timeout)
 
     try:
         yield
     finally:
         elapsed = time.time() - start_time
-        if cleanup:
-            shutdown_loky_workers()
-
         end_mem = get_memory_mb()
         mem_delta = end_mem - start_mem
         logger.info(
@@ -359,7 +285,7 @@ def chunked_parallel(
     chunks_done = 0
 
     # Process chunks in bounded groups
-    with parallel_stage(stage_name, n_workers=effective_jobs, cleanup=False):
+    with parallel_stage(stage_name, n_workers=effective_jobs):
         for batch_start in range(0, n_chunks, max_pending):
             batch_end = min(batch_start + max_pending, n_chunks)
             batch_chunks = chunks[batch_start:batch_end]
@@ -396,11 +322,8 @@ def chunked_parallel(
                     f"({items_done}/{n_items} items, {rate:.0f}/s, ETA {eta:.0f}s, mem={mem_mb:.0f}MB)"
                 )
 
-            # Explicit cleanup between batches
+            # Memory cleanup between batches
             gc.collect()
-
-    # Final cleanup
-    shutdown_loky_workers()
 
     if verbose:
         total_time = time.time() - start_time

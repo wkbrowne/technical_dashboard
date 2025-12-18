@@ -16,7 +16,10 @@ from .config import (
     SubsetResult, TaskType
 )
 from .cv import TimeSeriesCV
-from .metrics import MetricComputer, get_metric_function
+from .metrics import (
+    MetricComputer, get_metric_function,
+    compute_auc, compute_aupr, compute_brier, compute_log_loss
+)
 from .models import GBMWrapper
 
 
@@ -30,6 +33,7 @@ class SubsetEvaluator:
     Attributes:
         X: Feature DataFrame (stored once, never copied).
         y: Target Series.
+        sample_weight: Optional sample weights (e.g., from overlap inverse weighting).
         model_config: Model configuration.
         cv_config: Cross-validation configuration.
         metric_config: Metrics configuration.
@@ -45,7 +49,8 @@ class SubsetEvaluator:
         cv_config: CVConfig,
         metric_config: MetricConfig,
         search_config: SearchConfig,
-        regime: Optional[pd.Series] = None
+        regime: Optional[pd.Series] = None,
+        sample_weight: Optional[pd.Series] = None
     ):
         """Initialize the evaluator.
 
@@ -57,11 +62,15 @@ class SubsetEvaluator:
             metric_config: Metrics settings.
             search_config: Search settings.
             regime: Optional regime labels for stratified metrics.
+            sample_weight: Optional sample weights for training (e.g., from overlap inverse).
+                          These weights are applied during model training to down-weight
+                          overlapping trajectories from triple barrier targets.
         """
         # Store references (not copies)
         self._X = X
         self._y = y
         self._regime = regime
+        self._sample_weight = sample_weight
 
         # Store configurations
         self.model_config = model_config
@@ -158,6 +167,14 @@ class SubsetEvaluator:
             k: v for k, v in aggregated.items()
             if k != 'primary' and not k.startswith('tail_')
         }
+
+        # Aggregate extended metrics (AUC, AUPR, Brier, LogLoss)
+        extended_keys = ['auc', 'aupr', 'brier', 'log_loss']
+        for ext_key in extended_keys:
+            ext_values = [r.get('extended', {}).get(ext_key, np.nan) for r in fold_results]
+            valid_values = [v for v in ext_values if not np.isnan(v)]
+            if valid_values:
+                secondary_metrics[ext_key] = (np.mean(valid_values), np.std(valid_values))
 
         # Regime metrics (average across folds)
         regime_metrics = {}
@@ -265,6 +282,11 @@ class SubsetEvaluator:
         y_train = self._y.iloc[train_idx]
         y_test = self._y.iloc[test_idx]
 
+        # Extract sample weights if available
+        w_train = None
+        if self._sample_weight is not None:
+            w_train = self._sample_weight.iloc[train_idx]
+
         # Handle NaN values
         train_mask = ~(X_train.isna().any(axis=1) | y_train.isna())
         test_mask = ~(X_test.isna().any(axis=1) | y_test.isna())
@@ -273,6 +295,10 @@ class SubsetEvaluator:
         y_train = y_train.loc[train_mask]
         X_test = X_test.loc[test_mask]
         y_test = y_test.loc[test_mask]
+
+        # Apply mask to weights
+        if w_train is not None:
+            w_train = w_train.loc[train_mask]
 
         if len(X_train) < 50 or len(X_test) < 10:
             return {'primary': 0.0, 'tail': {}}
@@ -289,14 +315,24 @@ class SubsetEvaluator:
             X_val = X_train.iloc[split_point:]
             y_tr = y_train.iloc[:split_point]
             y_val = y_train.iloc[split_point:]
-            model.train(X_tr, y_tr, X_val, y_val, feature_names)
+
+            # Split weights for early stopping
+            w_tr = None
+            w_val = None
+            if w_train is not None:
+                w_tr = w_train.iloc[:split_point]
+                w_val = w_train.iloc[split_point:]
+
+            model.train(X_tr, y_tr, X_val, y_val, feature_names,
+                       sample_weight=w_tr, sample_weight_val=w_val)
         else:
-            model.train(X_train, y_train, feature_names=feature_names)
+            model.train(X_train, y_train, feature_names=feature_names,
+                       sample_weight=w_train)
 
         # Generate predictions
         y_pred = model.predict(X_test)
 
-        # Compute metrics
+        # Compute metrics using the MetricComputer (includes primary and configured secondaries)
         regime_arr = None
         if self._regime is not None:
             regime_arr = self._regime.iloc[test_idx].loc[test_mask].values
@@ -304,6 +340,16 @@ class SubsetEvaluator:
         metrics = self._metric_computer.compute_all(
             y_test.values, y_pred, regime_arr
         )
+
+        # Additionally compute extended metrics for comprehensive tracking
+        # These are always computed regardless of configuration
+        y_true_arr = y_test.values
+        metrics['extended'] = {
+            'auc': compute_auc(y_true_arr, y_pred),
+            'aupr': compute_aupr(y_true_arr, y_pred),
+            'brier': compute_brier(y_true_arr, y_pred),
+            'log_loss': compute_log_loss(y_true_arr, y_pred),
+        }
 
         # Cleanup
         model.cleanup()
@@ -392,7 +438,8 @@ def _evaluate_subset_joblib(
     model_config,
     cv_config,
     metric_config,
-    idx: int
+    idx: int,
+    sample_weight: Optional[pd.Series] = None
 ) -> Tuple[int, SubsetResult]:
     """Joblib-compatible worker for parallel subset evaluation.
 
@@ -406,6 +453,7 @@ def _evaluate_subset_joblib(
         cv_config: CV configuration.
         metric_config: Metrics configuration.
         idx: Index to preserve ordering in results.
+        sample_weight: Optional sample weights for training.
 
     Returns:
         Tuple of (index, SubsetResult).
@@ -418,6 +466,7 @@ def _evaluate_subset_joblib(
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=SearchConfig(),
+            sample_weight=sample_weight,
         )
         result = evaluator.evaluate(features)
         return (idx, result)
