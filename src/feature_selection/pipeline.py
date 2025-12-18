@@ -121,58 +121,106 @@ class SubsetSnapshot:
 # =============================================================================
 # Joblib Worker Functions (for parallel evaluation)
 # =============================================================================
+# MEMORY OPTIMIZATION: These functions receive numpy arrays instead of DataFrames
+# to leverage joblib's memory-mapping for large arrays, reducing memory copies.
 
 def _evaluate_subset_joblib(
-    X: pd.DataFrame,
-    y: pd.Series,
-    features: List[str],
+    X_arr: np.ndarray,
+    y_arr: np.ndarray,
+    feature_names: List[str],
+    features_to_eval: List[str],
+    index_values: np.ndarray,
     model_config: ModelConfig,
     cv_config: CVConfig,
     metric_config: MetricConfig,
     search_config: SearchConfig,
-    sample_weight: Optional[pd.Series] = None,
+    sample_weight_arr: Optional[np.ndarray] = None,
 ) -> Optional[SubsetResult]:
-    """Evaluate a feature subset (joblib worker)."""
+    """Evaluate a feature subset (joblib worker).
+
+    MEMORY OPTIMIZATION: Receives numpy arrays with memory mapping instead of
+    DataFrames to avoid serialization overhead in parallel workers.
+    """
     try:
         from .evaluation import SubsetEvaluator
+
+        # Reconstruct minimal DataFrame only for needed features
+        feature_to_idx = {f: i for i, f in enumerate(feature_names)}
+        col_indices = [feature_to_idx[f] for f in features_to_eval if f in feature_to_idx]
+        X_subset = pd.DataFrame(
+            X_arr[:, col_indices],
+            columns=[feature_names[i] for i in col_indices],
+            index=pd.DatetimeIndex(index_values)
+        )
+        y = pd.Series(y_arr, index=X_subset.index)
+        sample_weight = pd.Series(sample_weight_arr, index=X_subset.index) if sample_weight_arr is not None else None
+
         evaluator = SubsetEvaluator(
-            X=X, y=y,
+            X=X_subset, y=y,
             model_config=model_config,
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=search_config,
             sample_weight=sample_weight,
         )
-        return evaluator.evaluate(features)
+        result = evaluator.evaluate(features_to_eval)
+
+        # Explicit cleanup
+        del X_subset, y, sample_weight, evaluator
+        gc.collect()
+
+        return result
     except Exception as e:
         logger.debug(f"Evaluation failed: {e}")
         return None
 
 
 def _evaluate_addition_joblib(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X_arr: np.ndarray,
+    y_arr: np.ndarray,
+    feature_names: List[str],
     current_features: List[str],
     candidate: str,
+    index_values: np.ndarray,
     model_config: ModelConfig,
     cv_config: CVConfig,
     metric_config: MetricConfig,
     search_config: SearchConfig,
-    sample_weight: Optional[pd.Series] = None,
+    sample_weight_arr: Optional[np.ndarray] = None,
 ) -> Tuple[str, Optional[SubsetResult]]:
-    """Evaluate adding a candidate feature (joblib worker)."""
+    """Evaluate adding a candidate feature (joblib worker).
+
+    MEMORY OPTIMIZATION: Receives numpy arrays with memory mapping.
+    """
     try:
         from .evaluation import SubsetEvaluator
+
+        test_features = list(current_features) + [candidate]
+
+        # Reconstruct minimal DataFrame
+        feature_to_idx = {f: i for i, f in enumerate(feature_names)}
+        col_indices = [feature_to_idx[f] for f in test_features if f in feature_to_idx]
+        X_subset = pd.DataFrame(
+            X_arr[:, col_indices],
+            columns=[feature_names[i] for i in col_indices],
+            index=pd.DatetimeIndex(index_values)
+        )
+        y = pd.Series(y_arr, index=X_subset.index)
+        sample_weight = pd.Series(sample_weight_arr, index=X_subset.index) if sample_weight_arr is not None else None
+
         evaluator = SubsetEvaluator(
-            X=X, y=y,
+            X=X_subset, y=y,
             model_config=model_config,
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=search_config,
             sample_weight=sample_weight,
         )
-        test_features = list(current_features) + [candidate]
         result = evaluator.evaluate(test_features)
+
+        del X_subset, y, sample_weight, evaluator
+        gc.collect()
+
         return (candidate, result)
     except Exception as e:
         logger.debug(f"Addition evaluation failed for {candidate}: {e}")
@@ -180,29 +228,51 @@ def _evaluate_addition_joblib(
 
 
 def _evaluate_removal_joblib(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X_arr: np.ndarray,
+    y_arr: np.ndarray,
+    feature_names: List[str],
     current_features: List[str],
     feature_to_remove: str,
+    index_values: np.ndarray,
     model_config: ModelConfig,
     cv_config: CVConfig,
     metric_config: MetricConfig,
     search_config: SearchConfig,
-    sample_weight: Optional[pd.Series] = None,
+    sample_weight_arr: Optional[np.ndarray] = None,
 ) -> Tuple[str, Optional[SubsetResult]]:
-    """Evaluate removing a feature (joblib worker)."""
+    """Evaluate removing a feature (joblib worker).
+
+    MEMORY OPTIMIZATION: Receives numpy arrays with memory mapping.
+    """
     try:
         from .evaluation import SubsetEvaluator
+
+        test_features = [f for f in current_features if f != feature_to_remove]
+
+        # Reconstruct minimal DataFrame
+        feature_to_idx = {f: i for i, f in enumerate(feature_names)}
+        col_indices = [feature_to_idx[f] for f in test_features if f in feature_to_idx]
+        X_subset = pd.DataFrame(
+            X_arr[:, col_indices],
+            columns=[feature_names[i] for i in col_indices],
+            index=pd.DatetimeIndex(index_values)
+        )
+        y = pd.Series(y_arr, index=X_subset.index)
+        sample_weight = pd.Series(sample_weight_arr, index=X_subset.index) if sample_weight_arr is not None else None
+
         evaluator = SubsetEvaluator(
-            X=X, y=y,
+            X=X_subset, y=y,
             model_config=model_config,
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=search_config,
             sample_weight=sample_weight,
         )
-        test_features = [f for f in current_features if f != feature_to_remove]
         result = evaluator.evaluate(test_features)
+
+        del X_subset, y, sample_weight, evaluator
+        gc.collect()
+
         return (feature_to_remove, result)
     except Exception as e:
         logger.debug(f"Removal evaluation failed for {feature_to_remove}: {e}")
@@ -210,30 +280,52 @@ def _evaluate_removal_joblib(
 
 
 def _evaluate_swap_joblib(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X_arr: np.ndarray,
+    y_arr: np.ndarray,
+    feature_names: List[str],
     current_features: List[str],
     f_out: str,
     f_in: str,
+    index_values: np.ndarray,
     model_config: ModelConfig,
     cv_config: CVConfig,
     metric_config: MetricConfig,
     search_config: SearchConfig,
-    sample_weight: Optional[pd.Series] = None,
+    sample_weight_arr: Optional[np.ndarray] = None,
 ) -> Tuple[str, str, Optional[SubsetResult]]:
-    """Evaluate swapping features (joblib worker)."""
+    """Evaluate swapping features (joblib worker).
+
+    MEMORY OPTIMIZATION: Receives numpy arrays with memory mapping.
+    """
     try:
         from .evaluation import SubsetEvaluator
+
+        test_features = [f for f in current_features if f != f_out] + [f_in]
+
+        # Reconstruct minimal DataFrame
+        feature_to_idx = {f: i for i, f in enumerate(feature_names)}
+        col_indices = [feature_to_idx[f] for f in test_features if f in feature_to_idx]
+        X_subset = pd.DataFrame(
+            X_arr[:, col_indices],
+            columns=[feature_names[i] for i in col_indices],
+            index=pd.DatetimeIndex(index_values)
+        )
+        y = pd.Series(y_arr, index=X_subset.index)
+        sample_weight = pd.Series(sample_weight_arr, index=X_subset.index) if sample_weight_arr is not None else None
+
         evaluator = SubsetEvaluator(
-            X=X, y=y,
+            X=X_subset, y=y,
             model_config=model_config,
             cv_config=cv_config,
             metric_config=metric_config,
             search_config=search_config,
             sample_weight=sample_weight,
         )
-        test_features = [f for f in current_features if f != f_out] + [f_in]
         result = evaluator.evaluate(test_features)
+
+        del X_subset, y, sample_weight, evaluator
+        gc.collect()
+
         return (f_out, f_in, result)
     except Exception as e:
         logger.debug(f"Swap evaluation failed {f_out}->{f_in}: {e}")
@@ -347,6 +439,14 @@ class LooseTightPipeline:
         self._X: Optional[pd.DataFrame] = None
         self._y: Optional[pd.Series] = None
         self._sample_weight: Optional[pd.Series] = None
+
+        # MEMORY OPTIMIZATION: Cached numpy arrays for joblib workers
+        # Numpy arrays use memory mapping with joblib, avoiding full copies
+        self._X_arr: Optional[np.ndarray] = None
+        self._y_arr: Optional[np.ndarray] = None
+        self._sample_weight_arr: Optional[np.ndarray] = None
+        self._feature_names: Optional[List[str]] = None
+        self._index_values: Optional[np.ndarray] = None
 
         # Statistics display
         self._stats_display: Optional[StatsDisplay] = None
@@ -602,6 +702,19 @@ class LooseTightPipeline:
         self._verbose = verbose
         self._sample_weight = sample_weight
 
+        # MEMORY OPTIMIZATION: Cache numpy arrays for joblib workers
+        # Numpy arrays use memory mapping, avoiding full serialization copies
+        if verbose:
+            print("Preparing data arrays for parallel processing...")
+        self._X_arr = X.values.astype(np.float32)  # float32 saves ~50% memory
+        self._y_arr = y.values
+        self._feature_names = list(X.columns)
+        self._index_values = X.index.values
+        self._sample_weight_arr = sample_weight.values if sample_weight is not None else None
+        if verbose:
+            mem_mb = self._X_arr.nbytes / (1024 * 1024)
+            print(f"  Data array: {self._X_arr.shape}, {mem_mb:.1f} MB (float32)")
+
         # Get base features that exist in the data
         base_features = [f for f in get_base_features() if f in X.columns]
         all_expansion = [f for f in get_expansion_candidates(flat=True) if f in X.columns]
@@ -643,6 +756,7 @@ class LooseTightPipeline:
                 print(f"  [Checkpoint saved]")
 
         # STEP 2: Loose forward selection
+        gc.collect()  # MEMORY: Clean up before forward selection
         pre_forward_result = self._evaluate_subset(list(current_features), use_all_cores=True)
         current_features, result = self._loose_forward_selection(
             current_features, all_expansion
@@ -656,6 +770,7 @@ class LooseTightPipeline:
             print(f"  [Checkpoint saved]")
 
         # STEP 3: Strict backward elimination
+        gc.collect()  # MEMORY: Clean up before backward elimination
         pre_backward_result = result
         current_features, result = self._strict_backward_elimination(current_features)
         self._completed_stages.append("3_strict_backward")
@@ -667,6 +782,7 @@ class LooseTightPipeline:
             print(f"  [Checkpoint saved]")
 
         # STEP 4: Light interaction pass (optional)
+        gc.collect()  # MEMORY: Clean up before interaction pass
         if self.config.run_interactions:
             pre_interaction_result = result
             current_features, result = self._light_interaction_pass(
@@ -681,6 +797,7 @@ class LooseTightPipeline:
                 print(f"  [Checkpoint saved]")
 
         # STEP 5: Hill climbing / swapping
+        gc.collect()  # MEMORY: Clean up before swapping
         pre_swap_result = result
         current_features, result = self._hill_climbing_swapping(
             current_features, all_expansion
@@ -694,6 +811,7 @@ class LooseTightPipeline:
             print(f"  [Checkpoint saved]")
 
         # STEP 6: Final cleanup pass
+        gc.collect()  # MEMORY: Clean up before final cleanup
         pre_cleanup_result = result
         current_features, result = self._final_cleanup(current_features)
         self._completed_stages.append("6_final_cleanup")
@@ -709,6 +827,12 @@ class LooseTightPipeline:
 
         if verbose:
             self._print_final_summary(initial_baseline, result)
+
+        # MEMORY OPTIMIZATION: Clean up cached numpy arrays
+        self._X_arr = None
+        self._y_arr = None
+        self._sample_weight_arr = None
+        gc.collect()
 
         return self
 
@@ -744,13 +868,15 @@ class LooseTightPipeline:
         best_score = best_result.metric_main
 
         # Parallel evaluation of all removals
+        # MEMORY OPTIMIZATION: Pass numpy arrays (memory-mapped by joblib)
         features_list = list(current_set)
         results = Parallel(n_jobs=self.config.n_jobs, backend='loky', verbose=0)(
             delayed(_evaluate_removal_joblib)(
-                self._X, self._y, features_list, f,
+                self._X_arr, self._y_arr, self._feature_names,
+                features_list, f, self._index_values,
                 self.model_config, self.cv_config,
                 self.metric_config, self.search_config,
-                self._sample_weight
+                self._sample_weight_arr
             )
             for f in features_list
         )
@@ -850,12 +976,14 @@ class LooseTightPipeline:
             start_time = time.time()
 
             # Parallel evaluation of all candidates
+            # MEMORY OPTIMIZATION: Pass numpy arrays (memory-mapped by joblib)
             results = Parallel(n_jobs=self.config.n_jobs, backend='loky', verbose=0)(
                 delayed(_evaluate_addition_joblib)(
-                    self._X, self._y, list(current_set), cand,
+                    self._X_arr, self._y_arr, self._feature_names,
+                    list(current_set), cand, self._index_values,
                     self.model_config, self.cv_config,
                     self.metric_config, self.search_config,
-                    self._sample_weight
+                    self._sample_weight_arr
                 )
                 for cand in remaining
             )
@@ -937,13 +1065,15 @@ class LooseTightPipeline:
                 print(f"  Pass {pass_num}: {len(current_set)} features")
 
             # Parallel evaluation of all removals
+            # MEMORY OPTIMIZATION: Pass numpy arrays (memory-mapped by joblib)
             features_list = list(current_set)
             results = Parallel(n_jobs=self.config.n_jobs, backend='loky', verbose=0)(
                 delayed(_evaluate_removal_joblib)(
-                    self._X, self._y, features_list, f,
+                    self._X_arr, self._y_arr, self._feature_names,
+                    features_list, f, self._index_values,
                     self.model_config, self.cv_config,
                     self.metric_config, self.search_config,
-                    self._sample_weight
+                    self._sample_weight_arr
                 )
                 for f in features_list
             )
@@ -1161,12 +1291,14 @@ class LooseTightPipeline:
                 break
 
             # Parallel evaluation of swaps
+            # MEMORY OPTIMIZATION: Pass numpy arrays (memory-mapped by joblib)
             results = Parallel(n_jobs=self.config.n_jobs, backend='loky', verbose=0)(
                 delayed(_evaluate_swap_joblib)(
-                    self._X, self._y, list(current_set), f_out, f_in,
+                    self._X_arr, self._y_arr, self._feature_names,
+                    list(current_set), f_out, f_in, self._index_values,
                     self.model_config, self.cv_config,
                     self.metric_config, self.search_config,
-                    self._sample_weight
+                    self._sample_weight_arr
                 )
                 for f_out, f_in in swap_candidates
             )
