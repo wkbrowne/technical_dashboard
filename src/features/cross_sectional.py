@@ -12,6 +12,7 @@ Parallelization Strategy:
 """
 import logging
 import multiprocessing
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
@@ -992,6 +993,7 @@ def _load_benchmark_etfs_for_weekly(
         sector_to_etf: Dict mapping sector name -> ETF symbol
     """
     from pathlib import Path
+    from .cross_asset import CROSS_ASSET_ETFS
 
     # Collect all ETFs we need
     etfs_needed = set()
@@ -1003,6 +1005,13 @@ def _load_benchmark_etfs_for_weekly(
         for etf in sector_to_etf.values():
             if etf not in weekly_by_symbol:
                 etfs_needed.add(etf)
+
+    # Add cross-asset ETFs needed for weekly cross-asset features
+    # (GLD, TLT, SHY, HYG, LQD, XLY, XLP, XLK, XLF, XLU, COPX, etc.)
+    for name, symbols in CROSS_ASSET_ETFS.items():
+        for symbol in symbols:
+            if symbol not in weekly_by_symbol:
+                etfs_needed.add(symbol)
 
     if not etfs_needed:
         logger.debug("All benchmark ETFs already in weekly_by_symbol")
@@ -1261,6 +1270,14 @@ def compute_weekly_cross_sectional_features(
         except Exception as e:
             logger.warning(f"Weekly relative strength features failed: {e}")
 
+    # Step 6b: Compute weekly volatility regime cross-sectional context (w_vol_regime_rel)
+    # This requires w_vol_regime to already be computed (from single-stock weekly features)
+    logger.info("Computing weekly volatility regime cross-sectional context...")
+    try:
+        _add_weekly_vol_regime_cs_context(weekly_by_symbol, prefix=prefix)
+    except Exception as e:
+        logger.warning(f"Weekly vol regime CS context failed: {e}")
+
     # Step 7: Merge weekly cross-sectional features back to daily data
     logger.info("Merging weekly cross-sectional features back to daily...")
     _merge_weekly_cs_to_daily(indicators_by_symbol, weekly_by_symbol, prefix=prefix)
@@ -1274,9 +1291,17 @@ def _add_weekly_cross_asset_features(
 ) -> None:
     """Add weekly cross-asset features to weekly data."""
     from .cross_asset import (
-        _get_price_series, _compute_ratio, _compute_zscore,
+        _get_price_series, _compute_ratio,
         _compute_momentum, _compute_rolling_corr, CROSS_ASSET_ETFS
     )
+
+    # Local zscore function with appropriate min_periods for weekly data
+    def _weekly_zscore(series: pd.Series, window: int = 12) -> pd.Series:
+        """Compute rolling z-score for weekly data (min_periods = window // 2)."""
+        min_periods = max(4, window // 2)
+        mean = series.rolling(window, min_periods=min_periods).mean()
+        std = series.rolling(window, min_periods=min_periods).std()
+        return (series - mean) / std.replace(0, np.nan)
 
     # Extract weekly prices for ETFs
     prices = {}
@@ -1324,6 +1349,30 @@ def _add_weekly_cross_asset_features(
 
     if 'dollar' in prices:
         features[f'{prefix}dollar_momentum_20d'] = _compute_momentum(prices['dollar'], 4).rename(f'{prefix}dollar_momentum_20d')  # 4 weeks ~ 20 days
+
+    # Add cyclical/defensive ratio (XLY/XLP) - risk appetite indicator
+    if 'cyclical' in prices and 'defensive' in prices:
+        features[f'{prefix}cyclical_defensive_ratio'] = _compute_ratio(
+            prices['cyclical'], prices['defensive'], f'{prefix}cyclical_defensive_ratio'
+        )
+
+    # Add tech/SPY ratio (XLK/SPY) - tech leadership indicator
+    if 'tech' in prices and 'equity' in prices:
+        features[f'{prefix}tech_spy_ratio'] = _compute_ratio(
+            prices['tech'], prices['equity'], f'{prefix}tech_spy_ratio'
+        )
+
+    # Add yield curve proxy (TLT/SHY) and z-score - interest rate regime
+    if 'long_bond' in prices and 'short_bond' in prices:
+        yield_curve = _compute_ratio(prices['long_bond'], prices['short_bond'], f'{prefix}yield_curve_proxy')
+        features[f'{prefix}yield_curve_proxy'] = yield_curve
+        features[f'{prefix}yield_curve_zscore'] = _weekly_zscore(yield_curve, 12).rename(f'{prefix}yield_curve_zscore')  # 12 weeks ~ 60 days
+
+    # Add credit spread proxy (HYG/LQD) and z-score - credit risk regime
+    if 'high_yield' in prices and 'inv_grade' in prices:
+        credit_spread = _compute_ratio(prices['high_yield'], prices['inv_grade'], f'{prefix}credit_spread_proxy')
+        features[f'{prefix}credit_spread_proxy'] = credit_spread
+        features[f'{prefix}credit_spread_zscore'] = _weekly_zscore(credit_spread, 12).rename(f'{prefix}credit_spread_zscore')  # 12 weeks ~ 60 days
 
     # Attach to ALL weekly symbols
     for sym, df in weekly_by_symbol.items():
@@ -1609,12 +1658,14 @@ def _add_weekly_alpha_features(
 
         new_features = {}
 
-        # Rolling beta vs SPY
+        # Rolling beta vs SPY (simple cov/var method)
+        # Distinct from beta_market in joint factor model (orthogonalized)
+        # w_beta_market (joint factor) vs w_beta_spy_simple (this one)
         try:
             cov = aligned['stock'].rolling(beta_window, min_periods=beta_window//2).cov(aligned['spy'])
             var = aligned['spy'].rolling(beta_window, min_periods=beta_window//2).var()
             beta = cov / var.replace(0, np.nan)
-            new_features[f'{prefix}beta_spy'] = align_to_index(beta, df.index).astype('float32')
+            new_features[f'{prefix}beta_spy_simple'] = align_to_index(beta, df.index).astype('float32')
 
             # Alpha residual (stock return - beta * market return)
             alpha_resid = aligned['stock'] - beta * aligned['spy']
@@ -1644,10 +1695,12 @@ def _add_weekly_alpha_features(
                 }).dropna()
 
                 if len(aligned_qqq) >= beta_window:
+                    # Simple rolling beta (cov/var) - distinct from orthogonalized joint factor model
+                    # w_beta_qqq (joint factor) vs w_beta_qqq_simple (this one)
                     cov_qqq = aligned_qqq['stock'].rolling(beta_window, min_periods=beta_window//2).cov(aligned_qqq['qqq'])
                     var_qqq = aligned_qqq['qqq'].rolling(beta_window, min_periods=beta_window//2).var()
                     beta_qqq = cov_qqq / var_qqq.replace(0, np.nan)
-                    new_features[f'{prefix}beta_qqq'] = align_to_index(beta_qqq, df.index).astype('float32')
+                    new_features[f'{prefix}beta_qqq_simple'] = align_to_index(beta_qqq, df.index).astype('float32')
 
                     alpha_qqq = aligned_qqq['stock'] - beta_qqq * aligned_qqq['qqq']
                     new_features[f'{prefix}alpha_resid_qqq'] = align_to_index(alpha_qqq, df.index).astype('float32')
@@ -1844,6 +1897,95 @@ def _add_weekly_relative_strength_features(
             processed_symbols += 1
 
     logger.info(f"  Added up to {feature_count} weekly RS features for {processed_symbols} symbols")
+
+
+def _add_weekly_vol_regime_cs_context(
+    weekly_by_symbol: Dict[str, pd.DataFrame],
+    prefix: str = "w_"
+) -> None:
+    """Add weekly volatility regime cross-sectional context.
+
+    Computes weekly volatility regime for each symbol (rv_ratio_20_100 equivalent on weekly data),
+    then computes cross-sectional median and relative values:
+    - w_vol_regime_cs_median: Cross-sectional median vol regime
+    - w_vol_regime_rel: Symbol's w_vol_regime relative to cross-sectional median
+
+    NOTE: This does NOT output w_vol_regime itself - that comes from single-stock weekly
+    features (via _compute_higher_tf_for_symbol). This function only computes the
+    cross-sectional context using a local calculation of vol_regime.
+
+    This is the weekly version of add_vol_regime_cs_context() from volatility.py.
+
+    Args:
+        weekly_by_symbol: Dictionary of symbol -> weekly DataFrame (modified in place)
+        prefix: Prefix for weekly features (default 'w_')
+    """
+    # Step 1: Compute weekly vol regime for each symbol (for CS context only)
+    # vol_regime = log1p(rv_short / rv_long), where rv = rolling std of returns
+    # For weekly data: short=4 weeks (~20 days), long=20 weeks (~100 days)
+    # NOTE: We use an internal column name to avoid overwriting w_vol_regime from single-stock
+    internal_vol_regime_col = '_vol_regime_cs_calc'
+
+    vol_regime_data = {}
+    for sym, df in weekly_by_symbol.items():
+        if df.empty:
+            continue
+
+        # Need returns for volatility calculation
+        if 'ret' not in df.columns:
+            if 'adjclose' in df.columns:
+                ret = df['adjclose'].pct_change()
+            elif 'close' in df.columns:
+                ret = df['close'].pct_change()
+            else:
+                continue
+        else:
+            ret = df['ret']
+
+        # Compute rolling volatility (short and long windows)
+        # For weekly data: 4 weeks ~ 20 days, 20 weeks ~ 100 days
+        rv_short = ret.rolling(4, min_periods=2).std()
+        rv_long = ret.rolling(20, min_periods=10).std()
+
+        # Compute ratio and log-transform
+        ratio = rv_short / rv_long.replace(0, np.nan)
+        vol_regime = np.log1p(ratio)
+
+        # Store for cross-sectional computation
+        vol_regime_data[sym] = vol_regime
+
+        # Store internally (not as w_vol_regime to avoid overwriting single-stock version)
+        df[internal_vol_regime_col] = vol_regime.astype('float32')
+
+    if not vol_regime_data:
+        logger.warning("No symbols have sufficient data for weekly vol regime")
+        return
+
+    # Step 2: Compute cross-sectional median per week
+    panel = pd.DataFrame(vol_regime_data).sort_index()
+    cs_median = panel.median(axis=1, skipna=True)
+
+    # Step 3: Attach cross-sectional context to each symbol
+    attached = 0
+    for sym, df in weekly_by_symbol.items():
+        if df.empty or internal_vol_regime_col not in df.columns:
+            continue
+
+        # Add cross-sectional median
+        cs_reindexed = cs_median.reindex(df.index)
+        df[f'{prefix}vol_regime_cs_median'] = cs_reindexed.astype('float32')
+
+        # Add relative vol regime (symbol's vol_regime - cross-sectional median)
+        symbol_vol_regime = pd.to_numeric(df[internal_vol_regime_col], errors='coerce')
+        df[f'{prefix}vol_regime_rel'] = (symbol_vol_regime - cs_reindexed).astype('float32')
+
+        # Remove internal column (don't want it merged to daily)
+        df.drop(columns=[internal_vol_regime_col], inplace=True)
+
+        attached += 1
+
+    logger.info(f"  Added weekly vol regime CS context to {attached} symbols "
+                f"(median over {len(vol_regime_data)} symbols per week)")
 
 
 def _merge_weekly_cs_to_daily(

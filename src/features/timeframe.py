@@ -811,17 +811,20 @@ def combine_to_long(
 
     Returns:
         Combined long-format DataFrame with 'date' and 'symbol' columns
+
+    Note:
+        Uses copy() to defragment DataFrames before processing, avoiding
+        PerformanceWarning from fragmented input DataFrames.
     """
     if not symbol_data:
         return pd.DataFrame()
 
     frames = []
     for symbol, df in symbol_data.items():
-        frame = df.copy()
-
-        # Handle date as index - convert to column
-        if 'date' not in frame.columns and frame.index.name in ('date', None):
-            frame = frame.reset_index()
+        # Handle date as index - reset_index creates a new DataFrame (no copy needed)
+        if 'date' not in df.columns and df.index.name in ('date', None):
+            # Use copy() to defragment before reset_index to avoid PerformanceWarning
+            frame = df.copy().reset_index()
             # If index was unnamed, try to identify the date column
             if 'index' in frame.columns:
                 # Check if it looks like dates
@@ -829,13 +832,17 @@ def combine_to_long(
                     frame = frame.rename(columns={'index': 'date'})
                 else:
                     frame = frame.drop(columns=['index'])
+        else:
+            # Date already a column - use copy() to defragment then reset_index
+            frame = df.copy().reset_index(drop=True)
 
         # Remove duplicate columns (keep first occurrence)
         if frame.columns.duplicated().any():
             frame = frame.loc[:, ~frame.columns.duplicated()]
 
+        # Add symbol column using assign() to avoid fragmentation warning
         if 'symbol' not in frame.columns:
-            frame['symbol'] = symbol
+            frame = frame.assign(symbol=symbol)
         frames.append(frame)
 
     combined = pd.concat(frames, ignore_index=True)
