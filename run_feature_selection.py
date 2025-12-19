@@ -780,7 +780,7 @@ def main():
                 "n_features": len(s.features),
                 "metric_mean": s.metric_mean,
                 "metric_std": s.metric_std,
-                "is_best": s == pipeline.best_snapshot
+                "is_best": bool(s == pipeline.best_snapshot)
             }
             for s in pipeline.snapshots
         ],
