@@ -100,119 +100,129 @@ TODO: Three most promising feature areas to explore next:
    sentiment exhaustion. Currently the model has no sentiment inputs.
 
 ================================================================================
-FEATURE SELECTION RESULTS SUMMARY (52 features, 0.6932 AUC ± 0.0625)
+FEATURE SELECTION RESULTS SUMMARY (43 features, 0.70 AUC)
 ================================================================================
 
 TOP PERFORMING CATEGORIES (by # of features selected):
 
-1. MACRO/INTERMARKET (12 features) - 23% of model
-   Strongest signal: copper_gold_ratio, fred_* series, w_equity_bond_corr_60d
-   → Economic regime and credit conditions matter more than expected
-   → Weekly macro features (w_fred_*) complement daily well
+1. MACRO/INTERMARKET (10 features) - 23% of model
+   Core signals: copper_gold_zscore, gold_spy_ratio_zscore, fred_ccsa_z52w, fred_dgs2_chg20d
+   Weekly: w_equity_bond_corr_60d, w_fred_bamlh0a0hym2_z60, w_cyclical_defensive_ratio
+   VIX: vix_percentile_252d, vix_zscore_60d, w_vix_vxn_spread
+   → Economic regime and credit conditions dominate
 
-2. TREND STRENGTH (8 features) - 15% of model
-   Core: trend_score_sign, trend_score_slope, trend_persist_ema
-   Slopes: pct_slope_ma_20, pct_slope_ma_100, w_pct_slope_ma_20
-   → Multi-timeframe slope alignment is key signal
-
-3. RELATIVE PERFORMANCE (7 features) - 13% of model
-   Alpha: alpha_mom_spy_20_ema10, alpha_mom_sector_20_ema10, w_alpha_mom_spy_20_ema10
-   Beta: beta_spy, w_beta_spy
-   Strength: rel_strength_sector, xsec_mom_20d_z
+2. RELATIVE PERFORMANCE (9 features) - 21% of model
+   Alpha: alpha_mom_qqq_20_ema10, alpha_mom_sector_20_ema10, w_alpha_mom_qqq_60_ema10, w_alpha_mom_spy_20_ema10
+   Beta: w_beta_qqq
+   Strength: rel_strength_sector, w_rel_strength_sector
+   Cross-section: xsec_mom_20d_z, w_xsec_mom_4w_z
    → Stock vs market/sector differentiation crucial
 
-4. PRICE POSITION (6 features) - 12% of model
-   Distance: pct_dist_ma_20, pct_dist_ma_50, w_pct_dist_ma_20, w_pct_dist_ma_100_z
-   Range: pos_in_20d_range, w_pos_in_5d_range
+3. TREND STRENGTH (6 features) - 14% of model
+   Core: trend_score_sign, trend_score_slope
+   Slopes: pct_slope_ma_20, pct_slope_ma_100, w_pct_slope_ma_50
+   MACD: w_macd_histogram
+   → Multi-timeframe slope alignment is key signal
+
+4. PRICE POSITION (5 features) - 12% of model
+   Distance: pct_dist_ma_20_z, pct_dist_ma_50_z, relative_dist_20_50_z
+   Range: pos_in_20d_range
+   Spread: qqq_spy_cumret_60
    → Mean reversion signals complement momentum
 
-5. VOLATILITY REGIME (6 features) - 12% of model
-   Stock: vol_regime, vol_regime_ema10, atr_percent
-   Market: vix_regime, w_vix_ma4_ratio, w_vix_vxn_spread
-   → Both micro (stock) and macro (VIX) vol matter
+5. VOLATILITY REGIME (4 features) - 9% of model
+   Stock: atr_percent, vol_regime_ema10, rv_z_60
+   → Micro (stock) volatility matters
 
-6. TREND DIRECTION (4 features) - 8% of model
+6. VOLUME/LIQUIDITY (4 features) - 9% of model
+   VWAP: vwap_dist_5d_zscore, vwap_dist_20d_zscore
+   Volume: pv_divergence_5d, w_volshock_ema
+   Candlestick: upper_shadow_ratio
+   → VWAP distance and volume divergence useful
+
+7. BREADTH (4 features) - 9% of model
+   Daily: sector_breadth_ad_line, sector_breadth_mcclellan_osc, sector_breadth_pct_above_ma200
+   Interaction: sector_breadth_ad_line_x_pos_in_20d_range
+   → Sector breadth signals valuable
+
+8. MOMENTUM (1 feature) - 2% of model
    Daily: rsi_14
-   Weekly: w_rsi_14, w_macd_histogram
-   → Weekly momentum filters noise vs daily
-
-7. VOLUME/LIQUIDITY (3 features) - 6% of model
-   Selected: upper_shadow_ratio, vwap_dist_20d_zscore, w_vwap_dist_20d_zscore
-   → Candlestick patterns and VWAP useful; spread/illiquidity not selected
-
-UNDERPERFORMING CATEGORIES (features available but not selected):
-- Most spread proxies (cs_spread_est, roll_spread_est, hl_spread_proxy)
-- Amihud illiquidity measures
-- Most breakout signals (only breakout_up_20d selected)
-- Most relative strength variants (MACD-based RS not selected)
-- Cross-sectional percentiles (z-scores preferred over percentiles)
+   → Simple RSI survives; weekly RSI not selected
 
 KEY INSIGHTS:
-1. Weekly features are critical - 26 of 52 features have w_ prefix (50%)
-2. Z-scores preferred over raw values for mean reversion signals
-3. Macro regime (FRED, intermarket) unexpectedly important
-4. Simple trend indicators (sign, slope) beat complex ones
-5. Stock-level vol regime + market vol regime both matter
+1. Weekly features remain important - 12 of 43 features have w_ prefix (28%)
+2. Z-scores preferred for distance/volatility (pct_dist_ma_20_z, rv_z_60)
+3. Macro regime (FRED, intermarket ratios) provides strong signal
+4. Sector breadth proxy features prove valuable (4 selected)
+5. Alpha momentum vs QQQ/sector more important than vs SPY directly
+6. One interaction feature selected: sector_breadth_ad_line_x_pos_in_20d_range
 """
 
 # =============================================================================
-# BASE FEATURES V2 - Curated core features (~38 total)
+# BASE FEATURES V3 - Selected via Loose-Tight pipeline (43 features, 0.70 AUC)
 # =============================================================================
-# Streamlined set of high-signal features chosen for:
-# - Multi-timeframe coverage (daily + weekly)
-# - Diverse signal types (trend, mean reversion, volatility, relative)
-# - Low correlation within category
-# - Strong feature selection performance
+# Features selected by forward selection with sector-stratified evaluation.
+# Run: python run_feature_selection.py (191.7 min runtime)
 
 BASE_FEATURES = [
-    # === TREND / MOMENTUM (4) ===
-    "rsi_14",                    # Daily momentum oscillator
-    "w_macd_histogram",          # Weekly momentum trend (filters noise)
-    "trend_score_sign",          # Multi-MA alignment (+1/-1 per MA)
-    "trend_score_slope",         # Trend slope composite
-
-    # === TREND SLOPES (3) ===
-    "pct_slope_ma_20",           # Short-term trend direction
-    "pct_slope_ma_100",          # Medium-term trend direction
-    "w_pct_slope_ma_50",         # Weekly trend direction
-
-    # === PRICE POSITION / MEAN REVERSION (5) ===
-    "pct_dist_ma_20_z",          # Z-scored distance from 20d MA
-    "pct_dist_ma_50_z",          # Z-scored distance from 50d MA
-    "relative_dist_20_50_z",     # Relative position between MAs
-    "pos_in_20d_range",          # Position in recent range (0-1)
-    "vwap_dist_20d_zscore",      # Z-scored distance from 20d VWAP
-
-    # === VOLATILITY / REGIME (5) ===
-    "atr_percent",               # Normalized volatility (REQUIRED for targets)
-    "vol_regime_ema10",          # Smoothed vol regime
-    "rv_z_60",                   # Realized vol z-score
-    "vix_zscore_60d",            # VIX z-score (market fear)
-    "w_vix_vxn_spread",          # Weekly VIX-VXN spread (tech vs broad)
-
-    # === RELATIVE PERFORMANCE / CROSS-SECTION (6) ===
-    "alpha_mom_spy_20_ema10",    # Alpha vs market (20d, smoothed)
+    # === RELATIVE PERFORMANCE / ALPHA (9 features) ===
+    "alpha_mom_qqq_20_ema10",    # Alpha vs QQQ (20d, smoothed)
     "alpha_mom_sector_20_ema10", # Alpha vs sector (20d, smoothed)
-    "w_alpha_mom_spy_20_ema10",  # Weekly alpha vs market
+    "w_alpha_mom_qqq_60_ema10",  # Weekly alpha vs QQQ (60d)
+    "w_alpha_mom_spy_20_ema10",  # Weekly alpha vs SPY (20d)
+    "w_beta_qqq",                # Weekly beta to QQQ (growth sensitivity)
     "rel_strength_sector",       # Relative strength vs sector
+    "w_rel_strength_sector",     # Weekly relative strength vs sector
     "xsec_mom_20d_z",            # Cross-sectional momentum z-score
     "w_xsec_mom_4w_z",           # Weekly cross-sectional z-score
 
-    # === SECTOR BREADTH PROXY (2) ===
-    "sector_breadth_pct_above_ma200",  # Slow structural regime (% sectors above 200d MA)
-    "sector_breadth_mcclellan_osc",    # Fast breadth momentum (EMA(19) - EMA(39) of net adv)
+    # === MACRO / INTERMARKET (11 features) ===
+    "copper_gold_zscore",        # Copper/gold z-score (growth indicator)
+    "fred_ccsa_z52w",            # Continued claims z-score (labor market)
+    "fred_dgs2_chg20d",          # 2-year Treasury rate 20d change
+    "gold_spy_ratio_zscore",     # Gold/SPY z-score (risk-off)
+    "qqq_spy_cumret_60",         # QQQ-SPY cumulative return 60d (growth premium)
+    "vix_percentile_252d",       # VIX percentile (1-year lookback)
+    "vix_zscore_60d",            # VIX z-score (market fear)
+    "w_cyclical_defensive_ratio", # Weekly cyclical/defensive ratio
+    "w_equity_bond_corr_60d",    # Weekly equity-bond correlation
+    "w_fred_bamlh0a0hym2_z60",   # Weekly high yield spread z-score
+    "w_vix_vxn_spread",          # Weekly VIX-VXN spread (tech vs broad)
 
-    # === LIQUIDITY / VOLUME (2) ===
+    # === TREND STRENGTH (6 features) ===
+    "pct_slope_ma_20",           # Short-term trend direction
+    "pct_slope_ma_100",          # Medium-term trend direction
+    "w_pct_slope_ma_50",         # Weekly trend slope (50-week MA)
+    "trend_score_sign",          # Multi-MA alignment (+1/-1 per MA)
+    "trend_score_slope",         # Trend slope composite
+    "w_macd_histogram",          # Weekly MACD histogram
+
+    # === PRICE POSITION / MEAN REVERSION (4 features) ===
+    "pct_dist_ma_20_z",          # Z-scored distance from 20d MA
+    "pct_dist_ma_50_z",          # Z-scored distance from 50d MA
+    "pos_in_20d_range",          # Position in 20d range (0-1)
+    "relative_dist_20_50_z",     # Relative position between 20/50 MAs
+
+    # === VOLATILITY / REGIME (3 features) ===
+    "atr_percent",               # Normalized ATR (REQUIRED for targets)
+    "rv_z_60",                   # Realized vol z-score (60d)
+    "vol_regime_ema10",          # Smoothed vol regime
+
+    # === SECTOR BREADTH (4 features) ===
+    "sector_breadth_ad_line",                       # Cumulative A/D line
+    "sector_breadth_ad_line_x_pos_in_20d_range",    # Interaction: breadth × range position
+    "sector_breadth_mcclellan_osc",                 # McClellan oscillator (fast breadth)
+    "sector_breadth_pct_above_ma200",               # % sectors above 200d MA
+
+    # === VOLUME / LIQUIDITY (5 features) ===
+    "pv_divergence_5d",          # Price-volume divergence (5d)
     "upper_shadow_ratio",        # Selling pressure (candlestick)
+    "vwap_dist_5d_zscore",       # Z-scored distance from 5d VWAP
+    "vwap_dist_20d_zscore",      # Z-scored distance from 20d VWAP
     "w_volshock_ema",            # Weekly volume shock indicator
 
-    # === MACRO / INTERMARKET (6) ===
-    "copper_gold_zscore",        # Copper/gold z-score (growth indicator)
-    "gold_spy_ratio_zscore",     # Gold/SPY z-score (risk-off)
-    "w_equity_bond_corr_60d",    # Weekly equity-bond correlation
-    "w_fred_bamlh0a0hym2_z60",   # High yield spread z-score
-    "fred_dgs2_chg20d",          # 2-year Treasury rate change
-    "fred_ccsa_z52w",            # Continued claims z-score
+    # === MOMENTUM (1 feature) ===
+    "rsi_14",                    # Daily RSI (14-period)
 ]
 
 # Feature categories for reference (updated to match config/features.yaml)

@@ -414,6 +414,7 @@ class LooseTightPipeline:
         search_config: Optional[SearchConfig] = None,
         metric_config: Optional[MetricConfig] = None,
         pipeline_config: Optional[LooseTightConfig] = None,
+        checkpoint_path: Optional[str] = None,
     ):
         """Initialize the pipeline.
 
@@ -423,6 +424,8 @@ class LooseTightPipeline:
             search_config: Search configuration (used for evaluator)
             metric_config: Metrics configuration
             pipeline_config: Pipeline-specific configuration
+            checkpoint_path: Custom path for checkpoint file. If None, uses default
+                'artifacts/feature_selection/checkpoint.pkl'.
         """
         self.model_config = model_config or ModelConfig()
         self.cv_config = cv_config or CVConfig()
@@ -452,8 +455,12 @@ class LooseTightPipeline:
         self._stats_display: Optional[StatsDisplay] = None
 
         # Checkpointing
-        self._checkpoint_dir = Path('artifacts/feature_selection')
-        self._checkpoint_file = self._checkpoint_dir / 'checkpoint.pkl'
+        if checkpoint_path is not None:
+            self._checkpoint_file = Path(checkpoint_path)
+            self._checkpoint_dir = self._checkpoint_file.parent
+        else:
+            self._checkpoint_dir = Path('artifacts/feature_selection')
+            self._checkpoint_file = self._checkpoint_dir / 'checkpoint.pkl'
         self._current_features: Optional[Set[str]] = None
         self._completed_stages: List[str] = []
 
@@ -746,18 +753,19 @@ class LooseTightPipeline:
         initial_baseline = baseline_result
 
         # STEP 1b: Optional base feature elimination (quick pruning)
+        pre_forward_result = baseline_result  # Use baseline as starting point for comparison
         if self.config.run_base_elimination:
             current_features, result = self._base_feature_elimination(current_features)
             self._completed_stages.append("1b_base_elimination")
             self._record_snapshot("1b_base_elimination", current_features, result)
             self._save_checkpoint("1b_base_elimination", current_features, result)
+            pre_forward_result = result  # Update comparison baseline after elimination
             if verbose:
                 self._print_comparison_table(initial_baseline, result, "Base Elimination")
                 print(f"  [Checkpoint saved]")
 
         # STEP 2: Loose forward selection
         gc.collect()  # MEMORY: Clean up before forward selection
-        pre_forward_result = self._evaluate_subset(list(current_features), use_all_cores=True)
         current_features, result = self._loose_forward_selection(
             current_features, all_expansion
         )
@@ -1394,8 +1402,8 @@ class LooseTightPipeline:
 
         Args:
             features: List of feature names to evaluate.
-            use_all_cores: If True, use all available cores for this evaluation.
-                          Used for base features evaluation where there's no parallelism.
+            use_all_cores: If True, use all available cores for this single evaluation.
+                          LightGBM's num_threads parameter overrides OMP_NUM_THREADS.
         """
         model_config = self.model_config
         if use_all_cores:
@@ -1408,6 +1416,7 @@ class LooseTightPipeline:
                 early_stopping_rounds=self.model_config.early_stopping_rounds,
                 num_boost_round=self.model_config.num_boost_round,
             )
+
         evaluator = SubsetEvaluator(
             X=self._X, y=self._y,
             model_config=model_config,

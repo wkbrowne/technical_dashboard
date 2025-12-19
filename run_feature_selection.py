@@ -15,9 +15,11 @@ This script:
 4. Saves results to artifacts/
 """
 
+# Parallelism strategy: Sequential evaluation with LightGBM using all cores
+import os
+
 import gc
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -267,8 +269,10 @@ def run_feature_selection(
     sector: pd.Series = None,
     n_folds: int = 5,
     n_jobs: int = 8,
+    threads_per_job: int = None,
     scale_pos_weight: float = None,
-    prune_base: bool = False
+    prune_base: bool = False,
+    checkpoint_path: str = None,
 ) -> LooseTightPipeline:
     """Run the LOOSE-THEN-TIGHT feature selection pipeline.
 
@@ -290,20 +294,39 @@ def run_feature_selection(
         sector: Sector labels for sector-stratified evaluation.
         n_folds: Number of CV folds.
         n_jobs: Number of parallel jobs.
+        threads_per_job: Threads per LightGBM model. None = auto (all cores if n_jobs=1, else 1).
         scale_pos_weight: LightGBM class weight (n_neg/n_pos). None for no weighting.
         prune_base: If True, run quick reverse elimination on BASE_FEATURES before
                    forward selection to prune weak base features early.
+        checkpoint_path: Custom path for checkpoint file. None = default location.
 
     Returns:
         Fitted LooseTightPipeline object.
     """
+    import os as _os
+    effective_n_jobs = n_jobs if n_jobs > 0 else (_os.cpu_count() or 1)
+
+    # Determine threads per job
+    # Default: all cores if sequential (n_jobs=1), else 1 thread per job
+    if threads_per_job is None:
+        if effective_n_jobs == 1:
+            effective_threads = -1  # LightGBM uses all cores
+        else:
+            effective_threads = 1  # Avoid oversubscription
+    else:
+        effective_threads = threads_per_job
+
+    total_threads = effective_n_jobs * (effective_threads if effective_threads > 0 else (_os.cpu_count() or 1))
+
     print(f"\n{'='*60}")
     print("Running LOOSE-THEN-TIGHT Feature Selection Pipeline")
     print(f"{'='*60}")
     print(f"Available features: {len(features)}")
     print(f"Samples: {len(X)}")
     print(f"CV Folds: {n_folds}")
-    print(f"Parallel Jobs: {n_jobs}")
+    print(f"Parallel Jobs: {effective_n_jobs}")
+    print(f"Threads per Job: {effective_threads if effective_threads > 0 else 'all cores'}")
+    print(f"Total Threads: ~{total_threads}")
     if sample_weight is not None:
         print(f"Sample Weighting: ENABLED (overlap inverse)")
     if scale_pos_weight is not None:
@@ -328,7 +351,7 @@ def run_feature_selection(
     print(f"  X_subset shape: {X_subset.shape}")
 
     # Configure model for LightGBM classification
-    # With 64 cores: 8 parallel candidate evaluations × 8 threads per model = 64 total
+    # Sequential evaluation with LightGBM using all cores
     model_params = {
         'learning_rate': 0.05,
         'max_depth': 6,
@@ -348,7 +371,7 @@ def run_feature_selection(
         model_type=ModelType.LIGHTGBM,
         task_type=TaskType.CLASSIFICATION,
         params=model_params,
-        num_threads=8,  # 8 threads per model (8 jobs × 8 threads = 64 cores)
+        num_threads=effective_threads,  # Threads per model
         early_stopping_rounds=50,
         num_boost_round=300,
     )
@@ -412,6 +435,7 @@ def run_feature_selection(
         search_config=search_config,
         metric_config=metric_config,
         pipeline_config=pipeline_config,
+        checkpoint_path=checkpoint_path,
     )
 
     # Subset sample weights to match X_subset index
@@ -438,26 +462,32 @@ def main():
                         help='Use class weights (scale_pos_weight) for balanced training')
     parser.add_argument('--max-symbols', type=int, default=5000,
                         help='Maximum number of symbols to include')
-    parser.add_argument('--n-jobs', type=int, default=8,
-                        help='Number of parallel jobs')
+    parser.add_argument('--n-jobs', type=int, default=1,
+                        help='Number of parallel joblib workers (default=1, sequential)')
+    parser.add_argument('--threads-per-job', type=int, default=None,
+                        help='Threads per LightGBM model (default: all cores if n-jobs=1, else 1)')
     parser.add_argument('--n-folds', type=int, default=5,
                         help='Number of CV folds')
     parser.add_argument('--prune-base', action='store_true',
                         help='Run quick reverse elimination on BASE_FEATURES before forward selection')
+    parser.add_argument('--no-weights', action='store_true',
+                        help='Disable sample weighting even if weights are available in targets')
     parser.add_argument('--resume', action='store_true',
                         help='Resume from last checkpoint if available')
     parser.add_argument('--checkpoint-info', action='store_true',
                         help='Show checkpoint info and exit')
+    parser.add_argument('--checkpoint-path', type=str, default=None,
+                        help='Custom checkpoint file path (default: artifacts/feature_selection/checkpoint.pkl)')
     args = parser.parse_args()
 
     # Handle checkpoint info request
     if args.checkpoint_info:
-        info = LooseTightPipeline.checkpoint_info()
+        info = LooseTightPipeline.checkpoint_info(args.checkpoint_path)
         if info:
-            print("Checkpoint found:")
+            print(f"Checkpoint found{' at ' + args.checkpoint_path if args.checkpoint_path else ''}:")
             print(info)
         else:
-            print("No checkpoint found.")
+            print(f"No checkpoint found{' at ' + args.checkpoint_path if args.checkpoint_path else ''}.")
         return None
 
     print("="*60)
@@ -468,7 +498,28 @@ def main():
         print("  MODE: IMBALANCED (no class weights)")
     if args.prune_base:
         print("  BASE FEATURE PRUNING: ENABLED")
+    if args.no_weights:
+        print("  SAMPLE WEIGHTING: DISABLED (--no-weights)")
     print("="*60)
+
+    # Check for existing checkpoint and warn user
+    checkpoint_file = args.checkpoint_path or 'artifacts/feature_selection/checkpoint.pkl'
+    if LooseTightPipeline.has_checkpoint(args.checkpoint_path) and not args.resume:
+        print()
+        print("!" * 60)
+        print("WARNING: Existing checkpoint found!")
+        print("!" * 60)
+        info = LooseTightPipeline.checkpoint_info(args.checkpoint_path)
+        print(info)
+        print()
+        print("Options:")
+        print("  1. Use --resume to continue from checkpoint")
+        print("  2. Delete checkpoint to start fresh:")
+        print(f"     rm {checkpoint_file}")
+        print()
+        print("Starting FRESH run (checkpoint will be overwritten)...")
+        print("!" * 60)
+
     print()
 
     # Load and prepare data - use all symbols
@@ -478,6 +529,11 @@ def main():
         min_samples_per_symbol=5,
         use_filtered_features=True
     )
+
+    # Disable sample weights if --no-weights flag is set
+    if args.no_weights:
+        sample_weight = None
+        print("\nSample weighting DISABLED by --no-weights flag")
 
     # Compute scale_pos_weight if balanced mode
     scale_pos_weight = None
@@ -501,17 +557,17 @@ def main():
     valid_features = prefilter_features(X, max_nan_rate=0.3, correlation_threshold=0.95)
 
     # Check for resume
-    if args.resume and LooseTightPipeline.has_checkpoint():
+    if args.resume and LooseTightPipeline.has_checkpoint(args.checkpoint_path):
         print("\n" + "="*60)
         print("RESUMING FROM CHECKPOINT")
         print("="*60)
-        info = LooseTightPipeline.checkpoint_info()
+        info = LooseTightPipeline.checkpoint_info(args.checkpoint_path)
         print(info)
         print()
 
         # Create pipeline and resume
-        pipeline = LooseTightPipeline()
-        pipeline.resume_from_checkpoint(X, y, verbose=True)
+        pipeline = LooseTightPipeline(checkpoint_path=args.checkpoint_path)
+        pipeline.resume_from_checkpoint(X, y, checkpoint_path=args.checkpoint_path, verbose=True)
     else:
         if args.resume:
             print("\nNo checkpoint found, starting fresh...")
@@ -524,8 +580,10 @@ def main():
             sector=sector,
             n_folds=args.n_folds,
             n_jobs=args.n_jobs,
+            threads_per_job=args.threads_per_job,
             scale_pos_weight=scale_pos_weight,
-            prune_base=args.prune_base
+            prune_base=args.prune_base,
+            checkpoint_path=args.checkpoint_path,
         )
 
     # Print results
@@ -552,18 +610,29 @@ def main():
     from src.feature_selection.evaluation import SubsetEvaluator
     from src.feature_selection.config import SearchConfig
 
+    # Get the X data from pipeline (includes any interaction features created during pipeline)
+    # If best_features contains interaction features, we need to use pipeline's internal X
+    X_final = pipeline._X.copy() if hasattr(pipeline, '_X') and pipeline._X is not None else X[valid_features].copy()
+
+    # Filter to only features that exist in X_final
+    final_features = [f for f in best_features if f in X_final.columns]
+    if len(final_features) < len(best_features):
+        missing = set(best_features) - set(final_features)
+        print(f"    Note: {len(missing)} features not available for final evaluation")
+        print(f"    Missing: {list(missing)[:5]}...")
+
     # Use the pipeline's config to re-evaluate (with sector for stratified metrics)
     final_evaluator = SubsetEvaluator(
-        X=X[valid_features].copy(),
+        X=X_final,
         y=y,
         model_config=pipeline.model_config,
         cv_config=pipeline.cv_config,
         metric_config=pipeline.metric_config,
         search_config=SearchConfig(),
-        sample_weight=sample_weight.loc[X.index] if sample_weight is not None else None,
-        regime=sector.loc[X.index] if sector is not None else None,  # Pass sector for stratified metrics
+        sample_weight=sample_weight.loc[X_final.index] if sample_weight is not None else None,
+        regime=sector.loc[X_final.index] if sector is not None else None,  # Pass sector for stratified metrics
     )
-    final_result = final_evaluator.evaluate(best_features)
+    final_result = final_evaluator.evaluate(final_features)
 
     # Print extended metrics table
     print()
@@ -718,10 +787,12 @@ def main():
         "config": {
             "n_folds": args.n_folds,
             "n_jobs": args.n_jobs,
+            "threads_per_job": args.threads_per_job,
             "balanced": args.balanced,
             "prune_base": args.prune_base,
+            "no_weights": args.no_weights,
             "max_symbols": args.max_symbols,
-            "sample_weighting": "overlap_inverse" if sample_weight is not None else "disabled",
+            "sample_weighting": "disabled" if args.no_weights else ("overlap_inverse" if sample_weight is not None else "not_available"),
             "sector_stratified": sector is not None
         }
     }

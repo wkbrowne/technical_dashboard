@@ -12,6 +12,14 @@ import tempfile
 from typing import Dict
 
 
+# Register custom pytest markers
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line(
+        "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    )
+
+
 @pytest.fixture
 def business_day_index():
     """Create a 120-row business day index for testing."""

@@ -335,7 +335,9 @@ class SubsetEvaluator:
         # Compute metrics using the MetricComputer (includes primary and configured secondaries)
         regime_arr = None
         if self._regime is not None:
-            regime_arr = self._regime.iloc[test_idx].loc[test_mask].values
+            # Get regime values for test set, then apply same NaN mask
+            regime_test = self._regime.iloc[test_idx]
+            regime_arr = regime_test.values[test_mask.values]
 
         metrics = self._metric_computer.compute_all(
             y_test.values, y_pred, regime_arr
