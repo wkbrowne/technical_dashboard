@@ -68,27 +68,73 @@ class InteractionCandidate:
 
 
 # Domain-based interaction patterns (feature category pairs that often interact)
+# These patterns guide prioritization during interaction search.
+# Pattern matching is substring-based: ('vol', 'rsi') matches 'vol_regime' × 'rsi_14'
 DOMAIN_PATTERNS = [
     # (category1, category2) - features with these substrings are likely to interact
+
+    # === VOLATILITY REGIME × SIGNALS ===
+    # High-vol regimes widen ATR barriers; momentum signals need recalibration
     ('vol', 'momentum'),
     ('vol', 'rsi'),
     ('vol', 'return'),
+    ('vol', 'trend'),      # NEW: vol regime × trend strength
     ('regime', 'momentum'),
     ('regime', 'rsi'),
     ('regime', 'macd'),
     ('regime', 'return'),
+    ('regime', 'trend'),   # NEW: regime × trend alignment
+
+    # === BREADTH × LOCAL GEOMETRY ===
+    # Proven by selection: sector_breadth_ad_line_x_pos_in_20d_range
+    # Broad rally + stock near highs = higher barrier-up probability
+    ('breadth', 'momentum'),
+    ('breadth', 'return'),
+    ('breadth', 'range'),  # NEW: breadth × position in range
+    ('breadth', 'pos'),    # NEW: breadth × pos_in_*d_range features
+    ('breadth', 'dist'),   # NEW: breadth × distance to MA
+
+    # === CROSS-SECTIONAL × TIME-SERIES ===
+    # Top-decile stock with strong TS momentum = compounding effect
     ('rank', 'momentum'),
     ('rank', 'return'),
     ('xsec', 'momentum'),
     ('xsec', 'return'),
-    ('breadth', 'momentum'),
-    ('breadth', 'return'),
+    ('xsec', 'trend'),     # NEW: cross-sectional rank × trend
+
+    # === ALPHA/RELATIVE × REGIME ===
     ('alpha', 'vol'),
     ('alpha', 'regime'),
+    ('alpha', 'vix'),      # NEW: alpha signals × macro fear
+
+    # === VIX/MACRO × SIGNALS ===
+    # High VIX periods see correlated selloffs; stock-specific signals less reliable
     ('vix', 'momentum'),
     ('vix', 'return'),
+    ('vix', 'trend'),      # NEW: VIX state × trend signals
+    ('vix', 'breakout'),   # NEW: VIX × breakout signals (false breakouts in high VIX)
+
+    # === LIQUIDITY/FLOW × DIRECTION ===
+    # VWAP deviation × trend direction = confirmation vs reversal signal
+    ('vwap', 'trend'),     # NEW: VWAP distance × trend
+    ('vwap', 'momentum'),  # NEW: VWAP distance × momentum
+    ('vwap', 'slope'),     # NEW: VWAP distance × MA slopes
+
+    # === VOLUME DYNAMICS × PRICE LOCATION ===
+    # Volume shock at range extremes = conviction vs churning
+    ('volshock', 'range'), # NEW: volume shock × position in range
+    ('volshock', 'pos'),   # NEW: volume shock × price position
+    ('volume', 'range'),   # NEW: relative volume × range position
+
+    # === CANDLESTICK PATTERNS × REGIME ===
+    # Upper shadows in high-vol are noise; in low-vol = genuine rejection
+    ('shadow', 'vol'),     # NEW: candlestick patterns × volatility regime
+    ('shadow', 'regime'),  # NEW: shadow ratio × regime state
+
+    # === ATR/RANGE × MOMENTUM ===
     ('atr', 'momentum'),
     ('atr', 'return'),
+    ('atr', 'trend'),      # NEW: ATR × trend strength
 ]
 
 
