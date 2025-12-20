@@ -785,15 +785,15 @@ def main():
             for s in pipeline.snapshots
         ],
         "config": {
-            "n_folds": args.n_folds,
-            "n_jobs": args.n_jobs,
-            "threads_per_job": args.threads_per_job,
-            "balanced": args.balanced,
-            "prune_base": args.prune_base,
-            "no_weights": args.no_weights,
-            "max_symbols": args.max_symbols,
+            "n_folds": int(args.n_folds),
+            "n_jobs": int(args.n_jobs),
+            "threads_per_job": int(args.threads_per_job),
+            "balanced": bool(args.balanced),
+            "prune_base": bool(args.prune_base),
+            "no_weights": bool(args.no_weights),
+            "max_symbols": int(args.max_symbols) if args.max_symbols else None,
             "sample_weighting": "disabled" if args.no_weights else ("overlap_inverse" if sample_weight is not None else "not_available"),
-            "sector_stratified": sector is not None
+            "sector_stratified": bool(sector is not None)
         }
     }
     with open(output_dir / 'selection_summary.json', 'w') as f:
