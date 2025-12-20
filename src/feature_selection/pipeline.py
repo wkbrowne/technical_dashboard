@@ -332,6 +332,85 @@ def _evaluate_swap_joblib(
         return (f_out, f_in, None)
 
 
+def _evaluate_interaction_joblib(
+    X_arr: np.ndarray,
+    y_arr: np.ndarray,
+    feature_names: List[str],
+    current_features: List[str],
+    f1: str,
+    f2: str,
+    index_values: np.ndarray,
+    model_config: ModelConfig,
+    cv_config: CVConfig,
+    metric_config: MetricConfig,
+    search_config: SearchConfig,
+    sample_weight_arr: Optional[np.ndarray] = None,
+) -> Tuple[str, str, str, Optional[SubsetResult]]:
+    """Evaluate adding an interaction feature (joblib worker).
+
+    MEMORY OPTIMIZATION: Receives numpy arrays with memory mapping.
+    Computes interaction in worker to avoid serializing interaction values.
+
+    Returns:
+        Tuple of (f1, f2, interaction_name, result)
+    """
+    interaction_name = f"{f1}_x_{f2}"
+    try:
+        from .evaluation import SubsetEvaluator
+
+        # Get feature indices
+        feature_to_idx = {f: i for i, f in enumerate(feature_names)}
+
+        # Check if both features exist
+        if f1 not in feature_to_idx or f2 not in feature_to_idx:
+            return (f1, f2, interaction_name, None)
+
+        # Compute interaction values
+        f1_idx = feature_to_idx[f1]
+        f2_idx = feature_to_idx[f2]
+        interaction_values = X_arr[:, f1_idx] * X_arr[:, f2_idx]
+
+        # Check for excessive NaNs
+        nan_ratio = np.isnan(interaction_values).mean()
+        if nan_ratio > 0.5:
+            return (f1, f2, interaction_name, None)
+
+        # Build feature subset with interaction
+        col_indices = [feature_to_idx[f] for f in current_features if f in feature_to_idx]
+        X_subset_arr = X_arr[:, col_indices]
+
+        # Add interaction column
+        X_with_interaction = np.column_stack([X_subset_arr, interaction_values])
+        columns = [feature_names[i] for i in col_indices] + [interaction_name]
+
+        X_subset = pd.DataFrame(
+            X_with_interaction,
+            columns=columns,
+            index=pd.DatetimeIndex(index_values)
+        )
+        y = pd.Series(y_arr, index=X_subset.index)
+        sample_weight = pd.Series(sample_weight_arr, index=X_subset.index) if sample_weight_arr is not None else None
+
+        evaluator = SubsetEvaluator(
+            X=X_subset, y=y,
+            model_config=model_config,
+            cv_config=cv_config,
+            metric_config=metric_config,
+            search_config=search_config,
+            sample_weight=sample_weight,
+        )
+        test_features = list(current_features) + [interaction_name]
+        result = evaluator.evaluate(test_features)
+
+        del X_subset, y, sample_weight, evaluator
+        gc.collect()
+
+        return (f1, f2, interaction_name, result)
+    except Exception as e:
+        logger.debug(f"Interaction evaluation failed {interaction_name}: {e}")
+        return (f1, f2, interaction_name, None)
+
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -1191,50 +1270,75 @@ class LooseTightPipeline:
         if self._verbose:
             print(f"  Generated {len(interaction_candidates)} interaction candidates")
 
+        # Filter out already existing interactions
+        interaction_candidates = [
+            (f1, f2) for f1, f2 in interaction_candidates
+            if f"{f1}_x_{f2}" not in self._X.columns
+        ]
+
         added_interactions = []
 
-        for f1, f2 in interaction_candidates:
-            if len(added_interactions) >= self.config.max_interactions:
+        # Process interactions in batches using parallel evaluation
+        # We use a greedy approach: evaluate all candidates in parallel,
+        # then add the best ones one at a time (re-evaluating as needed)
+        while len(added_interactions) < self.config.max_interactions and interaction_candidates:
+            # Parallel evaluation of interaction candidates
+            # MEMORY OPTIMIZATION: Pass numpy arrays (memory-mapped by joblib)
+            results = Parallel(n_jobs=self.config.n_jobs, backend='loky', verbose=0)(
+                delayed(_evaluate_interaction_joblib)(
+                    self._X_arr, self._y_arr, self._feature_names,
+                    list(current_set), f1, f2, self._index_values,
+                    self.model_config, self.cv_config,
+                    self.metric_config, self.search_config,
+                    self._sample_weight_arr
+                )
+                for f1, f2 in interaction_candidates
+            )
+
+            # Find the best interaction that improves score
+            best_interaction = None
+            best_improvement = self.config.epsilon_add_interaction
+            best_interaction_result = None
+            best_f1, best_f2 = None, None
+
+            for f1, f2, interaction_name, result in results:
+                if result is None:
+                    continue
+                improvement = result.metric_main - best_score
+                if improvement >= best_improvement:
+                    best_interaction = interaction_name
+                    best_improvement = improvement
+                    best_interaction_result = result
+                    best_f1, best_f2 = f1, f2
+
+            if best_interaction is None:
+                # No improving interaction found
                 break
 
-            # Create interaction feature
-            interaction_name = f"{f1}_x_{f2}"
-            if interaction_name in self._X.columns:
-                continue
+            # Add the best interaction to current set
+            # Compute and store the interaction values in the DataFrame
+            interaction_values = self._X[best_f1] * self._X[best_f2]
+            self._X[best_interaction] = interaction_values
 
-            try:
-                # Compute interaction
-                interaction_values = self._X[f1] * self._X[f2]
+            # Update numpy arrays to include the new interaction
+            self._feature_names = list(self._X.columns)
+            self._X_arr = self._X.values.astype(np.float32)
 
-                # Check for excessive NaNs
-                if interaction_values.isna().mean() > 0.5:
-                    continue
+            current_set.add(best_interaction)
+            best_score = best_interaction_result.metric_main
+            best_result = best_interaction_result
+            added_interactions.append(best_interaction)
 
-                # Add to DataFrame temporarily
-                self._X[interaction_name] = interaction_values
+            if self._verbose:
+                print(f"  +{best_interaction}: {best_score:.4f} (+{best_improvement:.4f})")
 
-                # Evaluate
-                test_features = list(current_set) + [interaction_name]
-                result = self._evaluate_subset(test_features)
+            # Remove the added interaction from candidates
+            interaction_candidates = [
+                (f1, f2) for f1, f2 in interaction_candidates
+                if f"{f1}_x_{f2}" != best_interaction
+            ]
 
-                improvement = result.metric_main - best_score
-
-                if improvement >= self.config.epsilon_add_interaction:
-                    current_set.add(interaction_name)
-                    best_score = result.metric_main
-                    best_result = result
-                    added_interactions.append(interaction_name)
-
-                    if self._verbose:
-                        print(f"  +{interaction_name}: {best_score:.4f} (+{improvement:.4f})")
-                else:
-                    # Remove from DataFrame if not accepted
-                    del self._X[interaction_name]
-
-            except Exception as e:
-                logger.debug(f"Interaction {interaction_name} failed: {e}")
-                if interaction_name in self._X.columns:
-                    del self._X[interaction_name]
+            gc.collect()
 
         if self._verbose:
             print(f"\n  Added {len(added_interactions)} interactions")
