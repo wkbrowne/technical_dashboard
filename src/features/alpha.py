@@ -485,8 +485,9 @@ def add_alpha_momentum_features(
             continue
 
         df = indicators_by_symbol[sym]
-        for col_name, series in alpha_features.items():
-            df[col_name] = series
+        # Use pd.concat instead of repeated column insertion to avoid fragmentation
+        new_cols_df = pd.DataFrame(alpha_features, index=df.index)
+        indicators_by_symbol[sym] = pd.concat([df, new_cols_df], axis=1)
         added_count += 1
 
     logger.info(f"Alpha momentum features added for {added_count} symbols "

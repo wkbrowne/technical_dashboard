@@ -533,7 +533,7 @@ def compute_per_symbol_cs_features_parallel(
                 )
                 results.append((sym, features))
 
-    # Apply results to DataFrames
+    # Apply results to DataFrames using pd.concat to avoid fragmentation
     alpha_count = 0
     rs_count = 0
     for sym, features in results:
@@ -541,8 +541,9 @@ def compute_per_symbol_cs_features_parallel(
             continue
 
         df = indicators_by_symbol[sym]
-        for col_name, series in features.items():
-            df[col_name] = series
+        # Use pd.concat instead of repeated column insertion to avoid fragmentation
+        new_cols_df = pd.DataFrame(features, index=df.index)
+        indicators_by_symbol[sym] = pd.concat([df, new_cols_df], axis=1)
 
         # Count features
         if any('alpha' in col for col in features.keys()):

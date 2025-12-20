@@ -18,6 +18,8 @@ try:
     from .range_breakout import add_range_breakout_features
     from .volume import add_volume_features, add_volume_shock_features
     from .liquidity import add_liquidity_features
+    from .drawdown import add_drawdown_features
+    from .divergence import add_divergence_features
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.trend import add_trend_features, add_rsi_features, add_macd_features
@@ -26,6 +28,8 @@ except ImportError:
     from src.features.range_breakout import add_range_breakout_features
     from src.features.volume import add_volume_features, add_volume_shock_features
     from src.features.liquidity import add_liquidity_features
+    from src.features.drawdown import add_drawdown_features
+    from src.features.divergence import add_divergence_features
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,8 @@ def compute_single_stock_features(
     7. Range/breakout features (including ATR14)
     8. Volume features
     9. Volume shock features
+    10. Drawdown and recovery features
+    11. Divergence features (RSI-price, MACD-price, trend-momentum)
 
     Note: Cross-sectional volatility features (vol_regime_cs_median, vol_regime_rel)
     are NOT included here as they require data from multiple stocks. Use
@@ -177,6 +183,14 @@ def compute_single_stock_features(
     # 9) Liquidity and microstructure features
     logger.debug("Adding liquidity features")
     out = add_liquidity_features(out, windows=(5, 10, 20))
+
+    # 10) Drawdown and recovery features
+    logger.debug("Adding drawdown features")
+    out = add_drawdown_features(out, windows=(20, 60, 120), z_window=252)
+
+    # 11) Divergence features (requires RSI, MACD, trend features to exist)
+    logger.debug("Adding divergence features")
+    out = add_divergence_features(out, windows=(10, 20))
 
     logger.debug("Single-stock feature computation completed")
     return out
