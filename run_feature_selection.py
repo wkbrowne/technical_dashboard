@@ -98,8 +98,8 @@ def load_and_prepare_data(
         feature_file = 'artifacts/features_filtered.parquet'
         print(f"Loading filtered features from {feature_file}...")
     else:
-        feature_file = 'artifacts/features_daily.parquet'
-        print(f"Loading raw features from {feature_file}...")
+        feature_file = 'artifacts/features_complete.parquet'
+        print(f"Loading complete features from {feature_file}...")
 
     features = pd.read_parquet(feature_file)
     print(f"  Features shape: {features.shape}")
@@ -760,9 +760,9 @@ def main():
             "mean": round(sector_auc_mean, 6),
             "std": round(sector_auc_std, 6),
             "concentration_threshold": CONCENTRATION_THRESHOLD,
-            "concentration_warning": sector_auc_std > CONCENTRATION_THRESHOLD
+            "concentration_warning": bool(sector_auc_std > CONCENTRATION_THRESHOLD)
         }
-        sector_concentration_warning = sector_auc_std > CONCENTRATION_THRESHOLD
+        sector_concentration_warning = bool(sector_auc_std > CONCENTRATION_THRESHOLD)
 
     # Save selection_summary.json with complete results
     selection_summary = {

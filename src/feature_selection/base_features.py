@@ -100,129 +100,145 @@ TODO: Three most promising feature areas to explore next:
    sentiment exhaustion. Currently the model has no sentiment inputs.
 
 ================================================================================
-FEATURE SELECTION RESULTS SUMMARY (43 features, 0.70 AUC)
+FEATURE SELECTION RESULTS SUMMARY (53 features)
 ================================================================================
 
 TOP PERFORMING CATEGORIES (by # of features selected):
 
-1. MACRO/INTERMARKET (10 features) - 23% of model
+1. MACRO/INTERMARKET (16 features) - 30% of model
    Core signals: copper_gold_zscore, gold_spy_ratio_zscore, fred_ccsa_z52w, fred_dgs2_chg20d
-   Weekly: w_equity_bond_corr_60d, w_fred_bamlh0a0hym2_z60, w_cyclical_defensive_ratio
+   FRED: fred_bamlh0a0hym2_z60, fred_t10y2y_z60, w_fred_bamlh0a0hym2_z60, w_fred_icsa_z52w
+   Factor spreads: qqq_spy_cumret_20, qqq_spy_cumret_60, qqq_spy_slope_20
    VIX: vix_percentile_252d, vix_zscore_60d, w_vix_vxn_spread
+   Weekly: w_equity_bond_corr_60d, w_cyclical_defensive_ratio
    → Economic regime and credit conditions dominate
 
-2. RELATIVE PERFORMANCE (9 features) - 21% of model
-   Alpha: alpha_mom_qqq_20_ema10, alpha_mom_sector_20_ema10, w_alpha_mom_qqq_60_ema10, w_alpha_mom_spy_20_ema10
+2. RELATIVE PERFORMANCE (10 features) - 19% of model
+   Alpha: alpha_mom_qqq_20_ema10, alpha_mom_sector_20_ema10
+   Weekly alpha: w_alpha_mom_qqq_60_ema10, w_alpha_mom_sector_60_ema10, w_alpha_mom_spy_20_ema10
    Beta: w_beta_qqq
    Strength: rel_strength_sector, w_rel_strength_sector
    Cross-section: xsec_mom_20d_z, w_xsec_mom_4w_z
    → Stock vs market/sector differentiation crucial
 
-3. TREND STRENGTH (6 features) - 14% of model
+3. TREND STRENGTH (6 features) - 11% of model
    Core: trend_score_sign, trend_score_slope
    Slopes: pct_slope_ma_20, pct_slope_ma_100, w_pct_slope_ma_50
    MACD: w_macd_histogram
    → Multi-timeframe slope alignment is key signal
 
-4. PRICE POSITION (5 features) - 12% of model
+4. PRICE POSITION (5 features) - 9% of model
    Distance: pct_dist_ma_20_z, pct_dist_ma_50_z, relative_dist_20_50_z
    Range: pos_in_20d_range
-   Spread: qqq_spy_cumret_60
+   Drawdown: days_since_high_20d_norm
    → Mean reversion signals complement momentum
 
-5. VOLATILITY REGIME (4 features) - 9% of model
+5. VOLATILITY REGIME (4 features) - 8% of model
    Stock: atr_percent, vol_regime_ema10, rv_z_60
-   → Micro (stock) volatility matters
+   Compression: bb_width_20_2
+   → Micro (stock) volatility and squeeze detection matter
 
-6. VOLUME/LIQUIDITY (4 features) - 9% of model
+6. VOLUME/LIQUIDITY (4 features) - 8% of model
    VWAP: vwap_dist_5d_zscore, vwap_dist_20d_zscore
-   Volume: pv_divergence_5d, w_volshock_ema
+   Volume: w_volshock_ema
    Candlestick: upper_shadow_ratio
-   → VWAP distance and volume divergence useful
+   → VWAP distance useful; pv_divergence_5d dropped
 
-7. BREADTH (4 features) - 9% of model
+7. BREADTH (4 features) - 8% of model
    Daily: sector_breadth_ad_line, sector_breadth_mcclellan_osc, sector_breadth_pct_above_ma200
-   Interaction: sector_breadth_ad_line_x_pos_in_20d_range
+   Weekly: w_sector_breadth_mcclellan_osc
    → Sector breadth signals valuable
 
-8. MOMENTUM (1 feature) - 2% of model
-   Daily: rsi_14
-   → Simple RSI survives; weekly RSI not selected
+8. MOMENTUM / TREND QUALITY (4 features) - 8% of model
+   Daily: rsi_14, chop_14, di_minus_14
+   Gap: gap_atr_ratio_raw
+   → Trend quality filters complement momentum
 
 KEY INSIGHTS:
-1. Weekly features remain important - 12 of 43 features have w_ prefix (28%)
+1. Weekly features remain important - 16 of 53 features have w_ prefix (30%)
 2. Z-scores preferred for distance/volatility (pct_dist_ma_20_z, rv_z_60)
-3. Macro regime (FRED, intermarket ratios) provides strong signal
-4. Sector breadth proxy features prove valuable (4 selected)
+3. Macro regime (FRED, intermarket ratios) provides strong signal - expanded from V3
+4. Sector breadth proxy features prove valuable (4 selected, now includes weekly)
 5. Alpha momentum vs QQQ/sector more important than vs SPY directly
-6. One interaction feature selected: sector_breadth_ad_line_x_pos_in_20d_range
+6. Trend quality features (chop_14, di_minus_14) now selected
+7. Volatility compression (bb_width_20_2) captures squeeze setups
 """
 
 # =============================================================================
-# BASE FEATURES V3 - Selected via Loose-Tight pipeline (43 features, 0.70 AUC)
+# BASE FEATURES V4 - Selected via Loose-Tight pipeline (53 features)
 # =============================================================================
 # Features selected by forward selection with sector-stratified evaluation.
-# Run: python run_feature_selection.py (191.7 min runtime)
+# Run: python run_feature_selection.py
 
 BASE_FEATURES = [
-    # === RELATIVE PERFORMANCE / ALPHA (9 features) ===
-    "alpha_mom_qqq_20_ema10",    # Alpha vs QQQ (20d, smoothed)
-    "alpha_mom_sector_20_ema10", # Alpha vs sector (20d, smoothed)
-    "w_alpha_mom_qqq_60_ema10",  # Weekly alpha vs QQQ (60d)
-    "w_alpha_mom_spy_20_ema10",  # Weekly alpha vs SPY (20d)
-    "w_beta_qqq",                # Weekly beta to QQQ (growth sensitivity)
-    "rel_strength_sector",       # Relative strength vs sector
-    "w_rel_strength_sector",     # Weekly relative strength vs sector
-    "xsec_mom_20d_z",            # Cross-sectional momentum z-score
-    "w_xsec_mom_4w_z",           # Weekly cross-sectional z-score
+    # === RELATIVE PERFORMANCE / ALPHA (11 features) ===
+    "alpha_mom_qqq_20_ema10",      # Alpha vs QQQ (20d, smoothed)
+    "alpha_mom_sector_20_ema10",   # Alpha vs sector (20d, smoothed)
+    "w_alpha_mom_qqq_60_ema10",    # Weekly alpha vs QQQ (60d)
+    "w_alpha_mom_sector_60_ema10", # Weekly alpha vs sector (60d)
+    "w_alpha_mom_spy_20_ema10",    # Weekly alpha vs SPY (20d)
+    "w_beta_qqq",                  # Weekly beta to QQQ (growth sensitivity)
+    "rel_strength_sector",         # Relative strength vs sector
+    "w_rel_strength_sector",       # Weekly relative strength vs sector
+    "xsec_mom_20d_z",              # Cross-sectional momentum z-score
+    "w_xsec_mom_4w_z",             # Weekly cross-sectional z-score
 
-    # === MACRO / INTERMARKET (11 features) ===
-    "copper_gold_zscore",        # Copper/gold z-score (growth indicator)
-    "fred_ccsa_z52w",            # Continued claims z-score (labor market)
-    "fred_dgs2_chg20d",          # 2-year Treasury rate 20d change
-    "gold_spy_ratio_zscore",     # Gold/SPY z-score (risk-off)
-    "qqq_spy_cumret_60",         # QQQ-SPY cumulative return 60d (growth premium)
-    "vix_percentile_252d",       # VIX percentile (1-year lookback)
-    "vix_zscore_60d",            # VIX z-score (market fear)
-    "w_cyclical_defensive_ratio", # Weekly cyclical/defensive ratio
-    "w_equity_bond_corr_60d",    # Weekly equity-bond correlation
-    "w_fred_bamlh0a0hym2_z60",   # Weekly high yield spread z-score
-    "w_vix_vxn_spread",          # Weekly VIX-VXN spread (tech vs broad)
+    # === MACRO / INTERMARKET (14 features) ===
+    "copper_gold_zscore",          # Copper/gold z-score (growth indicator)
+    "fred_bamlh0a0hym2_z60",       # High yield spread z-score (daily)
+    "fred_ccsa_z52w",              # Continued claims z-score (labor market)
+    "fred_dgs2_chg20d",            # 2-year Treasury rate 20d change
+    "fred_t10y2y_z60",             # 10Y-2Y yield curve z-score
+    "gold_spy_ratio_zscore",       # Gold/SPY z-score (risk-off)
+    "qqq_spy_cumret_20",           # QQQ-SPY cumulative return 20d
+    "qqq_spy_cumret_60",           # QQQ-SPY cumulative return 60d (growth premium)
+    "qqq_spy_slope_20",            # QQQ-SPY slope 20d
+    "vix_percentile_252d",         # VIX percentile (1-year lookback)
+    "vix_zscore_60d",              # VIX z-score (market fear)
+    "w_cyclical_defensive_ratio",  # Weekly cyclical/defensive ratio
+    "w_equity_bond_corr_60d",      # Weekly equity-bond correlation
+    "w_fred_bamlh0a0hym2_z60",     # Weekly high yield spread z-score
+    "w_fred_icsa_z52w",            # Weekly initial claims z-score
+    "w_vix_vxn_spread",            # Weekly VIX-VXN spread (tech vs broad)
 
     # === TREND STRENGTH (6 features) ===
-    "pct_slope_ma_20",           # Short-term trend direction
-    "pct_slope_ma_100",          # Medium-term trend direction
-    "w_pct_slope_ma_50",         # Weekly trend slope (50-week MA)
-    "trend_score_sign",          # Multi-MA alignment (+1/-1 per MA)
-    "trend_score_slope",         # Trend slope composite
-    "w_macd_histogram",          # Weekly MACD histogram
+    "pct_slope_ma_20",             # Short-term trend direction
+    "pct_slope_ma_100",            # Medium-term trend direction
+    "w_pct_slope_ma_50",           # Weekly trend slope (50-week MA)
+    "trend_score_sign",            # Multi-MA alignment (+1/-1 per MA)
+    "trend_score_slope",           # Trend slope composite
+    "w_macd_histogram",            # Weekly MACD histogram
 
-    # === PRICE POSITION / MEAN REVERSION (4 features) ===
-    "pct_dist_ma_20_z",          # Z-scored distance from 20d MA
-    "pct_dist_ma_50_z",          # Z-scored distance from 50d MA
-    "pos_in_20d_range",          # Position in 20d range (0-1)
-    "relative_dist_20_50_z",     # Relative position between 20/50 MAs
+    # === PRICE POSITION / MEAN REVERSION (5 features) ===
+    "days_since_high_20d_norm",    # Days since 20d high (normalized)
+    "pct_dist_ma_20_z",            # Z-scored distance from 20d MA
+    "pct_dist_ma_50_z",            # Z-scored distance from 50d MA
+    "pos_in_20d_range",            # Position in 20d range (0-1)
+    "relative_dist_20_50_z",       # Relative position between 20/50 MAs
 
-    # === VOLATILITY / REGIME (3 features) ===
-    "atr_percent",               # Normalized ATR (REQUIRED for targets)
-    "rv_z_60",                   # Realized vol z-score (60d)
-    "vol_regime_ema10",          # Smoothed vol regime
+    # === VOLATILITY / REGIME (5 features) ===
+    "atr_percent",                 # Normalized ATR (REQUIRED for targets)
+    "bb_width_20_2",               # Bollinger Bandwidth (volatility compression)
+    "rv_z_60",                     # Realized vol z-score (60d)
+    "vol_regime_ema10",            # Smoothed vol regime
 
     # === SECTOR BREADTH (4 features) ===
-    "sector_breadth_ad_line",                       # Cumulative A/D line
-    "sector_breadth_ad_line_x_pos_in_20d_range",    # Interaction: breadth × range position
-    "sector_breadth_mcclellan_osc",                 # McClellan oscillator (fast breadth)
-    "sector_breadth_pct_above_ma200",               # % sectors above 200d MA
+    "sector_breadth_ad_line",          # Cumulative A/D line
+    "sector_breadth_mcclellan_osc",    # McClellan oscillator (fast breadth)
+    "sector_breadth_pct_above_ma200",  # % sectors above 200d MA
+    "w_sector_breadth_mcclellan_osc",  # Weekly McClellan oscillator
 
-    # === VOLUME / LIQUIDITY (5 features) ===
-    "pv_divergence_5d",          # Price-volume divergence (5d)
-    "upper_shadow_ratio",        # Selling pressure (candlestick)
-    "vwap_dist_5d_zscore",       # Z-scored distance from 5d VWAP
-    "vwap_dist_20d_zscore",      # Z-scored distance from 20d VWAP
-    "w_volshock_ema",            # Weekly volume shock indicator
+    # === VOLUME / LIQUIDITY (4 features) ===
+    "upper_shadow_ratio",          # Selling pressure (candlestick)
+    "vwap_dist_5d_zscore",         # Z-scored distance from 5d VWAP
+    "vwap_dist_20d_zscore",        # Z-scored distance from 20d VWAP
+    "w_volshock_ema",              # Weekly volume shock indicator
 
-    # === MOMENTUM (1 feature) ===
-    "rsi_14",                    # Daily RSI (14-period)
+    # === MOMENTUM / TREND QUALITY (4 features) ===
+    "chop_14",                     # Choppiness Index (trend quality filter)
+    "di_minus_14",                 # -DI (Negative Directional Indicator)
+    "gap_atr_ratio_raw",           # Gap size in ATR units
+    "rsi_14",                      # Daily RSI (14-period)
 ]
 
 # Feature categories for reference (updated to match config/features.yaml)
@@ -244,6 +260,11 @@ FEATURE_CATEGORIES = {
         "macd_histogram",
         "w_macd_histogram",
         "macd_hist_deriv_ema3",
+        # NEW: Trend quality / chop filter
+        "chop_14",               # Choppiness Index [0-100] - high = choppy, low = trending
+        "adx_14",                # ADX - trend strength [0-100]
+        "di_plus_14",            # +DI (Positive Directional Indicator)
+        "di_minus_14",           # -DI (Negative Directional Indicator)
     ],
     "volatility": [
         "vol_regime",
@@ -253,6 +274,15 @@ FEATURE_CATEGORIES = {
         "rvol_20",
         "w_rv60_slope_norm",
         "w_rv100_slope_norm",
+        # NEW: Volatility compression / squeeze
+        "bb_width_20_2",         # Bollinger Bandwidth (20, 2)
+        "bb_width_20_2_z60",     # Z-score of BB width over 60d
+        "squeeze_on_20",         # 1 if BB inside KC(1.5), else 0
+        "squeeze_on_wide_20",    # 1 if BB inside KC(2.0), else 0
+        "squeeze_intensity_20",  # Compression intensity [-1, 1]
+        "squeeze_release_20",    # 1 on squeeze release transition
+        "days_in_squeeze_20",    # Consecutive days in squeeze (capped 50)
+        "atr_percent_chg_5",     # 5-day percent change in ATR%
     ],
     "price_position": [
         "pct_dist_ma_20",
@@ -273,6 +303,10 @@ FEATURE_CATEGORIES = {
         "breakout_up_10d",
         "breakout_up_20d",
         "range_expansion_20d",
+        # NEW: Gap/overnight features
+        "overnight_ret",         # Overnight return = open / prev_close - 1
+        "gap_atr_ratio_raw",     # Gap size in ATR units (raw ATR, not %)
+        "gap_fill_frac",         # Gap fill fraction (0-1)
     ],
     "volume": [
         "obv_z_60",
@@ -477,8 +511,8 @@ EXPANSION_CANDIDATES = {
         "w_relative_dist_20_50_z",
     ],
 
-    # --- Alpha Momentum (8) ---
-    # Longer windows and combo variants
+    # --- Alpha Momentum (6) ---
+    # Longer windows and combo variants (w_alpha_mom_sector_60_ema10 promoted to BASE)
     "alpha_momentum": [
         "alpha_mom_spy_60_ema10",
         "alpha_mom_spy_120_ema10",
@@ -487,15 +521,12 @@ EXPANSION_CANDIDATES = {
         "alpha_mom_combo_20_ema10",
         "alpha_mom_combo_60_ema10",
         "w_alpha_mom_spy_60_ema10",
-        "w_alpha_mom_sector_60_ema10",
     ],
 
-    # --- Factor Spreads (10) ---
-    # RSP and bestmatch spreads for breadth/sector signals
+    # --- Factor Spreads (7) ---
+    # RSP and bestmatch spreads (qqq_spy_cumret_20, qqq_spy_slope_20 promoted to BASE)
     "factor_spreads": [
-        "qqq_spy_cumret_20",
         "qqq_spy_zscore_60",
-        "qqq_spy_slope_20",
         "rsp_spy_cumret_20",
         "rsp_spy_cumret_60",
         "rsp_spy_zscore_60",
@@ -531,27 +562,24 @@ EXPANSION_CANDIDATES = {
         "w_xsec_pct_4w",
     ],
 
-    # --- Sector ETF Breadth Proxy (4) ---
+    # --- Sector ETF Breadth Proxy (3) ---
+    # w_sector_breadth_mcclellan_osc promoted to BASE
     "sector_breadth": [
         "sector_breadth_pct_above_ma50",
         "w_sector_breadth_pct_above_ma10",
         "w_sector_breadth_pct_above_ma40",
-        "w_sector_breadth_mcclellan_osc",
     ],
 
-    # --- Macro (FRED) (12) ---
-    # Focus on features not yet selected but potentially useful
+    # --- Macro (FRED) (8) ---
+    # fred_bamlh0a0hym2_z60, fred_t10y2y_z60, w_fred_icsa_z52w promoted to BASE
     "macro_fred": [
-        "fred_bamlh0a0hym2_z60",
         "fred_dgs10_chg20d",
         "fred_dgs10_z60",
-        "fred_t10y2y_z60",
         "fred_nfci_z52w",
         "fred_icsa_z52w",
         "fred_ccsa_chg4w",
         "w_fred_dgs10_z60",
         "w_fred_t10y2y_z60",
-        "w_fred_icsa_z52w",
         "w_fred_ccsa_z52w",
         "w_fred_nfci_chg4w",
     ],
@@ -564,8 +592,8 @@ EXPANSION_CANDIDATES = {
         "w_yield_curve_zscore",
     ],
 
-    # --- Drawdown & Recovery (22) ---
-    # NEW: Depth and duration of drawdowns, recovery dynamics
+    # --- Drawdown & Recovery (24) ---
+    # days_since_high_20d_norm promoted to BASE
     "drawdown_recovery": [
         "drawdown_20d",
         "drawdown_60d",
@@ -574,7 +602,6 @@ EXPANSION_CANDIDATES = {
         "drawdown_20d_z",
         "drawdown_60d_z",
         "drawdown_120d_z",
-        "days_since_high_20d_norm",
         "days_since_high_60d_norm",
         "days_since_high_120d_norm",
         "recovery_20d",
@@ -595,9 +622,31 @@ EXPANSION_CANDIDATES = {
         "w_drawdown_velocity_60d",
     ],
 
-    # --- Gap features (1) ---
+    # --- Gap and overnight features (4) ---
+    # gap_atr_ratio_raw promoted to BASE
     "gaps": [
         "gap_atr_ratio",
+        "overnight_ret",
+        "gap_fill_frac",
+        "atr_percent_chg_5",
+    ],
+
+    # --- Trend quality / chop filter (2) ---
+    # chop_14, di_minus_14 promoted to BASE
+    "trend_quality": [
+        "adx_14",
+        "di_plus_14",
+    ],
+
+    # --- Volatility compression / squeeze (6) ---
+    # bb_width_20_2 promoted to BASE
+    "volatility_squeeze": [
+        "bb_width_20_2_z60",
+        "squeeze_on_20",
+        "squeeze_on_wide_20",
+        "squeeze_intensity_20",
+        "squeeze_release_20",
+        "days_in_squeeze_20",
     ],
 
     # --- Divergence features (12) ---
@@ -620,6 +669,12 @@ EXPANSION_CANDIDATES = {
         # Weekly versions
         "w_rsi_price_div_20d",
         "w_macd_price_div_20d",
+    ],
+
+    # --- Volume / Liquidity (1) ---
+    # Rejected from BASE_FEATURES V4
+    "volume_liquidity": [
+        "pv_divergence_5d",
     ],
 }
 
@@ -784,6 +839,274 @@ EXCLUDED_FEATURES = [
 ]
 
 
+# =============================================================================
+# RETIRED FEATURES - Features to optionally exclude from computation
+# =============================================================================
+# These features are NOT used for ML, NOT used as intermediates, and can be
+# safely skipped during computation when --exclude-retired is enabled.
+# Organized by module to enable module-level skipping.
+
+RETIRED_FEATURES_BY_MODULE = {
+    # --- trend.py: Momentum derivatives ---
+    "trend": [
+        "macd_hist_deriv_ema3",       # Daily MACD derivative doesn't add value
+        "w_macd_hist_deriv_ema3",     # Weekly MACD derivative
+        "rsi_21",                     # rsi_14 is sufficient
+        "rsi_30",                     # rsi_14 is sufficient
+        "w_rsi_14",                   # Weekly RSI not selected
+        "w_rsi_21",                   # Weekly RSI not selected
+        "trend_score_granular",       # trend_score_sign/slope sufficient
+        "w_trend_score_granular",
+        "trend_persist_ema",          # Not selected
+        "w_trend_persist_ema",
+        "quiet_trend",                # Interaction not selected
+        "w_quiet_trend",
+        "trend_alignment",            # Not selected
+        "w_trend_alignment",
+        # Intermediate slopes (only 20/100/w_50 matter)
+        "pct_slope_ma_10",
+        "pct_slope_ma_30",
+        "pct_slope_ma_50",
+        "pct_slope_ma_75",
+        "pct_slope_ma_150",
+        "pct_slope_ma_200",
+        "w_pct_slope_ma_10",
+        "w_pct_slope_ma_20",
+        "w_pct_slope_ma_30",
+        "w_pct_slope_ma_75",
+        "w_pct_slope_ma_100",
+        "w_pct_slope_ma_150",
+        "w_pct_slope_ma_200",
+        "w_trend_score_slope",
+    ],
+
+    # --- range_breakout.py: Breakout signals ---
+    "range_breakout": [
+        "breakout_up_5d",             # pos_in_20d_range captures signal better
+        "breakout_up_10d",
+        "breakout_up_20d",
+        "breakout_dn_5d",
+        "breakout_dn_10d",
+        "breakout_dn_20d",
+        "w_breakout_up_5d",
+        "w_breakout_up_10d",
+        "w_breakout_up_20d",
+        "w_breakout_dn_5d",
+        "w_breakout_dn_10d",
+        "w_breakout_dn_20d",
+        "range_expansion_5d",
+        "range_expansion_10d",
+        "range_expansion_20d",
+        "w_range_expansion_5d",
+        "w_range_expansion_10d",
+        "w_range_expansion_20d",
+        "range_z_5d",
+        "range_z_10d",
+        "range_z_20d",
+        "w_range_z_5d",
+        "w_range_z_10d",
+        "w_range_z_20d",
+        "pos_in_5d_range",
+        "pos_in_10d_range",
+        "w_pos_in_5d_range",
+        "w_pos_in_10d_range",
+        "w_pos_in_20d_range",
+    ],
+
+    # --- volatility.py: Volatility extras ---
+    "volatility": [
+        "vol_regime",                 # Use ema10 version
+        "rv_ratio_10_60",
+        "rv_ratio_20_100",
+        "vol_z_20",
+        "vol_z_60",
+        "rvol_20",
+        "w_rvol_20",
+        "vol_regime_cs_median",
+        "vol_regime_rel",
+        "w_rv_z_60",
+        "w_vol_z_60",
+        "w_vol_regime",
+        "w_vol_regime_ema10",
+        "w_vol_regime_rel",
+        "rv60_slope_norm",
+        "rv100_slope_norm",
+        "w_rv60_slope_norm",
+        "w_rv100_slope_norm",
+    ],
+
+    # --- volume.py: Volume extras ---
+    "volume": [
+        "obv_z_60",
+        "w_obv_z_60",
+        "volshock_z",
+        "volshock_dir",
+        "w_volshock_z",
+        "w_volshock_dir",
+        "rdollar_vol_20",
+        "w_rdollar_vol_20",
+    ],
+
+    # --- liquidity.py: Liquidity extras ---
+    "liquidity": [
+        "vwap_dist_10d_zscore",
+        "w_vwap_dist_20d_zscore",
+        "lower_shadow_ratio",
+        "overnight_ratio",
+        "range_efficiency",
+        "w_range_efficiency",
+        "amihud_illiq_ratio",
+        "rel_volume_5d",
+        "rel_volume_10d",
+        "rel_volume_20d",
+        "w_rel_volume_5d",
+        "w_rel_volume_10d",
+        "w_rel_volume_20d",
+        "volume_direction",
+        "volume_trend_10d",
+        "illiquidity_score",
+        "w_illiquidity_score",
+    ],
+
+    # --- alpha/cross_sectional.py: Factor betas ---
+    "alpha": [
+        "beta_market",                # Daily factor betas (only w_beta_qqq useful)
+        "beta_qqq",
+        "beta_bestmatch",
+        "beta_breadth",
+        "beta_spy_simple",
+        "beta_qqq_simple",
+        "beta_sector",
+        "residual_cumret",
+        "residual_vol",
+        "residual_mean",
+        # Weekly factor betas except w_beta_qqq
+        "w_beta_market",
+        "w_beta_bestmatch",
+        "w_beta_breadth",
+        "w_beta_spy_simple",
+        "w_beta_qqq_simple",
+        "w_residual_cumret",
+        "w_residual_vol",
+    ],
+
+    # --- macro.py: VIX/macro extras ---
+    "macro": [
+        "vix_ma20_ratio",
+        "vix_vxn_spread",             # Daily; weekly version selected
+        "vix_change_5d",
+        "vix_change_20d",
+        "vix_regime",
+        "w_vix_percentile_52w",
+        "w_vix_zscore_12w",
+        "w_vix_regime",
+        "w_vix_ma4_ratio",
+        "w_vix_change_4w",
+        "w_vxn_percentile_252d",
+    ],
+
+    # --- spread_features.py: Intermarket extras ---
+    "spread_features": [
+        "copper_gold_ratio",
+        "w_copper_gold_ratio",
+        "gold_spy_ratio",
+        "w_gold_spy_ratio",
+        "cyclical_defensive_ratio",   # Daily; weekly version selected
+        "financials_utilities_ratio",
+        "w_financials_utilities_ratio",
+        "tech_spy_ratio",
+        "w_tech_spy_ratio",
+        "oil_momentum_20d",
+        "dollar_momentum_20d",
+        "w_dollar_momentum_20d",
+        "dollar_percentile_252d",
+    ],
+}
+
+# Flatten for easy lookup
+RETIRED_FEATURES: set = set()
+for module_features in RETIRED_FEATURES_BY_MODULE.values():
+    RETIRED_FEATURES.update(module_features)
+
+
+# =============================================================================
+# INTERMEDIATE FEATURES - Required for derived features but not for ML output
+# =============================================================================
+# These are computed to derive kept features but should NOT appear in output.
+# Example: atr14 is needed for atr_percent, ma_20 is needed for pct_dist_ma_20_z
+
+INTERMEDIATE_FEATURES = {
+    # Raw moving averages (needed for slopes, distances, trend scores)
+    "ma_10", "ma_20", "ma_30", "ma_50", "ma_75", "ma_100", "ma_150", "ma_200",
+    "w_ma_10", "w_ma_20", "w_ma_30", "w_ma_50", "w_ma_75", "w_ma_100", "w_ma_150", "w_ma_200",
+    # Raw ATR (needed for atr_percent, gap_atr_ratio)
+    "atr14", "w_atr14",
+    # Raw ranges (needed for pos_in_range, range_z)
+    "5d_high", "5d_low", "10d_high", "10d_low", "20d_high", "20d_low",
+    "5d_range", "10d_range", "20d_range",
+    # Raw realized volatility (needed for rv_z, vol_regime)
+    "rv_10", "rv_20", "rv_60", "rv_100",
+    # Raw OHLCV
+    "open", "high", "low", "close", "adjclose", "volume",
+    # Sign columns for trend scores
+    "sign_ma_10", "sign_ma_20", "sign_ma_30", "sign_ma_50",
+    "sign_ma_75", "sign_ma_100", "sign_ma_150", "sign_ma_200",
+    # Raw distances (z-scored versions are kept)
+    "pct_dist_ma_20", "pct_dist_ma_50", "pct_dist_ma_100", "pct_dist_ma_200",
+    # Breadth intermediates
+    "sector_breadth_adv", "sector_breadth_dec", "sector_breadth_net_adv",
+    "w_sector_breadth_adv", "w_sector_breadth_dec", "w_sector_breadth_net_adv",
+}
+
+
+# =============================================================================
+# FEATURE DEPENDENCIES - Maps derived features to their required intermediates
+# =============================================================================
+# Used by the feature planner to ensure intermediates are computed when needed.
+
+FEATURE_DEPENDENCIES = {
+    # Volatility features
+    "atr_percent": {"atr14"},
+    "vol_regime": {"rv_20", "rv_100"},
+    "vol_regime_ema10": {"vol_regime", "rv_20", "rv_100"},
+    "rv_z_60": {"rv_20"},
+    # Trend features
+    "trend_score_sign": {"sign_ma_10", "sign_ma_20", "sign_ma_30", "sign_ma_50",
+                         "sign_ma_75", "sign_ma_100", "sign_ma_150", "sign_ma_200"},
+    "trend_score_slope": {"trend_score_granular"},
+    "pct_slope_ma_20": {"ma_20"},
+    "pct_slope_ma_100": {"ma_100"},
+    # Distance features
+    "pct_dist_ma_20_z": {"pct_dist_ma_20", "ma_20"},
+    "pct_dist_ma_50_z": {"pct_dist_ma_50", "ma_50"},
+    "relative_dist_20_50_z": {"ma_20", "ma_50"},
+    # Range features
+    "pos_in_20d_range": {"20d_high", "20d_low"},
+    # Gap features
+    "gap_atr_ratio": {"atr_percent"},
+}
+
+
+def get_retired_features() -> set:
+    """Return the set of retired feature names."""
+    return RETIRED_FEATURES.copy()
+
+
+def get_retired_features_by_module() -> dict:
+    """Return retired features organized by module."""
+    return {k: v.copy() for k, v in RETIRED_FEATURES_BY_MODULE.items()}
+
+
+def get_intermediate_features() -> set:
+    """Return the set of intermediate feature names (needed for derivations)."""
+    return INTERMEDIATE_FEATURES.copy()
+
+
+def get_feature_dependencies() -> dict:
+    """Return the feature dependency map."""
+    return {k: v.copy() for k, v in FEATURE_DEPENDENCIES.items()}
+
+
 def get_base_features():
     """Return the list of base features for forward selection."""
     return BASE_FEATURES.copy()
@@ -881,30 +1204,112 @@ def get_output_features():
     return output_features
 
 
-def filter_output_columns(df, keep_all=False):
+def filter_output_columns(df, keep_all=False, exclude_retired=False):
     """
     Filter DataFrame columns to only include curated output features.
 
     Args:
         df: DataFrame with computed features
-        keep_all: If True, return all columns (no filtering)
+        keep_all: If True, return all columns (no filtering for curated set)
+        exclude_retired: If True, also exclude retired features even when keep_all=True
 
     Returns:
         DataFrame with filtered columns
     """
-    if keep_all:
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if keep_all and not exclude_retired:
         return df
 
-    output_features = get_output_features()
+    # Start with all columns
+    cols_to_keep = set(df.columns)
+    retired_removed = 0
 
-    # Keep columns that are in our output set
-    keep_cols = [c for c in df.columns if c in output_features]
+    # Remove retired features if requested
+    if exclude_retired:
+        retired = get_retired_features()
+        retired_in_df = cols_to_keep & retired
+        retired_removed = len(retired_in_df)
+        cols_to_keep -= retired_in_df
+        if retired_removed > 0:
+            logger.info(f"Excluded {retired_removed} retired features from output")
+
+    # If not keep_all, filter to curated output set
+    if not keep_all:
+        output_features = get_output_features()
+        cols_to_keep &= output_features
+
+    # Keep columns in original order
+    keep_cols = [c for c in df.columns if c in cols_to_keep]
 
     # Log what we're filtering
     filtered_count = len(df.columns) - len(keep_cols)
     if filtered_count > 0:
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.debug(f"Filtered {filtered_count} intermediate columns, keeping {len(keep_cols)}")
+        logger.debug(f"Filtered {filtered_count} columns (including {retired_removed} retired), keeping {len(keep_cols)}")
 
     return df[keep_cols]
+
+
+def drop_retired_columns(df, inplace=False):
+    """
+    Drop retired feature columns from a DataFrame.
+
+    Args:
+        df: DataFrame with computed features
+        inplace: If True, modify DataFrame in place
+
+    Returns:
+        DataFrame with retired columns removed (or None if inplace=True)
+    """
+    retired = get_retired_features()
+    cols_to_drop = [c for c in df.columns if c in retired]
+
+    if cols_to_drop:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"Dropping {len(cols_to_drop)} retired columns")
+
+        if inplace:
+            df.drop(columns=cols_to_drop, inplace=True)
+            return None
+        else:
+            return df.drop(columns=cols_to_drop)
+
+    return df if not inplace else None
+
+
+def get_feature_exclusion_report(
+    computed_features: set,
+    exclude_retired: bool = False
+) -> dict:
+    """
+    Generate a report of what features were/would be excluded.
+
+    Args:
+        computed_features: Set of feature names that were computed
+        exclude_retired: Whether retired features were excluded
+
+    Returns:
+        Dictionary with exclusion statistics
+    """
+    output_features = get_output_features()
+    retired = get_retired_features() if exclude_retired else set()
+    intermediate = get_intermediate_features()
+
+    # Categorize computed features
+    kept_output = computed_features & output_features
+    kept_intermediate = computed_features & intermediate
+    excluded_retired = computed_features & retired if exclude_retired else set()
+
+    # Features that were computed but aren't in any category
+    other = computed_features - output_features - intermediate - retired
+
+    return {
+        "total_computed": len(computed_features),
+        "kept_output": len(kept_output),
+        "kept_intermediate": len(kept_intermediate),
+        "excluded_retired": len(excluded_retired),
+        "other": len(other),
+        "retired_list": sorted(excluded_retired) if exclude_retired else [],
+    }
