@@ -322,20 +322,24 @@ def run_single_model_selection(
     )
 
     # Align sample weights with X for pipeline
-    # sample_weight should be pre-aligned to X (same length, matching rows)
-    # Just reset index to match X's positional index for pipeline compatibility
+    # sample_weight must have same index as X for boolean masking in evaluation
     sample_weight_aligned = None
     if sample_weight is not None:
         if len(sample_weight) == len(X_subset):
-            # Already aligned - reset index to match X
-            sample_weight_aligned = sample_weight.reset_index(drop=True)
+            # Already aligned in length - set index to match X's index
+            sample_weight_aligned = sample_weight.copy()
+            sample_weight_aligned.index = X_subset.index
         else:
-            # Try to align by index (for external callers)
+            # Length mismatch - try to align or create uniform weights
             try:
                 sample_weight_aligned = sample_weight.loc[X_subset.index]
-            except KeyError:
-                # Fallback: assume same order, truncate/extend as needed
-                sample_weight_aligned = sample_weight.iloc[:len(X_subset)].reset_index(drop=True)
+            except (KeyError, TypeError):
+                # Fallback: create uniform weights with correct index
+                # This handles cases where sample_weight has different length/index
+                sample_weight_aligned = pd.Series(
+                    np.ones(len(X_subset)),
+                    index=X_subset.index
+                )
 
     # Run pipeline
     pipeline.run(X_subset, y, verbose=verbose, sample_weight=sample_weight_aligned)
