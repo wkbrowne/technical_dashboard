@@ -123,15 +123,25 @@ def compute_scale_pos_weight(y: pd.Series) -> float:
 
 def load_training_data(
     selected_features: list[str],
-    min_samples_per_symbol: int = 5
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    min_samples_per_symbol: int = 5,
+    use_sample_weights: bool = True
+) -> tuple[pd.DataFrame, pd.Series, np.ndarray | None, pd.DataFrame]:
     """Load and prepare training data.
 
+    Args:
+        selected_features: List of feature column names to use
+        min_samples_per_symbol: Minimum samples required per symbol
+        use_sample_weights: Whether to load and return sample weights
+
     Returns:
-        Tuple of (X, y, metadata) where metadata contains symbol, date for predictions.
+        Tuple of (X, y, sample_weight, metadata)
+        - X: Feature DataFrame
+        - y: Binary target Series
+        - sample_weight: Sample weights array (or None if disabled)
+        - metadata: DataFrame with symbol, date, entry_px, etc.
     """
     print("Loading features...")
-    features = pd.read_parquet('artifacts/features_daily.parquet')
+    features = pd.read_parquet('artifacts/features_complete.parquet')
     print(f"  Features shape: {features.shape}")
 
     print("Loading targets...")
@@ -143,7 +153,7 @@ def load_training_data(
         't0': 'date',
         'top': 'target_price',
         'bot': 'stop_price',
-        'entry_px': 'close'
+        'entry_px': 'entry_price'
     })
 
     # Filter symbols with enough samples
@@ -153,14 +163,19 @@ def load_training_data(
     features = features[features['symbol'].isin(valid_symbols)].copy()
     targets = targets[targets['symbol'].isin(valid_symbols)].copy()
 
+    # Columns to merge from targets
+    target_cols = ['symbol', 'date', 'hit', 'entry_price', 'target_price', 'stop_price']
+    if use_sample_weights and 'weight_final' in targets.columns:
+        target_cols.append('weight_final')
+
     # Merge features with targets
     merged = features.merge(
-        targets[['symbol', 'date', 'hit', 'target_price', 'stop_price']],
+        targets[target_cols],
         on=['symbol', 'date'],
         how='inner'
     )
 
-    # Binary target (exclude neutral)
+    # Binary target (exclude neutral hit=0)
     merged = merged[merged['hit'] != 0].copy()
     merged['target'] = (merged['hit'] == 1).astype(int)
 
@@ -179,8 +194,17 @@ def load_training_data(
     X = merged[available_features].copy()
     y = merged['target'].copy()
 
+    # Sample weights
+    sample_weight = None
+    if use_sample_weights and 'weight_final' in merged.columns:
+        sample_weight = merged['weight_final'].values
+        print(f"  Sample weights: min={sample_weight.min():.3f}, max={sample_weight.max():.3f}, mean={sample_weight.mean():.3f}")
+    elif use_sample_weights:
+        print("  Warning: Sample weights requested but 'weight_final' not in targets")
+
     # Metadata for later use
-    metadata = merged[['symbol', 'date', 'close', 'target_price', 'stop_price', 'hit']].copy()
+    metadata_cols = ['symbol', 'date', 'entry_price', 'target_price', 'stop_price', 'hit']
+    metadata = merged[metadata_cols].copy()
 
     print(f"\nTraining data:")
     print(f"  Samples: {len(X):,}")
@@ -191,7 +215,7 @@ def load_training_data(
     del features, targets, merged
     gc.collect()
 
-    return X, y, metadata
+    return X, y, sample_weight, metadata
 
 
 def train_production_model(
@@ -199,7 +223,8 @@ def train_production_model(
     y: pd.Series,
     params: dict,
     n_jobs: int = 8,
-    scale_pos_weight: float = None
+    sample_weight: np.ndarray | None = None,
+    scale_pos_weight: float | None = None
 ) -> lgb.LGBMClassifier:
     """Train the production model on all data.
 
@@ -208,6 +233,7 @@ def train_production_model(
         y: Target vector
         params: LightGBM hyperparameters
         n_jobs: Number of threads
+        sample_weight: Per-sample weights from triple barrier overlap inverse
         scale_pos_weight: Class weight for balancing (n_neg/n_pos). None for no weighting.
 
     Returns:
@@ -239,9 +265,13 @@ def train_production_model(
     # Handle NaN
     X_clean = X.fillna(0).replace([np.inf, -np.inf], 0)
 
-    # Train
+    # Train with sample weights
     model = lgb.LGBMClassifier(**full_params)
-    model.fit(X_clean, y)
+    if sample_weight is not None:
+        print(f"  Using sample weights (overlap inverse)")
+        model.fit(X_clean, y, sample_weight=sample_weight)
+    else:
+        model.fit(X_clean, y)
 
     # Evaluate on training data (sanity check)
     y_pred = model.predict_proba(X_clean)[:, 1]
@@ -309,6 +339,7 @@ def save_model_artifacts(
         'date_range': train_metrics['date_range'],
         'balanced': train_metrics.get('balanced', False),
         'scale_pos_weight': train_metrics.get('scale_pos_weight'),
+        'sample_weights_used': train_metrics.get('sample_weights_used', False),
     }
 
     metadata_file = output_dir / 'model_metadata.json'
@@ -327,9 +358,12 @@ def main():
                         help='Use class weights for balanced training (auto if hyperopt used --balanced)')
     parser.add_argument('--no-balanced', action='store_true',
                         help='Force disable balanced training even if hyperopt used it')
+    parser.add_argument('--no-sample-weights', action='store_true',
+                        help='Disable sample weights from triple barrier overlap inverse')
 
     args = parser.parse_args()
     output_dir = Path(args.output_dir)
+    use_sample_weights = not args.no_sample_weights
 
     print("=" * 60)
     print("Production Model Training")
@@ -344,7 +378,10 @@ def main():
     params, hyperopt_balanced, hyperopt_scale_pos_weight = load_best_params()
 
     # Load data
-    X, y, metadata = load_training_data(selected_features)
+    X, y, sample_weight, metadata = load_training_data(
+        selected_features,
+        use_sample_weights=use_sample_weights
+    )
 
     # Determine whether to use balanced training
     # Priority: --no-balanced > --balanced > hyperopt setting
@@ -367,7 +404,12 @@ def main():
         print("\n  Balanced training: disabled")
 
     # Train model
-    model = train_production_model(X, y, params, n_jobs=args.n_jobs, scale_pos_weight=scale_pos_weight)
+    model = train_production_model(
+        X, y, params,
+        n_jobs=args.n_jobs,
+        sample_weight=sample_weight,
+        scale_pos_weight=scale_pos_weight
+    )
 
     # Calculate metrics for metadata
     X_clean = X.fillna(0).replace([np.inf, -np.inf], 0)
@@ -377,10 +419,11 @@ def main():
         'train_auc': roc_auc_score(y, y_pred),
         'train_aupr': average_precision_score(y, y_pred),
         'n_samples': len(y),
-        'positive_rate': y.mean(),
+        'positive_rate': float(y.mean()),
         'date_range': [str(metadata['date'].min()), str(metadata['date'].max())],
         'balanced': scale_pos_weight is not None,
         'scale_pos_weight': scale_pos_weight,
+        'sample_weights_used': sample_weight is not None,
     }
 
     # Save artifacts

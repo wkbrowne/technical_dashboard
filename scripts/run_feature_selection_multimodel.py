@@ -641,8 +641,20 @@ Examples:
     parser.add_argument(
         '--n-jobs',
         type=int,
-        default=8,
-        help='Number of parallel workers'
+        default=-1,
+        help='Number of parallel workers (-1 = auto-detect CPU count, default)'
+    )
+    parser.add_argument(
+        '--max-swaps',
+        type=int,
+        default=50,
+        help='Maximum swap iterations for feature refinement (50=quick, 300-500=production)'
+    )
+    parser.add_argument(
+        '--num-threads',
+        type=int,
+        default=1,
+        help='Threads per LightGBM model (default: 1). Total CPU = n_jobs * num_threads'
     )
     parser.add_argument(
         '--quiet',
@@ -716,6 +728,23 @@ Examples:
         min_train_samples=1000,
     )
 
+    # Auto-detect CPU count if n_jobs=-1
+    n_jobs = args.n_jobs
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 8
+    num_threads = args.num_threads
+    if verbose:
+        print(f"Parallelism: n_jobs={n_jobs}, num_threads={num_threads} (CPU count: {os.cpu_count()})")
+
+    # Create model config with num_threads
+    model_config = ModelConfig(
+        model_type=ModelType.LIGHTGBM,
+        task_type=TaskType.CLASSIFICATION,
+        num_threads=num_threads,
+        early_stopping_rounds=50,
+        num_boost_round=300,
+    )
+
     # Create pipeline config
     pipeline_config = LooseTightConfig(
         run_base_elimination=False,
@@ -727,8 +756,8 @@ Examples:
         max_interactions=8,
         epsilon_add_interaction=0.001,
         epsilon_swap=0.0005,
-        max_swap_iterations=50,
-        n_jobs=args.n_jobs,
+        max_swap_iterations=args.max_swaps,
+        n_jobs=n_jobs,
     )
 
     # Run multi-model selection
@@ -740,6 +769,7 @@ Examples:
         max_features=args.max_features,
         output_dir=output_dir,
         cv_config=cv_config,
+        model_config=model_config,
         pipeline_config=pipeline_config,
         verbose=verbose,
     )

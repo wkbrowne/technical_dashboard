@@ -12,8 +12,14 @@ from typing import Optional
 # Feature module imports with fallback for both relative and absolute imports
 try:
     # Try relative imports first (when run as module)
-    from .trend import add_trend_features, add_rsi_features, add_macd_features
-    from .volatility import add_multiscale_vol_regime
+    from .trend import (
+        add_trend_features, add_rsi_features, add_macd_features,
+        add_chop_features, add_adx_features
+    )
+    from .volatility import (
+        add_multiscale_vol_regime, add_bollinger_bandwidth_features,
+        add_squeeze_features
+    )
     from .distance import add_distance_to_ma_features
     from .range_breakout import add_range_breakout_features
     from .volume import add_volume_features, add_volume_shock_features
@@ -22,8 +28,14 @@ try:
     from .divergence import add_divergence_features
 except ImportError:
     # Fallback to absolute imports (when run directly)
-    from src.features.trend import add_trend_features, add_rsi_features, add_macd_features
-    from src.features.volatility import add_multiscale_vol_regime
+    from src.features.trend import (
+        add_trend_features, add_rsi_features, add_macd_features,
+        add_chop_features, add_adx_features
+    )
+    from src.features.volatility import (
+        add_multiscale_vol_regime, add_bollinger_bandwidth_features,
+        add_squeeze_features
+    )
     from src.features.distance import add_distance_to_ma_features
     from src.features.range_breakout import add_range_breakout_features
     from src.features.volume import add_volume_features, add_volume_shock_features
@@ -52,13 +64,17 @@ def compute_single_stock_features(
     2. Trend features (MA slopes, agreement, etc.)
     3. RSI features (momentum oscillator)
     4. MACD features (histogram and derivative)
-    5. Multi-scale volatility regime (single-stock only)
-    6. Distance-to-MA features (z-scores)
-    7. Range/breakout features (including ATR14)
-    8. Volume features
-    9. Volume shock features
-    10. Drawdown and recovery features
-    11. Divergence features (RSI-price, MACD-price, trend-momentum)
+    5. CHOP features (Choppiness Index - trend quality filter)
+    6. ADX features (Average Directional Index - trend strength)
+    7. Multi-scale volatility regime (single-stock only)
+    8. Bollinger Bandwidth features (volatility compression)
+    9. Squeeze features (BB inside KC - compression/expansion)
+    10. Distance-to-MA features (z-scores)
+    11. Range/breakout features (including ATR14, overnight return, gap features)
+    12. Volume features
+    13. Volume shock features
+    14. Drawdown and recovery features
+    15. Divergence features (RSI-price, MACD-price, trend-momentum)
 
     Note: Cross-sectional volatility features (vol_regime_cs_median, vol_regime_rel)
     are NOT included here as they require data from multiple stocks. Use
@@ -138,7 +154,15 @@ def compute_single_stock_features(
         derivative_ema_span=3
     )
 
-    # 4) Enhanced multi-scale vol regime (single-stock only, no cross-sectional context)
+    # 4) CHOP features (Choppiness Index - trend quality filter)
+    logger.debug("Adding CHOP features")
+    out = add_chop_features(out, length=14)
+
+    # 5) ADX features (Average Directional Index - trend strength)
+    logger.debug("Adding ADX features")
+    out = add_adx_features(out, length=14)
+
+    # 6) Enhanced multi-scale vol regime (single-stock only, no cross-sectional context)
     logger.debug("Adding volatility regime features")
     out = add_multiscale_vol_regime(
         out,
@@ -151,7 +175,22 @@ def compute_single_stock_features(
         cs_ratio_median=None,  # No cross-sectional context in single-stock mode
     )
 
-    # 5) Distance-to-MA + z-scores
+    # 7) Bollinger Bandwidth features (volatility compression)
+    logger.debug("Adding Bollinger Bandwidth features")
+    out = add_bollinger_bandwidth_features(out, length=20, std=2.0, z_window=60)
+
+    # 8) Squeeze features (BB inside KC - compression/expansion detection)
+    logger.debug("Adding squeeze features")
+    out = add_squeeze_features(
+        out,
+        length=20,
+        bb_std=2.0,
+        kc_scalar_narrow=1.5,
+        kc_scalar_wide=2.0,
+        max_squeeze_days=50
+    )
+
+    # 9) Distance-to-MA + z-scores
     logger.debug("Adding distance-to-MA features")
     out = add_distance_to_ma_features(
         out,
@@ -160,15 +199,15 @@ def compute_single_stock_features(
         z_window=60
     )
 
-    # 6) Range / breakout features (includes ATR14)
+    # 10) Range / breakout features (includes ATR14, overnight return, gap features)
     logger.debug("Adding range/breakout features")
     out = add_range_breakout_features(out, win_list=(5, 10, 20))
 
-    # 7) Volume features
+    # 11) Volume features
     logger.debug("Adding volume features")
     out = add_volume_features(out)
 
-    # 8) Volume shock + alignment features
+    # 12) Volume shock + alignment features
     logger.debug("Adding volume shock features")
     out = add_volume_shock_features(
         out,
@@ -180,15 +219,15 @@ def compute_single_stock_features(
         prefix="volshock"
     )
 
-    # 9) Liquidity and microstructure features
+    # 13) Liquidity and microstructure features
     logger.debug("Adding liquidity features")
     out = add_liquidity_features(out, windows=(5, 10, 20))
 
-    # 10) Drawdown and recovery features
+    # 14) Drawdown and recovery features
     logger.debug("Adding drawdown features")
     out = add_drawdown_features(out, windows=(20, 60, 120), z_window=252)
 
-    # 11) Divergence features (requires RSI, MACD, trend features to exist)
+    # 15) Divergence features (requires RSI, MACD, trend features to exist)
     logger.debug("Adding divergence features")
     out = add_divergence_features(out, windows=(10, 20))
 

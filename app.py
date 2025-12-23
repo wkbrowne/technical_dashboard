@@ -721,12 +721,11 @@ def render_ticker_analysis():
 
 def render_top_candidates():
     """Render the top candidates page."""
-    st.header("🏆 Top Momentum Candidates")
-
     # Load model first (fast)
     model, metadata = load_model()
 
     if model is None:
+        st.header("🏆 Top Momentum Candidates")
         st.error("Model not found. Run training first.")
         return
 
@@ -738,11 +737,19 @@ def render_top_candidates():
         predictions_df = load_predictions()
 
     if features_df is None:
+        st.header("🏆 Top Momentum Candidates")
         st.error("Features not found. Run feature computation first.")
         return
 
     # Get data info (date, missing features)
     data_info = get_data_info(features_df, feature_names)
+
+    # Display header with entry date
+    if data_info['data_date']:
+        entry_date_str = data_info['data_date'].strftime('%Y-%m-%d')
+        st.header(f"🏆 Top Momentum Candidates — Entry: {entry_date_str}")
+    else:
+        st.header("🏆 Top Momentum Candidates")
 
     # Display data status bar (compact version for this page)
     col_date, col_missing = st.columns([2, 3])
@@ -1420,7 +1427,7 @@ def render_alerts():
         st.markdown("""
         **Immediate actions required:**
         1. Check data quality - verify recent data is complete and accurate
-        2. Re-run hyperparameter optimization: `python run_hyperopt.py --n-trials 200`
+        2. Re-run hyperparameter optimization: `python run_model_tuning.py --n-trials 200`
         3. If still degraded, re-run feature selection: `python run_feature_selection.py`
         4. Review market conditions for regime change
         """)

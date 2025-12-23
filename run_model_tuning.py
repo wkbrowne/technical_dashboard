@@ -1,12 +1,19 @@
 #!/usr/bin/env python
 """
-LightGBM Hyperparameter Optimization using Optuna.
+LightGBM Hyperparameter Tuning using Optuna.
 
-Uses the selected features from feature selection and the same CV configuration
-(expanding window with 20-day embargo) to find optimal hyperparameters.
+Optimizes a composite objective of financial metrics:
+- Discrimination: AUC + AUPR
+- Calibration: Brier score
+- Tail performance: Precision@10%, Spread
+- Stability: CV coefficient
+
+Uses sample weights from triple barrier overlap inverse weighting.
 
 Usage:
-    python run_hyperopt.py [--n-trials 100] [--timeout 3600]
+    python run_model_tuning.py [--n-trials 200] [--n-jobs 8]
+    python run_model_tuning.py --objective auc  # AUC-only mode
+    python run_model_tuning.py --resume  # Resume interrupted study
 """
 
 import gc
@@ -18,15 +25,14 @@ import argparse
 import warnings
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass
+from typing import Optional
 
-# Suppress LightGBM feature name warnings
 warnings.filterwarnings('ignore', message='.*feature_name.*')
 warnings.filterwarnings('ignore', category=UserWarning, module='lightgbm')
-# Suppress sklearn feature name validation warning
 warnings.filterwarnings('ignore', message='.*does not have valid feature names.*')
-warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
 
-# Set joblib temp folder to main disk
+# Set joblib temp folder
 JOBLIB_TEMP = Path(__file__).parent / ".joblib_temp"
 JOBLIB_TEMP.mkdir(exist_ok=True)
 os.environ["JOBLIB_TEMP_FOLDER"] = str(JOBLIB_TEMP)
@@ -34,21 +40,51 @@ os.environ["JOBLIB_TEMP_FOLDER"] = str(JOBLIB_TEMP)
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
 import optuna
 from optuna.samplers import TPESampler
-from optuna.pruners import MedianPruner
+from optuna.pruners import HyperbandPruner
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass
+class ObjectiveWeights:
+    """Weights for composite objective function."""
+    auc: float = 0.20
+    aupr: float = 0.15
+    calibration: float = 0.15
+    tail: float = 0.20
+    spread: float = 0.10
+    stability: float = 0.20
+
+
+@dataclass
+class PruningConfig:
+    """Thresholds for early trial pruning."""
+    min_auc: float = 0.54
+    max_brier: float = 0.26
+    max_cv_coef: float = 0.20
+
+
+DEFAULT_WEIGHTS = ObjectiveWeights()
+DEFAULT_PRUNING = PruningConfig()
+
+
+# =============================================================================
+# Data Loading
+# =============================================================================
+
 def load_selected_features() -> list[str]:
-    """Load the selected features from feature selection output."""
+    """Load selected features from feature selection output."""
     features_file = Path('artifacts/feature_selection/selected_features.txt')
     if not features_file.exists():
         raise FileNotFoundError(
-            f"Selected features file not found: {features_file}\n"
+            f"Selected features not found: {features_file}\n"
             "Run feature selection first: python run_feature_selection.py"
         )
 
@@ -58,51 +94,37 @@ def load_selected_features() -> list[str]:
             line = line.strip()
             if line and not line.startswith('#'):
                 features.append(line)
-
     return features
-
-
-def compute_scale_pos_weight(y: np.ndarray) -> float:
-    """Compute scale_pos_weight for LightGBM class balancing.
-
-    scale_pos_weight = n_negative / n_positive
-
-    Args:
-        y: Binary target array (0/1)
-
-    Returns:
-        scale_pos_weight value for LightGBM
-    """
-    n_positive = (y == 1).sum()
-    n_negative = (y == 0).sum()
-    return n_negative / n_positive
 
 
 def load_and_prepare_data(
     selected_features: list[str],
     max_symbols: int = 5000,
     min_samples_per_symbol: int = 5
-) -> tuple[pd.DataFrame, pd.Series, pd.DatetimeIndex]:
-    """Load and prepare data for hyperopt.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DatetimeIndex, list[str]]:
+    """
+    Load features, targets, and sample weights.
 
     Returns:
-        Tuple of (X, y, dates) where dates is used for CV splitting.
+        X: Feature matrix (n_samples, n_features)
+        y: Binary target array
+        sample_weight: Overlap inverse weights
+        dates: DatetimeIndex for CV splitting
+        feature_names: List of feature names
     """
     print("Loading features...")
-    features = pd.read_parquet('artifacts/features_daily.parquet')
+    features = pd.read_parquet('artifacts/features_complete.parquet')
     print(f"  Features shape: {features.shape}")
 
     print("Loading targets...")
     targets = pd.read_parquet('artifacts/targets_triple_barrier.parquet')
     print(f"  Targets shape: {targets.shape}")
 
-    # Merge
     targets = targets.rename(columns={'t0': 'date'})
 
     # Filter symbols
     symbol_counts = targets.groupby('symbol').size()
     valid_symbols = symbol_counts[symbol_counts >= min_samples_per_symbol].index.tolist()
-
     if len(valid_symbols) > max_symbols:
         valid_symbols = symbol_counts.loc[valid_symbols].nlargest(max_symbols).index.tolist()
 
@@ -111,83 +133,75 @@ def load_and_prepare_data(
 
     # Merge
     merged = features.merge(
-        targets[['symbol', 'date', 'hit']],
+        targets[['symbol', 'date', 'hit', 'weight_final']],
         on=['symbol', 'date'],
         how='inner'
     )
 
-    # Binary target (exclude neutral)
+    # Binary target (exclude neutral hit=0)
     merged = merged[merged['hit'] != 0].copy()
     merged['target'] = (merged['hit'] == 1).astype(int)
-
-    # Sort by date
     merged = merged.sort_values(['date', 'symbol']).reset_index(drop=True)
 
-    # Check which selected features are available
+    # Check available features
     available_features = [f for f in selected_features if f in merged.columns]
     missing = set(selected_features) - set(available_features)
     if missing:
-        print(f"  Warning: {len(missing)} selected features not in data: {list(missing)[:5]}...")
+        print(f"  Warning: {len(missing)} features not in data: {list(missing)[:5]}...")
 
     print(f"  Using {len(available_features)} features")
 
-    X = merged[available_features].copy()
-    y = merged['target'].copy()
+    X = merged[available_features].values.astype(np.float32)
+    y = merged['target'].values
+    sample_weight = merged['weight_final'].values if 'weight_final' in merged.columns else None
     dates = pd.to_datetime(merged['date'])
 
-    print(f"\nFinal data:")
+    print(f"\nData prepared:")
     print(f"  Samples: {len(X):,}")
     print(f"  Features: {X.shape[1]}")
-    print(f"  Positive class: {y.sum():,} ({y.mean()*100:.1f}%)")
-    print(f"  Date range: {dates.min()} to {dates.max()}")
+    print(f"  Positive rate: {y.mean()*100:.1f}%")
+    print(f"  Date range: {dates.min().date()} to {dates.max().date()}")
+    if sample_weight is not None:
+        print(f"  Sample weights: min={sample_weight.min():.3f}, max={sample_weight.max():.3f}")
 
     del features, targets, merged
     gc.collect()
 
-    return X, y, dates
+    return X, y, sample_weight, dates, available_features
 
+
+# =============================================================================
+# Cross-Validation
+# =============================================================================
 
 def get_expanding_cv_splits(
     dates: pd.DatetimeIndex,
     n_splits: int = 5,
     gap: int = 20,
-    min_train_samples: int = 1000
+    min_train_samples: int = 3000
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Generate expanding window CV splits with embargo gap.
+    """
+    Generate expanding window CV splits with embargo gap.
 
-    Args:
-        dates: DatetimeIndex of all samples
-        n_splits: Number of CV folds
-        gap: Embargo gap in trading days between train and test
-        min_train_samples: Minimum samples required in training set
-
-    Returns:
-        List of (train_idx, test_idx) tuples
+    gap=20 matches max_horizon from triple barrier targets.
     """
     unique_dates = np.sort(dates.unique())
     n_dates = len(unique_dates)
 
-    # Calculate test size (equal portions for each fold)
-    # Reserve first portion for minimum training
-    min_train_dates = max(min_train_samples // 100, 50)  # Rough estimate
+    min_train_dates = max(min_train_samples // 100, 50)
     available_dates = n_dates - min_train_dates
     test_size = available_dates // (n_splits + 1)
 
     splits = []
-
     for fold in range(n_splits):
-        # Test window: from the end, moving backwards
         test_end_idx = n_dates - 1 - fold * test_size
         test_start_idx = test_end_idx - test_size + 1
-
-        # Train window: everything before test, minus gap
         train_end_idx = test_start_idx - gap - 1
-        train_start_idx = 0  # Expanding window
 
         if train_end_idx < min_train_dates:
             continue
 
-        train_dates = unique_dates[train_start_idx:train_end_idx + 1]
+        train_dates = unique_dates[:train_end_idx + 1]
         test_dates = unique_dates[test_start_idx:test_end_idx + 1]
 
         train_mask = dates.isin(train_dates)
@@ -199,302 +213,344 @@ def get_expanding_cv_splits(
         if len(train_idx) >= min_train_samples and len(test_idx) > 0:
             splits.append((train_idx, test_idx))
 
-    # Reverse to get chronological order (oldest train first)
-    return splits[::-1]
+    return splits[::-1]  # Chronological order
 
 
-def objective(
-    trial: optuna.Trial,
-    X: np.ndarray,
-    y: np.ndarray,
-    cv_splits: list[tuple[np.ndarray, np.ndarray]],
-    n_jobs: int = 8,
-    min_fold_auc: float = 0.55,
-    variance_penalty: float = 1.0,
-    scale_pos_weight: float = None
-) -> float:
-    """Optuna objective function for LightGBM hyperparameter optimization.
+# =============================================================================
+# Metrics
+# =============================================================================
 
-    Uses a stability-adjusted score: mean_auc - variance_penalty * std_auc
-    Also requires all folds to exceed min_fold_auc threshold.
+def compute_fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Compute all financial metrics for one CV fold."""
+    n = len(y_pred)
+    k = max(1, int(n * 0.10))
 
-    Args:
-        trial: Optuna trial object
-        X: Feature matrix
-        y: Target vector
-        cv_splits: List of (train_idx, test_idx) tuples
-        n_jobs: Threads per model
-        min_fold_auc: Minimum AUC required on each fold (default 0.55)
-        variance_penalty: Weight for std penalty (default 1.0)
-        scale_pos_weight: Class weight for balancing (n_neg/n_pos). None for no weighting.
+    sorted_idx = np.argsort(y_pred)
+    top_idx = sorted_idx[-k:]
+    bottom_idx = sorted_idx[:k]
 
-    Returns:
-        Stability-adjusted AUC score (mean - penalty * std)
-    """
-
-    # Hyperparameter search space
-    params = {
-        'objective': 'binary',
-        'metric': 'auc',
-        'boosting_type': 'gbdt',
-        'verbosity': -1,
-        'seed': 42,
-        'num_threads': n_jobs,
-
-        # Tree structure
-        'max_depth': trial.suggest_int('max_depth', 3, 10),
-        'num_leaves': trial.suggest_int('num_leaves', 15, 127),
-        'min_child_samples': trial.suggest_int('min_child_samples', 20, 500),
-
-        # Learning
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
-        'n_estimators': trial.suggest_int('n_estimators', 100, 500),
-
-        # Regularization
-        'reg_alpha': trial.suggest_float('reg_alpha', 1e-4, 10.0, log=True),
-        'reg_lambda': trial.suggest_float('reg_lambda', 1e-4, 10.0, log=True),
-        'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 1.0),
-
-        # Subsampling
-        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-        'subsample_freq': trial.suggest_int('subsample_freq', 1, 10),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-
-        # Additional
-        'max_bin': trial.suggest_categorical('max_bin', [63, 127, 255]),
+    return {
+        'auc': roc_auc_score(y_true, y_pred),
+        'aupr': average_precision_score(y_true, y_pred),
+        'brier': brier_score_loss(y_true, np.clip(y_pred, 0, 1)),
+        'precision_top_10': y_true[top_idx].mean(),
+        'precision_bottom_10': y_true[bottom_idx].mean(),
     }
 
-    # Add class weighting if specified
-    if scale_pos_weight is not None:
-        params['scale_pos_weight'] = scale_pos_weight
 
-    # Constraint: num_leaves <= 2^max_depth
-    max_leaves = 2 ** params['max_depth']
-    if params['num_leaves'] > max_leaves:
-        params['num_leaves'] = max_leaves
+def compute_composite_score(fold_metrics: list[dict], weights: ObjectiveWeights) -> float:
+    """Compute weighted composite objective from fold metrics."""
+    auc_mean = np.mean([m['auc'] for m in fold_metrics])
+    auc_std = np.std([m['auc'] for m in fold_metrics])
+    aupr_mean = np.mean([m['aupr'] for m in fold_metrics])
+    brier_mean = np.mean([m['brier'] for m in fold_metrics])
+    prec_top = np.mean([m['precision_top_10'] for m in fold_metrics])
+    prec_bot = np.mean([m['precision_bottom_10'] for m in fold_metrics])
 
-    # Cross-validation
-    fold_aucs = []
-    fold_auprs = []
+    score = 0.0
 
-    for fold_idx, (train_idx, test_idx) in enumerate(cv_splits):
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+    # Discrimination (35%)
+    score += weights.auc * auc_mean
+    score += weights.aupr * aupr_mean
 
-        # Handle NaN/inf
-        X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
-        X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
+    # Calibration (15%) - Brier in [0, 0.25], invert
+    score += weights.calibration * (1 - brier_mean / 0.25)
 
-        # Train
-        model = lgb.LGBMClassifier(**params)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=50, verbose=False),
-                lgb.log_evaluation(period=0)
-            ]
-        )
+    # Tail performance (30%)
+    score += weights.tail * prec_top
+    score += weights.spread * (prec_top - prec_bot)
 
-        # Predict
-        y_pred = model.predict_proba(X_test)[:, 1]
-        auc = roc_auc_score(y_test, y_pred)
-        aupr = average_precision_score(y_test, y_pred)
-        fold_aucs.append(auc)
-        fold_auprs.append(aupr)
+    # Stability (20%)
+    cv_coef = auc_std / (auc_mean + 1e-8)
+    stability = np.clip(1 - cv_coef * 5, 0, 1)
+    score += weights.stability * stability
 
-        # Early rejection: if any fold is below minimum threshold, prune
-        if auc < min_fold_auc:
-            # Store the failure reason for analysis
-            trial.set_user_attr('failed_fold', fold_idx + 1)
-            trial.set_user_attr('failed_auc', auc)
-            raise optuna.TrialPruned()
+    return score
 
-        # Report intermediate result for pruning
-        trial.report(np.mean(fold_aucs), fold_idx)
 
-        # Prune if not promising
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+def compute_auc_score(fold_metrics: list[dict], variance_penalty: float) -> float:
+    """Compute AUC-only objective with variance penalty."""
+    auc_mean = np.mean([m['auc'] for m in fold_metrics])
+    auc_std = np.std([m['auc'] for m in fold_metrics])
+    return auc_mean - variance_penalty * auc_std
 
-    # Calculate stability-adjusted score
-    mean_auc = np.mean(fold_aucs)
-    std_auc = np.std(fold_aucs)
-    min_auc = np.min(fold_aucs)
-    mean_aupr = np.mean(fold_auprs)
-    std_aupr = np.std(fold_auprs)
 
-    # Store metrics for analysis
-    trial.set_user_attr('mean_auc', mean_auc)
-    trial.set_user_attr('std_auc', std_auc)
-    trial.set_user_attr('min_auc', min_auc)
-    trial.set_user_attr('fold_aucs', fold_aucs)
-    trial.set_user_attr('mean_aupr', mean_aupr)
-    trial.set_user_attr('std_aupr', std_aupr)
-    trial.set_user_attr('fold_auprs', fold_auprs)
+# =============================================================================
+# Optuna Objective
+# =============================================================================
 
-    # Stability-adjusted score: penalize high variance
-    # This encourages consistent performance across all folds
-    stability_score = mean_auc - variance_penalty * std_auc
+def create_objective(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray],
+    cv_splits: list,
+    objective_mode: str,
+    weights: ObjectiveWeights,
+    pruning: PruningConfig,
+    variance_penalty: float,
+    num_threads: int,
+):
+    """Create Optuna objective function."""
 
-    return stability_score
+    def objective(trial: optuna.Trial) -> float:
+        # Suggest hyperparameters
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'boosting_type': 'gbdt',
+            'verbosity': -1,
+            'seed': 42,
+            'num_threads': num_threads,
 
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'num_leaves': trial.suggest_int('num_leaves', 15, 127),
+            'min_child_samples': trial.suggest_int('min_child_samples', 20, 500),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+            'n_estimators': trial.suggest_int('n_estimators', 100, 800),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-4, 10.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-4, 10.0, log=True),
+            'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 1.0),
+            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+            'subsample_freq': trial.suggest_int('subsample_freq', 1, 10),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'max_bin': trial.suggest_categorical('max_bin', [63, 127, 255]),
+        }
+
+        # Constraint: num_leaves <= 2^max_depth
+        max_leaves = 2 ** params['max_depth']
+        if params['num_leaves'] > max_leaves:
+            params['num_leaves'] = max_leaves
+
+        # Optional class balancing
+        use_balanced = trial.suggest_categorical('use_balanced', [True, False])
+        if use_balanced:
+            params['scale_pos_weight'] = (y == 0).sum() / (y == 1).sum()
+
+        # Cross-validation
+        all_fold_metrics = []
+
+        for fold_idx, (train_idx, test_idx) in enumerate(cv_splits):
+            X_train = np.nan_to_num(X[train_idx], nan=0.0, posinf=0.0, neginf=0.0)
+            X_test = np.nan_to_num(X[test_idx], nan=0.0, posinf=0.0, neginf=0.0)
+            y_train, y_test = y[train_idx], y[test_idx]
+            w_train = sample_weight[train_idx] if sample_weight is not None else None
+
+            model = lgb.LGBMClassifier(**params)
+            model.fit(
+                X_train, y_train,
+                sample_weight=w_train,
+                eval_set=[(X_test, y_test)],
+                callbacks=[
+                    lgb.early_stopping(stopping_rounds=50, verbose=False),
+                    lgb.log_evaluation(period=0),
+                ],
+            )
+
+            y_pred = model.predict_proba(X_test)[:, 1]
+            fold_metrics = compute_fold_metrics(y_test, y_pred)
+            all_fold_metrics.append(fold_metrics)
+
+            # Custom pruning (composite mode only)
+            if objective_mode == 'composite':
+                if fold_metrics['auc'] < pruning.min_auc:
+                    trial.set_user_attr('prune_reason', f'low_auc_fold_{fold_idx}')
+                    raise optuna.TrialPruned()
+
+                if fold_metrics['brier'] > pruning.max_brier:
+                    trial.set_user_attr('prune_reason', f'poor_brier_fold_{fold_idx}')
+                    raise optuna.TrialPruned()
+
+                if len(all_fold_metrics) >= 3:
+                    aucs = [m['auc'] for m in all_fold_metrics]
+                    cv = np.std(aucs) / np.mean(aucs)
+                    if cv > pruning.max_cv_coef:
+                        trial.set_user_attr('prune_reason', 'high_variance')
+                        raise optuna.TrialPruned()
+
+            # Optuna intermediate reporting
+            trial.report(fold_metrics['auc'], fold_idx)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        # Store metrics
+        for metric in ['auc', 'aupr', 'brier', 'precision_top_10', 'precision_bottom_10']:
+            values = [m[metric] for m in all_fold_metrics]
+            trial.set_user_attr(f'{metric}_mean', np.mean(values))
+            trial.set_user_attr(f'{metric}_std', np.std(values))
+
+        # Compute objective
+        if objective_mode == 'composite':
+            return compute_composite_score(all_fold_metrics, weights)
+        else:
+            return compute_auc_score(all_fold_metrics, variance_penalty)
+
+    return objective
+
+
+# =============================================================================
+# Trial Callback
+# =============================================================================
 
 def trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-    """Callback to print trial results as they complete."""
+    """Print trial results."""
     if trial.state == optuna.trial.TrialState.COMPLETE:
-        mean_auc = trial.user_attrs.get('mean_auc', trial.value)
-        std_auc = trial.user_attrs.get('std_auc', 0)
-        mean_aupr = trial.user_attrs.get('mean_aupr', 0)
-        std_aupr = trial.user_attrs.get('std_aupr', 0)
+        auc_mean = trial.user_attrs.get('auc_mean', 0)
+        auc_std = trial.user_attrs.get('auc_std', 0)
+        brier_mean = trial.user_attrs.get('brier_mean', 0)
+        prec_top = trial.user_attrs.get('precision_top_10_mean', 0)
 
-        # Check if this is a new best
         is_best = study.best_trial.number == trial.number
+        marker = " ** BEST **" if is_best else ""
 
-        best_marker = " ** NEW BEST **" if is_best else ""
-        print(f"Trial {trial.number:3d}: AUC={mean_auc:.4f}±{std_auc:.4f}  AUPR={mean_aupr:.4f}±{std_aupr:.4f}  Score={trial.value:.4f}{best_marker}")
+        print(f"Trial {trial.number:3d}: Score={trial.value:.4f}  "
+              f"AUC={auc_mean:.4f}±{auc_std:.4f}  "
+              f"Brier={brier_mean:.4f}  "
+              f"Prec@10={prec_top:.4f}{marker}")
+
     elif trial.state == optuna.trial.TrialState.PRUNED:
-        failed_fold = trial.user_attrs.get('failed_fold', '?')
-        failed_auc = trial.user_attrs.get('failed_auc', 0)
-        print(f"Trial {trial.number:3d}: PRUNED (fold {failed_fold}, AUC={failed_auc:.4f})")
+        reason = trial.user_attrs.get('prune_reason', 'optuna_pruner')
+        print(f"Trial {trial.number:3d}: PRUNED ({reason})")
 
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def run_hyperopt(
-    n_trials: int = 100,
-    timeout: int = None,
-    n_jobs_model: int = 8,
-    n_jobs_optuna: int = 1,
+    n_trials: int = 200,
+    timeout: Optional[int] = None,
+    n_jobs: int = 8,
     n_folds: int = 5,
     gap: int = 20,
-    min_fold_auc: float = 0.55,
+    objective_mode: str = 'composite',
     variance_penalty: float = 1.0,
-    balanced: bool = False
+    resume: bool = False,
 ) -> dict:
-    """Run hyperparameter optimization.
+    """
+    Run hyperparameter optimization.
 
     Args:
         n_trials: Number of Optuna trials
-        timeout: Timeout in seconds (None for no timeout)
-        n_jobs_model: Threads per LightGBM model
-        n_jobs_optuna: Parallel Optuna trials (1 recommended for reproducibility)
+        timeout: Timeout in seconds
+        n_jobs: LightGBM threads per model
         n_folds: Number of CV folds
         gap: Embargo gap in days
-        min_fold_auc: Minimum AUC required on each fold
-        variance_penalty: Weight for std penalty in objective
-        balanced: If True, use class weights (scale_pos_weight) for balanced training
+        objective_mode: 'composite' or 'auc'
+        variance_penalty: Penalty for AUC std (auc mode only)
+        resume: Resume from saved study
 
     Returns:
-        Dictionary with best params and results
+        Dict with best params and results
     """
-    print("=" * 60)
+    print("=" * 70)
     print("LightGBM Hyperparameter Optimization")
-    if balanced:
-        print("  MODE: BALANCED (using class weights)")
-    else:
-        print("  MODE: IMBALANCED (no class weights)")
-    print("=" * 60)
+    print(f"  Objective: {objective_mode}")
+    print("=" * 70)
     print()
 
-    # Load selected features
-    print("Loading selected features...")
-    selected_features = load_selected_features()
-    print(f"  {len(selected_features)} features from feature selection")
-
     # Load data
-    X, y, dates = load_and_prepare_data(selected_features)
+    selected_features = load_selected_features()
+    print(f"  {len(selected_features)} features from feature selection\n")
 
-    # Convert to numpy for speed
-    feature_names = X.columns.tolist()
-    X_np = X.values.astype(np.float32)
-    y_np = y.values
+    X, y, sample_weight, dates, feature_names = load_and_prepare_data(selected_features)
 
-    # Compute scale_pos_weight if balanced mode
-    scale_pos_weight = None
-    if balanced:
-        scale_pos_weight = compute_scale_pos_weight(y_np)
-        print(f"\nClass balancing enabled:")
-        print(f"  Positive samples: {(y_np == 1).sum():,}")
-        print(f"  Negative samples: {(y_np == 0).sum():,}")
-        print(f"  scale_pos_weight: {scale_pos_weight:.3f}")
-
-    # Generate CV splits
-    print(f"\nGenerating {n_folds}-fold expanding CV splits with {gap}-day embargo...")
+    # CV splits
+    print(f"\nGenerating {n_folds}-fold expanding CV with {gap}-day embargo...")
     cv_splits = get_expanding_cv_splits(dates, n_splits=n_folds, gap=gap)
-    print(f"  Generated {len(cv_splits)} valid splits")
-
+    print(f"  Generated {len(cv_splits)} folds")
     for i, (train_idx, test_idx) in enumerate(cv_splits):
         print(f"    Fold {i+1}: {len(train_idx):,} train, {len(test_idx):,} test")
 
-    # Create Optuna study
-    print(f"\nStarting Optuna optimization...")
+    # Create study
+    output_dir = Path('artifacts/hyperopt')
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    storage = f'sqlite:///{output_dir}/study.db'
+
+    sampler = TPESampler(seed=42, n_startup_trials=15, multivariate=True)
+    pruner = HyperbandPruner(min_resource=2, max_resource=n_folds, reduction_factor=2)
+
+    if resume:
+        print("\nResuming from saved study...")
+        study = optuna.load_study(
+            study_name='lgbm_hyperopt',
+            storage=storage,
+            sampler=sampler,
+            pruner=pruner,
+        )
+        print(f"  Found {len(study.trials)} existing trials")
+    else:
+        # Delete existing study if present (fresh start)
+        try:
+            optuna.delete_study(study_name='lgbm_hyperopt', storage=storage)
+            print("\nDeleted existing study for fresh start...")
+        except KeyError:
+            pass  # No existing study
+
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=sampler,
+            pruner=pruner,
+            study_name='lgbm_hyperopt',
+            storage=storage,
+        )
+
+    # Run optimization
+    print(f"\nStarting optimization...")
     print(f"  Trials: {n_trials}")
     print(f"  Timeout: {timeout}s" if timeout else "  Timeout: None")
-    print(f"  Model threads: {n_jobs_model}")
-    print(f"  Min fold AUC: {min_fold_auc}")
-    print(f"  Variance penalty: {variance_penalty}")
-    print(f"  Objective: mean_auc - {variance_penalty} * std_auc")
-    if scale_pos_weight is not None:
-        print(f"  Class balancing: scale_pos_weight={scale_pos_weight:.3f}")
+    print(f"  LightGBM threads: {n_jobs}")
+    print(f"  Sample weights: {'enabled' if sample_weight is not None else 'disabled'}")
     print()
 
-    sampler = TPESampler(seed=42)
-    pruner = MedianPruner(n_startup_trials=10, n_warmup_steps=2)
-
-    study = optuna.create_study(
-        direction='maximize',
-        sampler=sampler,
-        pruner=pruner,
-        study_name='lightgbm_hyperopt'
+    objective = create_objective(
+        X=X,
+        y=y,
+        sample_weight=sample_weight,
+        cv_splits=cv_splits,
+        objective_mode=objective_mode,
+        weights=DEFAULT_WEIGHTS,
+        pruning=DEFAULT_PRUNING,
+        variance_penalty=variance_penalty,
+        num_threads=n_jobs,
     )
 
     start_time = time.time()
 
     study.optimize(
-        lambda trial: objective(
-            trial, X_np, y_np, cv_splits, n_jobs_model,
-            min_fold_auc=min_fold_auc,
-            variance_penalty=variance_penalty,
-            scale_pos_weight=scale_pos_weight
-        ),
+        objective,
         n_trials=n_trials,
         timeout=timeout,
-        n_jobs=n_jobs_optuna,
-        show_progress_bar=False,  # Disabled since we have custom callback output
+        n_jobs=1,  # Sequential for TPE effectiveness
+        show_progress_bar=False,
         gc_after_trial=True,
-        callbacks=[trial_callback]
+        callbacks=[trial_callback],
     )
 
     elapsed = time.time() - start_time
 
     # Results
     print()
-    print("=" * 60)
+    print("=" * 70)
     print("OPTIMIZATION RESULTS")
-    print("=" * 60)
-    print()
-    print(f"Completed trials: {len(study.trials)}")
-    print(f"Pruned trials: {len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])}")
-    print(f"Total time: {elapsed/60:.1f} minutes")
-    print()
+    print("=" * 70)
 
-    # Get best trial's actual metrics
-    best_trial = study.best_trial
-    best_mean_auc = best_trial.user_attrs.get('mean_auc', study.best_value)
-    best_std_auc = best_trial.user_attrs.get('std_auc', 0)
-    best_min_auc = best_trial.user_attrs.get('min_auc', 0)
-    best_fold_aucs = best_trial.user_attrs.get('fold_aucs', [])
+    n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    n_pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
 
-    print(f"Best Stability Score: {study.best_value:.4f}")
-    print(f"  (mean_auc - {variance_penalty} * std_auc)")
-    print()
-    print(f"Best Trial Metrics:")
-    print(f"  Mean AUC: {best_mean_auc:.4f}")
-    print(f"  Std AUC:  {best_std_auc:.4f}")
-    print(f"  Min AUC:  {best_min_auc:.4f}")
-    if best_fold_aucs:
-        print(f"  Fold AUCs: {[f'{auc:.4f}' for auc in best_fold_aucs]}")
-    print()
-    print("Best hyperparameters:")
+    print(f"\nTrials: {n_completed} completed, {n_pruned} pruned")
+    print(f"Time: {elapsed/60:.1f} minutes")
+
+    best = study.best_trial
+    print(f"\nBest Score: {study.best_value:.4f}")
+    print(f"\nBest Metrics:")
+    print(f"  AUC:           {best.user_attrs.get('auc_mean', 0):.4f} ± {best.user_attrs.get('auc_std', 0):.4f}")
+    print(f"  AUPR:          {best.user_attrs.get('aupr_mean', 0):.4f}")
+    print(f"  Brier:         {best.user_attrs.get('brier_mean', 0):.4f}")
+    print(f"  Precision@10%: {best.user_attrs.get('precision_top_10_mean', 0):.4f}")
+    print(f"  Spread@10%:    {best.user_attrs.get('precision_top_10_mean', 0) - best.user_attrs.get('precision_bottom_10_mean', 0):.4f}")
+
+    print(f"\nBest Hyperparameters:")
     for key, value in study.best_params.items():
         if isinstance(value, float):
             print(f"  {key}: {value:.6f}")
@@ -502,177 +558,79 @@ def run_hyperopt(
             print(f"  {key}: {value}")
 
     # Save results
-    output_dir = Path('artifacts/hyperopt')
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save best params
     best_params = study.best_params.copy()
-    best_params['best_auc'] = study.best_value
-    best_params['n_trials'] = len(study.trials)
-    best_params['elapsed_seconds'] = elapsed
-    best_params['timestamp'] = datetime.now().isoformat()
-    best_params['features'] = feature_names
-    best_params['balanced'] = balanced
-    if scale_pos_weight is not None:
-        best_params['scale_pos_weight'] = scale_pos_weight
+    best_params['_metrics'] = {
+        'composite_score': study.best_value,
+        'auc_mean': best.user_attrs.get('auc_mean'),
+        'auc_std': best.user_attrs.get('auc_std'),
+        'aupr_mean': best.user_attrs.get('aupr_mean'),
+        'brier_mean': best.user_attrs.get('brier_mean'),
+        'precision_top_10_mean': best.user_attrs.get('precision_top_10_mean'),
+        'precision_bottom_10_mean': best.user_attrs.get('precision_bottom_10_mean'),
+    }
+    best_params['_metadata'] = {
+        'n_trials': len(study.trials),
+        'n_completed': n_completed,
+        'n_pruned': n_pruned,
+        'elapsed_seconds': elapsed,
+        'timestamp': datetime.now().isoformat(),
+        'objective_mode': objective_mode,
+        'sample_weights_used': sample_weight is not None,
+        'features': feature_names,
+    }
 
-    params_file = output_dir / 'best_params.json'
-    with open(params_file, 'w') as f:
+    with open(output_dir / 'best_params.json', 'w') as f:
         json.dump(best_params, f, indent=2)
-    print(f"\nBest params saved to: {params_file}")
+    print(f"\nBest params saved to: {output_dir / 'best_params.json'}")
 
     # Save trial history
     trials_df = study.trials_dataframe()
-    trials_file = output_dir / 'trials_history.csv'
-    trials_df.to_csv(trials_file, index=False)
-    print(f"Trial history saved to: {trials_file}")
+    trials_df.to_csv(output_dir / 'trials_history.csv', index=False)
 
     # Parameter importance
     try:
         importance = optuna.importance.get_param_importances(study)
-        print("\nParameter importance:")
-        for param, imp in sorted(importance.items(), key=lambda x: -x[1])[:10]:
+        print("\nParameter Importance:")
+        for param, imp in sorted(importance.items(), key=lambda x: -x[1])[:8]:
             print(f"  {param}: {imp:.3f}")
-
-        importance_file = output_dir / 'param_importance.json'
-        with open(importance_file, 'w') as f:
+        with open(output_dir / 'param_importance.json', 'w') as f:
             json.dump(importance, f, indent=2)
     except Exception as e:
         print(f"  Could not compute importance: {e}")
 
-    # Final validation with best params
     print()
-    print("=" * 60)
-    print("FINAL VALIDATION WITH BEST PARAMS")
-    print("=" * 60)
+    print("=" * 70)
+    print("Next step: python run_training.py")
+    print("=" * 70)
 
-    # Reconstruct full params
-    final_params = {
-        'objective': 'binary',
-        'metric': 'auc',
-        'boosting_type': 'gbdt',
-        'verbosity': -1,
-        'seed': 42,
-        'num_threads': n_jobs_model,
-        **study.best_params
-    }
-
-    # Add class weighting if used
-    if scale_pos_weight is not None:
-        final_params['scale_pos_weight'] = scale_pos_weight
-
-    # Ensure num_leaves constraint
-    max_leaves = 2 ** final_params['max_depth']
-    if final_params['num_leaves'] > max_leaves:
-        final_params['num_leaves'] = max_leaves
-
-    # Run final CV with verbose output
-    fold_results = []
-
-    for fold_idx, (train_idx, test_idx) in enumerate(cv_splits):
-        X_train, X_test = X_np[train_idx], X_np[test_idx]
-        y_train, y_test = y_np[train_idx], y_np[test_idx]
-
-        X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
-        X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
-
-        model = lgb.LGBMClassifier(**final_params)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=50, verbose=False),
-                lgb.log_evaluation(period=0)
-            ]
-        )
-
-        # Train metrics
-        y_train_pred = model.predict_proba(X_train)[:, 1]
-        train_auc = roc_auc_score(y_train, y_train_pred)
-        train_aupr = average_precision_score(y_train, y_train_pred)
-
-        # Test metrics
-        y_test_pred = model.predict_proba(X_test)[:, 1]
-        test_auc = roc_auc_score(y_test, y_test_pred)
-        test_aupr = average_precision_score(y_test, y_test_pred)
-
-        fold_results.append({
-            'fold': fold_idx + 1,
-            'train_auc': train_auc,
-            'test_auc': test_auc,
-            'train_aupr': train_aupr,
-            'test_aupr': test_aupr,
-            'gap': train_auc - test_auc,
-            'best_iteration': model.best_iteration_
-        })
-
-        print(f"  Fold {fold_idx + 1}: Train AUC={train_auc:.4f} AUPR={train_aupr:.4f}, Test AUC={test_auc:.4f} AUPR={test_aupr:.4f}, Gap={train_auc - test_auc:.4f}")
-
-    mean_train_auc = np.mean([r['train_auc'] for r in fold_results])
-    mean_test_auc = np.mean([r['test_auc'] for r in fold_results])
-    std_test_auc = np.std([r['test_auc'] for r in fold_results])
-    mean_train_aupr = np.mean([r['train_aupr'] for r in fold_results])
-    mean_test_aupr = np.mean([r['test_aupr'] for r in fold_results])
-    std_test_aupr = np.std([r['test_aupr'] for r in fold_results])
-    mean_gap = np.mean([r['gap'] for r in fold_results])
-
-    print()
-    print(f"Final Results:")
-    print(f"  Train AUC:  {mean_train_auc:.4f}")
-    print(f"  Test AUC:   {mean_test_auc:.4f} ± {std_test_auc:.4f}")
-    print(f"  Train AUPR: {mean_train_aupr:.4f}")
-    print(f"  Test AUPR:  {mean_test_aupr:.4f} ± {std_test_aupr:.4f}")
-    print(f"  Gap (AUC):  {mean_gap:.4f}")
-
-    # Save final results
-    final_results = {
-        'best_params': study.best_params,
-        'fold_results': fold_results,
-        'mean_train_auc': mean_train_auc,
-        'mean_test_auc': mean_test_auc,
-        'std_test_auc': std_test_auc,
-        'mean_train_aupr': mean_train_aupr,
-        'mean_test_aupr': mean_test_aupr,
-        'std_test_aupr': std_test_aupr,
-        'mean_gap': mean_gap,
-    }
-
-    final_file = output_dir / 'final_results.json'
-    with open(final_file, 'w') as f:
-        json.dump(final_results, f, indent=2, default=str)
-    print(f"\nFinal results saved to: {final_file}")
-
-    return final_results
+    return best_params
 
 
 def main():
     parser = argparse.ArgumentParser(description='LightGBM Hyperparameter Optimization')
-    parser.add_argument('--n-trials', type=int, default=100, help='Number of Optuna trials')
+    parser.add_argument('--n-trials', type=int, default=200, help='Number of trials')
     parser.add_argument('--timeout', type=int, default=None, help='Timeout in seconds')
-    parser.add_argument('--n-jobs-model', type=int, default=8, help='Threads per model')
-    parser.add_argument('--n-folds', type=int, default=5, help='Number of CV folds')
-    parser.add_argument('--gap', type=int, default=20, help='Embargo gap in days')
-    parser.add_argument('--min-fold-auc', type=float, default=0.55,
-                        help='Minimum AUC required on each fold (trials below this are pruned)')
+    parser.add_argument('--n-jobs', type=int, default=8, help='LightGBM threads')
+    parser.add_argument('--n-folds', type=int, default=5, help='CV folds')
+    parser.add_argument('--gap', type=int, default=20, help='Embargo gap days')
+    parser.add_argument('--objective', type=str, default='composite',
+                        choices=['composite', 'auc'], help='Objective mode')
     parser.add_argument('--variance-penalty', type=float, default=1.0,
-                        help='Penalty weight for std in objective (score = mean - penalty * std)')
-    parser.add_argument('--balanced', action='store_true',
-                        help='Use class weights (scale_pos_weight) for balanced training')
+                        help='Variance penalty (auc mode only)')
+    parser.add_argument('--resume', action='store_true', help='Resume from saved study')
 
     args = parser.parse_args()
 
-    results = run_hyperopt(
+    run_hyperopt(
         n_trials=args.n_trials,
         timeout=args.timeout,
-        n_jobs_model=args.n_jobs_model,
+        n_jobs=args.n_jobs,
         n_folds=args.n_folds,
         gap=args.gap,
-        min_fold_auc=args.min_fold_auc,
+        objective_mode=args.objective,
         variance_penalty=args.variance_penalty,
-        balanced=args.balanced
+        resume=args.resume,
     )
-
-    return results
 
 
 if __name__ == '__main__':

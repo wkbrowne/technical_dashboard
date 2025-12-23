@@ -105,7 +105,7 @@ def load_latest_features(
         DataFrame with features for the target date
     """
     print("Loading features...")
-    features = pd.read_parquet('artifacts/features_daily.parquet')
+    features = pd.read_parquet('artifacts/features_complete.parquet')
 
     # Convert date if needed
     if 'date' in features.columns:

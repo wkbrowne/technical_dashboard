@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import logging
 import os
 import sys
@@ -22,6 +23,27 @@ from pathlib import Path
 from typing import Optional, List, Dict
 
 import pandas as pd
+
+
+def _cleanup_joblib_workers():
+    """Clean up joblib workers to prevent segfault on exit.
+
+    This function is registered with atexit to ensure workers are properly
+    terminated before Python shuts down the interpreter.
+    """
+    import gc
+    gc.collect()
+    try:
+        from joblib.externals.loky import get_reusable_executor
+        executor = get_reusable_executor()
+        executor.shutdown(wait=True, kill_workers=True)
+    except Exception:
+        pass
+    gc.collect()
+
+
+# Register cleanup to run on program exit
+atexit.register(_cleanup_joblib_workers)
 
 # Force unbuffered output for progress visibility (especially when piped to tee/file)
 # This ensures print() and logger output is flushed immediately
@@ -353,7 +375,8 @@ def run_feature_pipeline(
     n_jobs: int = -1,
     batch_size: int = 16,
     full_output: bool = False,
-    checkpoint_config: Optional['CheckpointConfig'] = None
+    checkpoint_config: Optional['CheckpointConfig'] = None,
+    exclude_retired: bool = False,
 ):
     """Run the feature computation pipeline.
 
@@ -369,11 +392,13 @@ def run_feature_pipeline(
         full_output: If True, output all computed features. If False (default),
             filter to curated feature set (~200 features)
         checkpoint_config: CheckpointConfig for staged checkpointing
+        exclude_retired: If True, exclude retired features from output files
     """
     from src.config.features import FeatureConfig, Timeframe
     from src.config.parallel import ParallelConfig
     from src.pipelines.orchestrator import run_pipeline_v2, compute_higher_timeframe_features
     from src.features.single_stock import compute_single_stock_features
+
     from src.features.cross_sectional import compute_cross_sectional_features
     from src.features.postprocessing import interpolate_internal_gaps
     from src.features.timeframe import combine_to_long, partition_by_symbol, TimeframeResampler
@@ -515,7 +540,8 @@ def run_feature_pipeline(
             enhanced_mappings=enhanced_mappings,
             sp500_tickers=sp500_tickers,
             full_output=full_output,
-            checkpoint_config=checkpoint_config
+            checkpoint_config=checkpoint_config,
+            exclude_retired=exclude_retired,
         )
 
         # Save BOTH complete and filtered feature files
@@ -543,6 +569,21 @@ def run_feature_pipeline(
 
         elapsed = time.time() - start_time
         logger.info(f"Pipeline completed in {elapsed:.1f}s")
+
+        # Explicit cleanup to prevent segfault on exit
+        # This ensures joblib workers are properly terminated before Python shuts down
+        import gc
+        gc.collect()
+
+        # Force terminate any lingering joblib workers
+        try:
+            from joblib.externals.loky import get_reusable_executor
+            executor = get_reusable_executor()
+            executor.shutdown(wait=True, kill_workers=True)
+        except Exception:
+            pass  # Ignore errors during cleanup
+
+        gc.collect()
 
         # Print summary
         print("\n" + "=" * 50)
@@ -579,6 +620,12 @@ def run_feature_pipeline(
         print(f"Output directory:   {output_dir}")
         print(f"Total time:         {elapsed:.1f}s")
         print("=" * 50)
+
+        # Force exit to avoid segfault from joblib worker cleanup race condition
+        # This bypasses Python's normal shutdown which can hang/segfault with loky
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
     except ImportError as e:
         logger.error(f"Could not import pipeline components: {e}")
@@ -674,7 +721,11 @@ Examples:
         action="store_true",
         help="Output all computed features (default: curated subset ~200 features)"
     )
-
+    parser.add_argument(
+        "--exclude-retired",
+        action="store_true",
+        help="Exclude retired features from output files (saves disk space)"
+    )
     # Checkpoint arguments
     parser.add_argument(
         "--checkpoint-dir",
@@ -753,7 +804,8 @@ Examples:
         n_jobs=args.n_jobs,
         batch_size=args.batch_size,
         full_output=args.full_output,
-        checkpoint_config=checkpoint_config
+        checkpoint_config=checkpoint_config,
+        exclude_retired=args.exclude_retired,
     )
 
 
