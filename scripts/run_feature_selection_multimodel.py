@@ -361,7 +361,7 @@ def run_multimodel_selection(
         print()
 
     # Pre-filter features by NaN rate
-    valid_features = filter_features_by_nan_rate(X[candidate_features], max_rate=0.3)
+    valid_features = filter_features_by_nan_rate(X[candidate_features], max_nan_rate=0.3)
     if verbose:
         print(f"After NaN filter (max 30%): {len(valid_features)} features")
 
