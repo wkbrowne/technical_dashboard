@@ -166,3 +166,9 @@ test_*.py
 notebooks/Feature_Dashboard.ipynb
 notebooks/Feature_Explorer.ipynb
 notebooks/ML_Training.ipynb
+
+# Backup files
+*.backup_*
+
+# Log files from feature selection
+feature_selection_log.txt
