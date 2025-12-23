@@ -190,8 +190,12 @@ def load_and_prepare_data(
     exclude_cols = {
         'symbol', 'date', 'close', 'open', 'high', 'low', 'volume', 'adjclose',
         'hit', 'weight_final', 'target', 'sector',
-        # Triple barrier target columns
-        't_hit', 'side', 'h_used', 'pnl', 'n_overlapping_trajs',
+        # Triple barrier target columns (per-model hit columns)
+        'hit_long_normal', 'hit_long_parabolic', 'hit_short_normal', 'hit_short_parabolic',
+        'ret_long_normal', 'ret_long_parabolic', 'ret_short_normal', 'ret_short_parabolic',
+        'h_used_long_normal', 'h_used_long_parabolic', 'h_used_short_normal', 'h_used_short_parabolic',
+        't0', 't_hit', 'entry_px', 'atr_at_entry',
+        'side', 'h_used', 'pnl', 'n_overlapping_trajs',
         'weight_overlap', 'weight_class_balance', 'is_last_traj',
     }
     feature_cols = [c for c in merged.columns if c not in exclude_cols]
@@ -200,8 +204,15 @@ def load_and_prepare_data(
     X = merged[feature_cols].copy()
     X.index = merged['date']
 
-    # Create targets DataFrame
-    target_cols = ['symbol', 'date', 'hit']
+    # Create targets DataFrame with model-specific hit columns
+    target_cols = ['symbol', 'date']
+    # Add model-specific hit columns if they exist
+    for model_hit_col in ['hit_long_normal', 'hit_long_parabolic', 'hit_short_normal', 'hit_short_parabolic']:
+        if model_hit_col in merged.columns:
+            target_cols.append(model_hit_col)
+    # Fallback to 'hit' if no model-specific columns
+    if 'hit' in merged.columns and not any(c.startswith('hit_') for c in target_cols):
+        target_cols.append('hit')
     if has_weights:
         target_cols.append('weight_final')
     targets_df = merged[target_cols].copy()
@@ -238,46 +249,52 @@ def get_model_labels(
 ) -> pd.Series:
     """Get target labels for a specific model key.
 
-    Currently uses the same 'hit' column for all models, but structured
-    to support different label columns per model in the future.
+    Uses model-specific hit columns from triple barrier targets:
+    - hit_long_normal: 1 if upper barrier hit, -1 if lower, 0 if timeout
+    - hit_long_parabolic: same for extended upper barrier
+    - hit_short_normal: same for lower barrier target
+    - hit_short_parabolic: same for extended lower barrier
 
     Args:
-        targets_df: DataFrame with target columns
+        targets_df: DataFrame with target columns (hit_long_normal, etc.)
         model_key: Model key to get labels for
-        binary: If True, convert to binary (exclude neutral)
+        binary: If True, convert to binary (exclude neutral/timeout)
 
     Returns:
-        Target Series
-
-    TODO: Implement different label columns per model key:
-        - LONG_NORMAL: hit_long_normal (upper barrier = success)
-        - LONG_PARABOLIC: hit_long_parabolic (extended upper = success)
-        - SHORT_NORMAL: hit_short_normal (lower barrier = success)
-        - SHORT_PARABOLIC: hit_short_parabolic (extended lower = success)
+        Target Series with binary labels (1=success, 0=failure)
     """
-    # TODO: Once different label columns exist, map model_key to column name:
-    # label_column_map = {
-    #     ModelKey.LONG_NORMAL: 'hit_long_normal',
-    #     ModelKey.LONG_PARABOLIC: 'hit_long_parabolic',
-    #     ModelKey.SHORT_NORMAL: 'hit_short_normal',
-    #     ModelKey.SHORT_PARABOLIC: 'hit_short_parabolic',
-    # }
-    # label_col = label_column_map.get(model_key, 'hit')
+    # Map model key to corresponding hit column
+    label_column_map = {
+        ModelKey.LONG_NORMAL: 'hit_long_normal',
+        ModelKey.LONG_PARABOLIC: 'hit_long_parabolic',
+        ModelKey.SHORT_NORMAL: 'hit_short_normal',
+        ModelKey.SHORT_PARABOLIC: 'hit_short_parabolic',
+    }
 
-    # For now, use 'hit' for all models
-    label_col = 'hit'
+    label_col = label_column_map.get(model_key)
+
+    # Fallback to 'hit' if model-specific column doesn't exist
+    if label_col not in targets_df.columns:
+        if 'hit' in targets_df.columns:
+            label_col = 'hit'
+        else:
+            raise ValueError(
+                f"No target column found for {model_key}. "
+                f"Expected '{label_column_map[model_key]}' or 'hit'. "
+                f"Available columns: {list(targets_df.columns)}"
+            )
 
     df = targets_df.copy()
 
     if binary:
-        # Binary: upper barrier (1) vs lower barrier (0), exclude neutral
+        # Binary: hit barrier (1) vs missed/opposite (-1), exclude timeout (0)
         df = df[df[label_col] != 0].copy()
 
         if model_key.is_long():
-            # Long models: upper barrier hit = success (1)
+            # Long models: upper barrier hit = success (1), lower = failure (0)
             df['target'] = (df[label_col] == 1).astype(int)
         else:
-            # Short models: lower barrier hit = success (1)
+            # Short models: lower barrier hit = success (1), upper = failure (0)
             df['target'] = (df[label_col] == -1).astype(int)
     else:
         # Multi-class: -1, 0, 1 -> 0, 1, 2

@@ -1285,25 +1285,26 @@ This signature enables:
 - Detecting when results need to be regenerated (data/config changed)
 - Reproducibility auditing
 
-### 17.7 Label Column Structure (TODO)
+### 17.7 Label Column Structure
 
-Currently, all models use the same `hit` column from triple barrier targets. The architecture supports model-specific label columns:
+Each model uses its own target column from triple barrier labeling with different ATR multiples:
 
-```python
-# Future label column mapping
-LABEL_COLUMNS = {
-    ModelKey.LONG_NORMAL: 'hit',           # Upper barrier = success
-    ModelKey.LONG_PARABOLIC: 'hit',        # Extended upper = success
-    ModelKey.SHORT_NORMAL: 'hit',          # Lower barrier = success (inverted)
-    ModelKey.SHORT_PARABOLIC: 'hit',       # Extended lower = success (inverted)
-}
-```
+| Model Key | Target Column | Barrier Config | Success Condition |
+|-----------|---------------|----------------|-------------------|
+| `LONG_NORMAL` | `hit_long_normal` | 1.5x ATR up/down | Upper barrier hit (1) |
+| `LONG_PARABOLIC` | `hit_long_parabolic` | 2.5x ATR up, 1.5x down | Upper barrier hit (1) |
+| `SHORT_NORMAL` | `hit_short_normal` | 1.5x up, 2.0x ATR down | Lower barrier hit (-1) |
+| `SHORT_PARABOLIC` | `hit_short_parabolic` | 1.5x up, 2.5x ATR down | Lower barrier hit (-1) |
 
-**TODO**: Once different target generation strategies are implemented:
+**Hit column values:**
+- `1`: Upper barrier hit (profit for long)
+- `-1`: Lower barrier hit (profit for short)
+- `0`: Timeout (neither barrier hit within horizon)
 
-1. Add `hit_long_normal`, `hit_long_parabolic`, `hit_short_normal`, `hit_short_parabolic` columns to `targets_triple_barrier.parquet`
-2. Update `get_model_labels()` in `run_feature_selection_multimodel.py` to use model-specific columns
-3. Consider different barrier configurations per model type
+The `get_model_labels()` function automatically:
+1. Selects the correct column for each model
+2. Filters out timeout samples (hit=0) for binary classification
+3. Converts to binary labels (1=success, 0=failure)
 
 ### 17.8 Best Practices
 
