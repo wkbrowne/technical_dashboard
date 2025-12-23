@@ -147,15 +147,29 @@ from .pipeline import (
 
 # Base features configuration
 from .base_features import (
+    # Core data structures
     BASE_FEATURES,
+    CORE_FEATURES,
+    HEAD_FEATURES,
     FEATURE_CATEGORIES,
     EXPANSION_CANDIDATES,
     EXCLUDED_FEATURES,
+    # Model-aware feature retrieval
+    get_core_features,
+    get_head_features,
+    get_featureset,
+    get_all_selectable_features,
+    get_all_head_features,
+    get_features_required_for_model,
+    get_retired_features_safe_to_skip,
+    # Legacy functions
     get_base_features,
     get_expansion_candidates,
     get_excluded_features,
-    get_all_selectable_features,
+    # Validation
     validate_features,
+    validate_model_featuresets,
+    report_head_features_status,
 )
 
 # CV utilities
@@ -240,6 +254,25 @@ from .utils import (
     cleanup_memory,
 )
 
+# Multi-model selection support
+from .multimodel import (
+    FeatureSelectionResult,
+    MultiModelSelectionSummary,
+    run_single_model_selection,
+    compute_overlap_analysis,
+    compute_run_signature,
+    compute_cv_config_hash,
+    compute_universe_hash,
+    write_per_model_artifacts,
+    write_global_summary,
+    validate_selected_features,
+    # Auto-update base_features.py
+    generate_base_features_update,
+    update_base_features_file,
+    compute_feature_diff,
+    print_feature_diff,
+)
+
 __all__ = [
     # Enums
     'ModelType',
@@ -263,16 +296,29 @@ __all__ = [
     # Loose-then-tight pipeline
     'LooseTightPipeline',
     'run_loose_tight_selection',
-    # Base features
+    # Base features - core data structures
     'BASE_FEATURES',
+    'CORE_FEATURES',
+    'HEAD_FEATURES',
     'FEATURE_CATEGORIES',
     'EXPANSION_CANDIDATES',
     'EXCLUDED_FEATURES',
+    # Model-aware feature retrieval
+    'get_core_features',
+    'get_head_features',
+    'get_featureset',
+    'get_all_selectable_features',
+    'get_all_head_features',
+    'get_features_required_for_model',
+    'get_retired_features_safe_to_skip',
+    # Legacy functions
     'get_base_features',
     'get_expansion_candidates',
     'get_excluded_features',
-    'get_all_selectable_features',
+    # Validation
     'validate_features',
+    'validate_model_featuresets',
+    'report_head_features_status',
     # CV
     'TimeSeriesCV',
     'PurgedKFold',
@@ -329,6 +375,22 @@ __all__ = [
     'print_feature_summary',
     'estimate_compute_time',
     'cleanup_memory',
+    # Multi-model selection
+    'FeatureSelectionResult',
+    'MultiModelSelectionSummary',
+    'run_single_model_selection',
+    'compute_overlap_analysis',
+    'compute_run_signature',
+    'compute_cv_config_hash',
+    'compute_universe_hash',
+    'write_per_model_artifacts',
+    'write_global_summary',
+    'validate_selected_features',
+    # Auto-update base_features.py
+    'generate_base_features_update',
+    'update_base_features_file',
+    'compute_feature_diff',
+    'print_feature_diff',
 ]
 
 __version__ = '1.0.0'

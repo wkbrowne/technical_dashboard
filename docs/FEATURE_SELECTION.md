@@ -291,14 +291,14 @@ The pipeline tracks multiple metrics for comprehensive evaluation:
   ┌──────────────────────────────────────────────────────────────────┐
   │                     METRICS SUMMARY                              │
   ├──────────────────────────────────────────────────────────────────┤
-  │ Stage: 3_strict_backward    Features:  42                        │
+  │ Stage: 3_strict_backward    Features: N                          │
   ├──────────┬────────────┬────────────┬──────────┬─────────────────┤
   │  Metric  │    Mean    │    Std     │  Better  │ Interpretation  │
   ├──────────┼────────────┼────────────┼──────────┼─────────────────┤
-  │   AUC    │   0.6932   │   0.0145   │ ↑ higher │  Discrimination │
-  │   AUPR   │   0.6821   │   0.0198   │ ↑ higher │   Prec-Recall   │
-  │  BRIER   │   0.2341   │   0.0087   │ ↓ lower  │   Calibration   │
-  │ LOG_LOSS │   0.6543   │   0.0234   │ ↓ lower  │   Likelihood    │
+  │   AUC    │   X.XXXX   │   0.XXXX   │ ↑ higher │  Discrimination │
+  │   AUPR   │   X.XXXX   │   0.XXXX   │ ↑ higher │   Prec-Recall   │
+  │  BRIER   │   0.XXXX   │   0.XXXX   │ ↓ lower  │   Calibration   │
+  │ LOG_LOSS │   0.XXXX   │   0.XXXX   │ ↓ lower  │   Likelihood    │
   └──────────┴────────────┴────────────┴──────────┴─────────────────┘
 ```
 
@@ -384,7 +384,7 @@ We intentionally choose slightly sub-optimal but robust feature sets:
 
 ### 5.1 Curated Feature Set
 
-The selection starts from `BASE_FEATURES` in `src/feature_selection/base_features.py` (36 features, 0.6932 AUC):
+The selection starts from `BASE_FEATURES` in `src/feature_selection/base_features.py`:
 
 | Category | Features | Description |
 |----------|----------|-------------|
@@ -756,7 +756,7 @@ artifacts/feature_selection/
 # selected_features.txt
 # Best features from Loose-then-Tight pipeline
 # Stage: 3_strict_backward
-# AUC: 0.6932 +/- 0.0625
+# Metric: [mean] +/- [std]
 
 rsi_14
 w_macd_histogram
@@ -766,14 +766,14 @@ trend_score_sign
 # selection_summary.json
 {
   "best_stage": "3_strict_backward",
-  "n_features": 42,
-  "metric_mean": 0.6932,
-  "metric_std": 0.0625,
+  "n_features": ...,
+  "metric_mean": ...,
+  "metric_std": ...,
   "features": ["alpha_mom_spy_20_ema10", "atr_percent", "rsi_14", ...],
   "stages": [
-    {"stage": "1_base_features", "n_features": 36, "metric_mean": 0.6821, "metric_std": 0.0512, "is_best": false},
-    {"stage": "2_loose_forward", "n_features": 58, "metric_mean": 0.6905, "metric_std": 0.0498, "is_best": false},
-    {"stage": "3_strict_backward", "n_features": 42, "metric_mean": 0.6932, "metric_std": 0.0625, "is_best": true}
+    {"stage": "1_base_features", "n_features": ..., "metric_mean": ..., "metric_std": ..., "is_best": false},
+    {"stage": "2_loose_forward", "n_features": ..., "metric_mean": ..., "metric_std": ..., "is_best": false},
+    {"stage": "3_strict_backward", "n_features": ..., "metric_mean": ..., "metric_std": ..., "is_best": true}
   ],
   "config": {
     "n_folds": 5,
@@ -866,13 +866,13 @@ evaluator = SubsetEvaluator(
   ┌─────────────────────┬────────┐
   │  Sector             │  AUC   │
   ├─────────────────────┼────────┤
-  │  Technology         │ 0.6921 │
-  │  Health Care        │ 0.6845 │
-  │  Financials         │ 0.7012 │
-  │  Consumer Discret.  │ 0.6789 │
+  │  Technology         │ X.XXXX │
+  │  Health Care        │ X.XXXX │
+  │  Financials         │ X.XXXX │
+  │  Consumer Discret.  │ X.XXXX │
   │  ...                │ ...    │
   └─────────────────────┴────────┘
-  Sector AUC Std Dev: 0.0087 (< 0.03 = consistent)
+  Sector AUC Std Dev: 0.XXXX (< 0.03 = consistent)
 ```
 
 **Warning trigger**: If sector AUC std dev > 0.03, display warning about potential sector concentration.
@@ -1039,4 +1039,351 @@ pipeline = LooseTightPipeline()
 pipeline.resume_from_checkpoint(X, y)
 for snapshot in pipeline.snapshots:
     print(f"{snapshot.stage}: {len(snapshot.features)} features, {snapshot.metric_mean:.4f}")
+```
+
+---
+
+## 17. Multi-Model Feature Selection
+
+### 17.1 Overview
+
+The multi-model feature selection system runs the Loose-Tight pipeline independently for each of the 4 model targets while ensuring:
+
+- **Same CV splits**: All models use identical time-series CV splits for comparability
+- **Same feature universe**: All models start from the same candidate features
+- **Single data load**: Features are computed once and reused
+
+**Model Keys:**
+
+| Model Key | Target | Interpretation |
+|-----------|--------|----------------|
+| `LONG_NORMAL` | Upper barrier hit | Standard long momentum (1.5 ATR) |
+| `LONG_PARABOLIC` | Extended upper | Trend persistence / parabolic moves |
+| `SHORT_NORMAL` | Lower barrier hit | Breakdown / fragility setups |
+| `SHORT_PARABOLIC` | Extended lower | Panic / regime shift |
+
+### 17.2 Running Multi-Model Selection
+
+**CLI Usage:**
+
+```bash
+# Run all 4 models (default)
+python scripts/run_feature_selection_multimodel.py
+
+# Run specific models
+python scripts/run_feature_selection_multimodel.py --model-keys LONG_NORMAL,SHORT_NORMAL
+
+# Limit max features per model
+python scripts/run_feature_selection_multimodel.py --max-features 50
+
+# Use cached data for faster iteration
+python scripts/run_feature_selection_multimodel.py --use-cache
+
+# Custom output directory
+python scripts/run_feature_selection_multimodel.py --output-dir artifacts/my_selection
+```
+
+**Programmatic Usage:**
+
+```python
+from src.feature_selection.multimodel import (
+    run_single_model_selection,
+    compute_overlap_analysis,
+    write_per_model_artifacts,
+    write_global_summary,
+)
+from src.config.model_keys import ModelKey
+
+# Run for a single model
+result = run_single_model_selection(
+    X=features_df,
+    y=target_series,
+    model_key=ModelKey.LONG_NORMAL,
+    features=candidate_features,
+    sample_weight=weights,
+    verbose=True,
+)
+
+# Access results
+print(f"Selected: {result.n_features} features")
+print(f"AUC: {result.cv_auc_mean:.4f} ± {result.cv_auc_std:.4f}")
+print(f"Features: {result.selected_features}")
+```
+
+### 17.3 Output Artifacts
+
+**Per-Model Artifacts:**
+
+```
+artifacts/feature_selection/
+├── long_normal/
+│   ├── selected_features.json    # Full metadata
+│   └── selected_features.txt     # Feature list only
+├── long_parabolic/
+│   ├── selected_features.json
+│   └── selected_features.txt
+├── short_normal/
+│   ├── selected_features.json
+│   └── selected_features.txt
+├── short_parabolic/
+│   ├── selected_features.json
+│   └── selected_features.txt
+└── summary.json                  # Global summary with overlap analysis
+```
+
+**Per-Model JSON Schema (`selected_features.json`):**
+
+```json
+{
+  "model_key": "long_normal",
+  "selected_features": ["feat1", "feat2", "..."],
+  "n_features": 42,
+  "cv_auc_mean": 0.6789,
+  "cv_auc_std": 0.0123,
+  "fold_metrics": [0.68, 0.67, 0.69, 0.68, 0.68],
+  "secondary_metrics": {
+    "auc": {"mean": 0.6789, "std": 0.0123}
+  },
+  "best_stage": "3_strict_backward",
+  "algorithm": "loose_tight_pipeline",
+  "algorithm_params": {
+    "epsilon_add_loose": 0.0002,
+    "epsilon_remove_strict": 0.0,
+    "max_features_loose": 80
+  },
+  "cv_config_hash": "a1b2c3d4e5f6",
+  "date_range": ["2020-01-01", "2024-12-01"],
+  "universe_hash": "f6e5d4c3b2a1",
+  "timestamp": "2024-12-22T10:30:00Z",
+  "run_signature": "abc123def456",
+  "elapsed_seconds": 1234.5
+}
+```
+
+**Global Summary Schema (`summary.json`):**
+
+```json
+{
+  "results": {
+    "long_normal": { "...per-model result..." },
+    "long_parabolic": { "..." },
+    "short_normal": { "..." },
+    "short_parabolic": { "..." }
+  },
+  "core_features": ["feat1", "feat2", "..."],
+  "head_features": {
+    "long_normal": ["unique_feat1", "..."],
+    "long_parabolic": ["unique_feat2", "..."],
+    "short_normal": ["unique_feat3", "..."],
+    "short_parabolic": ["unique_feat4", "..."]
+  },
+  "overlap_matrix": {
+    "long_normal": {
+      "long_normal": 1.0,
+      "long_parabolic": 0.75,
+      "short_normal": 0.60,
+      "short_parabolic": 0.55
+    }
+  },
+  "intersection_matrix": {
+    "long_normal": {
+      "long_normal": 42,
+      "long_parabolic": 35,
+      "short_normal": 30,
+      "short_parabolic": 28
+    }
+  },
+  "union_size": 85,
+  "top_shared_features": [
+    {"feature": "rsi_14", "count": 4},
+    {"feature": "atr_percent", "count": 4}
+  ],
+  "run_signature": "combined_hash",
+  "timestamp": "2024-12-22T10:30:00Z"
+}
+```
+
+### 17.4 CORE and HEAD Features
+
+**CORE_FEATURES**: Features selected by ALL 4 models (intersection). These represent the most universally predictive signals.
+
+**HEAD_FEATURES[model_key]**: Features unique to each model (selected by that model but not in CORE). These capture model-specific patterns.
+
+```
+Total Features = CORE_FEATURES ∪ HEAD_FEATURES[model_key]
+CORE_FEATURES  = ∩ (all selected feature sets)
+HEAD_FEATURES[mk] = selected[mk] - CORE_FEATURES
+```
+
+**Example Analysis:**
+
+```python
+import json
+from pathlib import Path
+
+# Load summary
+with open('artifacts/feature_selection/summary.json') as f:
+    summary = json.load(f)
+
+# Core features (shared by all models)
+print(f"CORE: {len(summary['core_features'])} features")
+for feat in summary['core_features'][:5]:
+    print(f"  - {feat}")
+
+# Model-specific head features
+for model_key, head_feats in summary['head_features'].items():
+    print(f"\n{model_key}: {len(head_feats)} unique features")
+    for feat in head_feats[:3]:
+        print(f"  - {feat}")
+```
+
+### 17.5 Overlap Analysis
+
+**Jaccard Similarity**: Measures pairwise overlap between model feature sets:
+
+```
+Jaccard(A, B) = |A ∩ B| / |A ∪ B|
+```
+
+- 1.0 = identical feature sets
+- 0.0 = completely disjoint
+
+**Interpretation:**
+
+| Jaccard Range | Interpretation |
+|---------------|----------------|
+| > 0.8 | Very similar models, may be redundant |
+| 0.5 - 0.8 | Moderate overlap, models share core signals |
+| 0.3 - 0.5 | Low overlap, models capture different patterns |
+| < 0.3 | Very different, models may target distinct regimes |
+
+### 17.6 Run Signature for Reproducibility
+
+Each selection run generates a unique signature combining:
+
+- Feature universe hash (which features were candidates)
+- CV configuration hash (splits, gap, purge)
+- Date range of data
+- Algorithm parameters
+- Model key
+
+```python
+from src.feature_selection.multimodel import compute_run_signature
+
+signature = compute_run_signature(
+    universe_hash="a1b2c3",
+    cv_config_hash="d4e5f6",
+    date_range=("2020-01-01", "2024-12-01"),
+    algorithm_params={"epsilon_add_loose": 0.0002},
+    model_key="long_normal",
+)
+# Returns: "abc123def456" (12-char hex hash)
+```
+
+This signature enables:
+- Tracking which runs produced which feature sets
+- Detecting when results need to be regenerated (data/config changed)
+- Reproducibility auditing
+
+### 17.7 Label Column Structure (TODO)
+
+Currently, all models use the same `hit` column from triple barrier targets. The architecture supports model-specific label columns:
+
+```python
+# Future label column mapping
+LABEL_COLUMNS = {
+    ModelKey.LONG_NORMAL: 'hit',           # Upper barrier = success
+    ModelKey.LONG_PARABOLIC: 'hit',        # Extended upper = success
+    ModelKey.SHORT_NORMAL: 'hit',          # Lower barrier = success (inverted)
+    ModelKey.SHORT_PARABOLIC: 'hit',       # Extended lower = success (inverted)
+}
+```
+
+**TODO**: Once different target generation strategies are implemented:
+
+1. Add `hit_long_normal`, `hit_long_parabolic`, `hit_short_normal`, `hit_short_parabolic` columns to `targets_triple_barrier.parquet`
+2. Update `get_model_labels()` in `run_feature_selection_multimodel.py` to use model-specific columns
+3. Consider different barrier configurations per model type
+
+### 17.8 Best Practices
+
+1. **Run all 4 models together**: Ensures identical CV splits and feature universe
+2. **Use caching for iteration**: `--use-cache` speeds up re-runs during tuning
+3. **Check overlap matrix**: Very high overlap (>0.9) suggests models may be redundant
+4. **Monitor CORE size**: A small CORE indicates models target very different signals
+5. **Validate against registry**: Ensure selected features exist in `base_features.py`
+
+### 17.9 Auto-Updating Feature Registry
+
+After multi-model selection, you can automatically update `base_features.py` with the new CORE/HEAD features:
+
+```bash
+# Run selection and auto-update registry
+python scripts/run_feature_selection_multimodel.py --update-registry
+
+# Preview changes without modifying (dry run)
+python scripts/run_feature_selection_multimodel.py --update-registry --dry-run
+
+# Skip backup when updating
+python scripts/run_feature_selection_multimodel.py --update-registry --no-backup
+```
+
+**What gets updated:**
+
+| Registry Variable | Updated To |
+|-------------------|------------|
+| `CORE_FEATURES` | Intersection of all 4 model selections |
+| `HEAD_FEATURES[model_key]` | Model-specific features (selected minus CORE) |
+
+**Important notes:**
+
+1. **Nothing is protected**: The backward elimination stage can remove ANY feature, including those currently in CORE_FEATURES. Features earn their place through CV performance.
+
+2. **Backup created**: By default, a timestamped backup is created before modifying (`base_features.py.backup_YYYYMMDD_HHMMSS`).
+
+3. **Diff displayed**: The script shows added/removed features before applying changes.
+
+4. **Timestamp tracking**: Updated registry includes auto-generation timestamp and run signature for traceability.
+
+**Programmatic usage:**
+
+```python
+from src.feature_selection.multimodel import (
+    update_base_features_file,
+    compute_feature_diff,
+    print_feature_diff,
+)
+from src.feature_selection.base_features import CORE_FEATURES, HEAD_FEATURES
+
+# After running selection and getting summary...
+diff = compute_feature_diff(CORE_FEATURES, old_head_dict, summary)
+print_feature_diff(diff)
+
+# Apply update
+result = update_base_features_file(
+    summary=summary,
+    backup=True,
+    dry_run=False,
+    verbose=True,
+)
+```
+
+### 17.10 Integration with Training Pipeline
+
+After multi-model selection, the results feed into model training:
+
+```python
+# Load selected features per model
+import json
+
+def load_selected_features(model_key: str) -> list:
+    path = f'artifacts/feature_selection/{model_key}/selected_features.json'
+    with open(path) as f:
+        return json.load(f)['selected_features']
+
+# Use in training
+for model_key in ['long_normal', 'long_parabolic', 'short_normal', 'short_parabolic']:
+    features = load_selected_features(model_key)
+    X_train = features_df[features]
+    # ... train model ...
 ```

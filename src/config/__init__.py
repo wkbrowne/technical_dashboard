@@ -30,6 +30,15 @@ from .features import (
 
 from .parallel import ParallelConfig
 
+from .model_keys import (
+    ModelKey,
+    LONG_NORMAL,
+    LONG_PARABOLIC,
+    SHORT_NORMAL,
+    SHORT_PARABOLIC,
+    DEFAULT_MODEL_KEY,
+)
+
 # Import basic configuration settings
 import os
 from pathlib import Path
@@ -76,6 +85,13 @@ __all__ = [
     'get_default_feature_config',
     # Parallel configuration
     'ParallelConfig',
+    # Model keys (4-model system)
+    'ModelKey',
+    'LONG_NORMAL',
+    'LONG_PARABOLIC',
+    'SHORT_NORMAL',
+    'SHORT_PARABOLIC',
+    'DEFAULT_MODEL_KEY',
     # Global settings
     'CACHE_DIR',
     'STOCKS_CACHE_DIR',
