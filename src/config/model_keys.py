@@ -19,8 +19,13 @@ Usage:
     features = get_featureset(ModelKey.LONG_NORMAL)
 """
 
+import json
+import logging
 from enum import Enum
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 
 class ModelKey(str, Enum):
@@ -156,3 +161,109 @@ def get_all_target_configs() -> Dict[ModelKey, Dict[str, Any]]:
         Dictionary mapping ModelKey to target configuration
     """
     return {k: v.copy() for k, v in TARGET_CONFIGS.items()}
+
+
+def load_target_configs_from_file(
+    config_path: Union[str, Path]
+) -> Dict[ModelKey, Dict[str, Any]]:
+    """
+    Load target configurations from a calibration JSON file.
+
+    This allows using custom barrier thresholds from calibrate_barriers.py output
+    instead of the hardcoded TARGET_CONFIGS defaults.
+
+    Args:
+        config_path: Path to barrier_calibration.json file
+
+    Returns:
+        Dictionary mapping ModelKey to target configuration
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist
+        ValueError: If config file is invalid
+
+    Example:
+        >>> configs = load_target_configs_from_file("artifacts/targets/barrier_calibration.json")
+        >>> # Use with target generation
+        >>> for model_key, config in configs.items():
+        ...     print(f"{model_key}: up={config['up_mult']}, dn={config['dn_mult']}")
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Target config file not found: {config_path}")
+
+    with open(config_path, 'r') as f:
+        data = json.load(f)
+
+    if 'target_configs' not in data:
+        raise ValueError(f"Invalid calibration file: missing 'target_configs' key in {config_path}")
+
+    raw_configs = data['target_configs']
+    configs: Dict[ModelKey, Dict[str, Any]] = {}
+
+    # Required keys for each config
+    required_keys = {'up_mult', 'dn_mult', 'max_horizon', 'start_every'}
+
+    for model_key_str, config in raw_configs.items():
+        # Validate config has required keys
+        missing = required_keys - set(config.keys())
+        if missing:
+            raise ValueError(f"Config for {model_key_str} missing required keys: {missing}")
+
+        # Convert string key to ModelKey enum
+        try:
+            model_key = ModelKey(model_key_str)
+        except ValueError:
+            logger.warning(f"Unknown model key in config file: {model_key_str}, skipping")
+            continue
+
+        # Extract only the standard config keys (exclude calibration_info metadata)
+        clean_config = {
+            'up_mult': float(config['up_mult']),
+            'dn_mult': float(config['dn_mult']),
+            'max_horizon': int(config['max_horizon']),
+            'start_every': int(config['start_every']),
+            'target_col': config.get('target_col', f"target_{model_key_str}"),
+        }
+
+        configs[model_key] = clean_config
+
+    if not configs:
+        raise ValueError(f"No valid model configurations found in {config_path}")
+
+    # Log loaded configs
+    logger.info(f"Loaded {len(configs)} target configs from {config_path}")
+    for mk, cfg in configs.items():
+        logger.info(f"  {mk.value}: up_mult={cfg['up_mult']}, dn_mult={cfg['dn_mult']}")
+
+    return configs
+
+
+def override_target_configs(
+    config_path: Optional[Union[str, Path]] = None
+) -> Dict[ModelKey, Dict[str, Any]]:
+    """
+    Get target configs, optionally overriding with values from a file.
+
+    This is the recommended way to get target configs when you want to support
+    both default and calibrated configurations.
+
+    Args:
+        config_path: Optional path to barrier_calibration.json.
+                     If None, returns default TARGET_CONFIGS.
+
+    Returns:
+        Dictionary mapping ModelKey to target configuration
+
+    Example:
+        >>> # Using default configs
+        >>> configs = override_target_configs()
+
+        >>> # Using calibrated configs
+        >>> configs = override_target_configs("artifacts/targets/barrier_calibration.json")
+    """
+    if config_path is None:
+        return get_all_target_configs()
+
+    return load_target_configs_from_file(config_path)

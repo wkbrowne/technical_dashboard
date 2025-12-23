@@ -4,6 +4,12 @@ Triple barrier target generation for financial time series.
 This module generates triple barrier targets for stock trajectories using configurable
 barriers based on ATR (Average True Range). Each target represents a potential trade
 with upper/lower barriers and time horizon constraints.
+
+Supports multi-target generation for the 4-model system:
+- LONG_NORMAL: 1.5 ATR up (profit), 1.5 ATR down (stop)
+- LONG_PARABOLIC: 2.5 ATR up (profit), 1.5 ATR down (stop)
+- SHORT_NORMAL: 1.5 ATR up (stop), 2.0 ATR down (profit)
+- SHORT_PARABOLIC: 1.5 ATR up (stop), 2.5 ATR down (profit)
 """
 import logging
 from typing import Dict, Optional, List, Union
@@ -17,6 +23,28 @@ try:
     from ..config.parallel import ParallelConfig
 except ImportError:
     from src.config.parallel import ParallelConfig
+
+# Import model keys and target configs
+try:
+    from ..config.model_keys import ModelKey, TARGET_CONFIGS, get_target_config
+except ImportError:
+    from src.config.model_keys import ModelKey, TARGET_CONFIGS, get_target_config
+
+# Import centralized validation
+try:
+    from ..validation.target_data import (
+        TargetDataValidator,
+        DEFAULT_VALIDATION_CONFIG,
+        filter_extreme_returns,
+        filter_invalid_entries,
+    )
+except ImportError:
+    from src.validation.target_data import (
+        TargetDataValidator,
+        DEFAULT_VALIDATION_CONFIG,
+        filter_extreme_returns,
+        filter_invalid_entries,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +370,196 @@ def get_target_summary(targets_df: pd.DataFrame) -> Dict:
     }
 
 
+def generate_multi_target_labels(
+    df: pd.DataFrame,
+    model_keys: Optional[List[ModelKey]] = None,
+    weight_min_clip: float = 0.01,
+    weight_max_clip: float = 10.0
+) -> pd.DataFrame:
+    """
+    Generate multiple target columns for the 4-model system.
+
+    This function creates a single targets DataFrame with separate target columns
+    for each model (hit_long_normal, hit_long_parabolic, hit_short_normal, hit_short_parabolic).
+    All models share the same trajectory timing (t0, t_hit) but have different barrier configs.
+
+    Args:
+        df: Long-format DataFrame with columns: symbol, date, close, high, low, atr
+        model_keys: List of ModelKey to generate targets for (default: all 4)
+        weight_min_clip: Minimum weight value (prevents zero weights)
+        weight_max_clip: Maximum weight value (prevents extreme weights)
+
+    Returns:
+        DataFrame with columns:
+        - symbol, t0, t_hit (shared trajectory timing)
+        - entry_px, atr_at_entry (shared entry info)
+        - hit_<model_key>: Target label for each model (-1, 0, 1)
+        - ret_<model_key>: Return from entry for each model
+        - h_used_<model_key>: Horizon used for each model
+        - weight_overlap, weight_final (shared weights based on primary model)
+
+    Notes:
+        - Uses LONG_NORMAL as the "primary" model for trajectory timing
+        - Other models re-evaluate the same trajectories with different barriers
+        - This approach ensures comparable targets across models for the same dates
+    """
+    if model_keys is None:
+        model_keys = ModelKey.all_keys()
+
+    required_cols = {'symbol', 'date', 'close', 'high', 'low', 'atr'}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    logger.info(f"Generating multi-target labels for {len(model_keys)} models: {[k.value for k in model_keys]}")
+
+    # Get the primary config (LONG_NORMAL) for trajectory timing
+    primary_config = get_target_config(ModelKey.LONG_NORMAL)
+
+    # Generate base targets using primary config (this determines t0, t_hit timing)
+    logger.info("Generating base trajectories using LONG_NORMAL config...")
+    base_targets = generate_triple_barrier_targets(
+        df, primary_config, weight_min_clip, weight_max_clip
+    )
+
+    if base_targets.empty:
+        logger.warning("No base targets generated")
+        return pd.DataFrame()
+
+    logger.info(f"Generated {len(base_targets)} base trajectories")
+
+    # Rename primary model columns
+    base_targets = base_targets.rename(columns={
+        'hit': f'hit_{ModelKey.LONG_NORMAL.value}',
+        'ret_from_entry': f'ret_{ModelKey.LONG_NORMAL.value}',
+        'h_used': f'h_used_{ModelKey.LONG_NORMAL.value}',
+        'top': f'top_{ModelKey.LONG_NORMAL.value}',
+        'bot': f'bot_{ModelKey.LONG_NORMAL.value}',
+        'price_hit': f'price_hit_{ModelKey.LONG_NORMAL.value}',
+    })
+
+    # Save entry info for re-evaluation
+    base_targets['atr_at_entry'] = base_targets['entry_px'].copy()  # We need ATR at entry
+
+    # Now re-evaluate the same trajectories with other model configs
+    # We need to merge back with the original data to get the price series
+    other_models = [k for k in model_keys if k != ModelKey.LONG_NORMAL]
+
+    if other_models:
+        logger.info(f"Re-evaluating trajectories for {len(other_models)} additional models...")
+
+        # Create a lookup for the original price data
+        df_indexed = df.set_index(['symbol', 'date']) if 'date' in df.columns else df
+
+        for model_key in other_models:
+            config = get_target_config(model_key)
+            logger.debug(f"Processing {model_key.value}: up_mult={config['up_mult']}, dn_mult={config['dn_mult']}")
+
+            # Re-evaluate each trajectory with this model's barrier config
+            hits = []
+            rets = []
+            h_useds = []
+
+            for idx, row in base_targets.iterrows():
+                symbol = row['symbol']
+                t0 = row['t0']
+                entry_px = row['entry_px']
+
+                # Get the ATR at entry from the stored value or estimate
+                # We stored in atr_at_entry but need the actual ATR from original data
+                try:
+                    if isinstance(df_indexed.index, pd.MultiIndex):
+                        symbol_data = df.loc[df['symbol'] == symbol].copy()
+                    else:
+                        symbol_data = df.loc[df['symbol'] == symbol].copy()
+
+                    if symbol_data.empty:
+                        hits.append(0)
+                        rets.append(np.nan)
+                        h_useds.append(config['max_horizon'])
+                        continue
+
+                    # Find ATR at t0
+                    t0_data = symbol_data[symbol_data['date'] == t0]
+                    if t0_data.empty:
+                        hits.append(0)
+                        rets.append(np.nan)
+                        h_useds.append(config['max_horizon'])
+                        continue
+
+                    atr_at_entry = t0_data['atr'].iloc[0]
+
+                    # Calculate barriers for this model
+                    top_barrier = entry_px + config['up_mult'] * atr_at_entry
+                    bot_barrier = entry_px - config['dn_mult'] * atr_at_entry
+
+                    # Get price data for the trajectory window
+                    symbol_data = symbol_data.sort_values('date')
+                    t0_idx = symbol_data[symbol_data['date'] == t0].index[0]
+                    t0_pos = symbol_data.index.get_loc(t0_idx)
+
+                    # Get the window (next day through max horizon)
+                    start_pos = t0_pos + 1
+                    end_pos = start_pos + config['max_horizon']
+
+                    if end_pos > len(symbol_data):
+                        hits.append(0)
+                        rets.append(np.nan)
+                        h_useds.append(config['max_horizon'])
+                        continue
+
+                    window = symbol_data.iloc[start_pos:end_pos]
+
+                    # Find barrier hits
+                    hit_top_idx = np.where(window['high'].values >= top_barrier)[0]
+                    hit_bot_idx = np.where(window['low'].values <= bot_barrier)[0]
+
+                    # Determine outcome
+                    hit_type = 0
+                    hit_idx = config['max_horizon'] - 1
+                    price_hit = window['close'].iloc[hit_idx] if len(window) > hit_idx else np.nan
+
+                    if len(hit_top_idx) > 0 and (len(hit_bot_idx) == 0 or hit_top_idx[0] <= hit_bot_idx[0]):
+                        hit_type = 1
+                        hit_idx = hit_top_idx[0]
+                        price_hit = top_barrier
+                    elif len(hit_bot_idx) > 0:
+                        hit_type = -1
+                        hit_idx = hit_bot_idx[0]
+                        price_hit = bot_barrier
+
+                    h_used = hit_idx + 1
+                    ret = np.log(price_hit / entry_px) if price_hit > 0 and entry_px > 0 else np.nan
+
+                    hits.append(hit_type)
+                    rets.append(ret)
+                    h_useds.append(h_used)
+
+                except Exception as e:
+                    logger.debug(f"Error processing {symbol} at {t0} for {model_key.value}: {e}")
+                    hits.append(0)
+                    rets.append(np.nan)
+                    h_useds.append(config['max_horizon'])
+
+            # Add columns for this model
+            base_targets[f'hit_{model_key.value}'] = hits
+            base_targets[f'ret_{model_key.value}'] = rets
+            base_targets[f'h_used_{model_key.value}'] = h_useds
+
+            # Log distribution for this model
+            hit_counts = pd.Series(hits).value_counts()
+            logger.info(f"  {model_key.value}: +1={hit_counts.get(1, 0)}, 0={hit_counts.get(0, 0)}, -1={hit_counts.get(-1, 0)}")
+
+    # Clean up intermediate columns
+    cols_to_drop = ['atr_at_entry']
+    base_targets = base_targets.drop(columns=[c for c in cols_to_drop if c in base_targets.columns])
+
+    logger.info(f"Multi-target generation complete: {len(base_targets)} trajectories, "
+               f"{len([c for c in base_targets.columns if c.startswith('hit_')])} target columns")
+
+    return base_targets
+
+
 def _add_overlap_counts(targets_df: pd.DataFrame, config: Dict) -> pd.DataFrame:
     """
     Add overlap counting to targets DataFrame using vectorized sweep-line algorithm.
@@ -624,10 +842,280 @@ def generate_targets_parallel(
         raise
 
 
+def _compute_multi_targets_for_symbol(
+    symbol_df: pd.DataFrame,
+    model_configs: Dict[str, Dict],
+    primary_model: str = "long_normal"
+) -> pd.DataFrame:
+    """
+    Compute multi-target labels for a single symbol using vectorized operations.
+
+    This is a pure function designed for parallel execution.
+
+    Args:
+        symbol_df: DataFrame for a single symbol with columns: date, close, high, low, atr
+        model_configs: Dict mapping model_key.value -> config dict
+        primary_model: The model to use for trajectory timing (default: long_normal)
+
+    Returns:
+        DataFrame with multi-target columns for this symbol
+    """
+    if symbol_df.empty or len(symbol_df) < 25:  # Need enough data
+        return pd.DataFrame()
+
+    symbol = symbol_df['symbol'].iloc[0]
+
+    # Sort by date and reset index for positional access
+    symbol_df = symbol_df.sort_values('date').reset_index(drop=True)
+
+    # Get primary config for trajectory timing
+    primary_config = model_configs[primary_model]
+    max_horizon = primary_config['max_horizon']
+    start_every = primary_config['start_every']
+
+    # Extract numpy arrays for speed
+    dates = symbol_df['date'].to_numpy('datetime64[ns]')
+    close = symbol_df['close'].to_numpy(dtype=float)
+    high = symbol_df['high'].to_numpy(dtype=float)
+    low = symbol_df['low'].to_numpy(dtype=float)
+    atr = symbol_df['atr'].to_numpy(dtype=float)
+
+    n = len(symbol_df)
+    trajectories = []
+
+    pos = 0
+    while pos < n - max_horizon - 1:
+        c0, a0, date0 = close[pos], atr[pos], dates[pos]
+
+        # Skip if entry price or ATR is invalid
+        if not (np.isfinite(c0) and np.isfinite(a0) and a0 > 0 and not np.isnat(date0)):
+            pos += 1
+            continue
+
+        # Define analysis window (next day through max horizon)
+        start_idx = pos + 1
+        end_idx = start_idx + max_horizon
+
+        if end_idx > n:
+            break
+
+        # Slice arrays for the analysis window
+        h_slice = high[start_idx:end_idx]
+        l_slice = low[start_idx:end_idx]
+        c_slice = close[start_idx:end_idx]
+
+        # Build trajectory record
+        traj = {
+            'symbol': symbol,
+            't0': date0,
+            'entry_px': c0,
+            'atr_at_entry': a0,
+        }
+
+        # Evaluate each model's barriers
+        primary_h_used = max_horizon  # Track primary model's h_used for advancement
+
+        for model_key, config in model_configs.items():
+            up_mult = config['up_mult']
+            dn_mult = config['dn_mult']
+
+            top_barrier = c0 + up_mult * a0
+            bot_barrier = c0 - dn_mult * a0
+
+            # Find barrier hits
+            hit_top_indices = np.where(h_slice >= top_barrier)[0]
+            hit_bot_indices = np.where(l_slice <= bot_barrier)[0]
+
+            # Determine outcome
+            hit_type = 0
+            hit_idx = max_horizon - 1
+            price_hit = c_slice[hit_idx] if len(c_slice) > hit_idx else np.nan
+
+            if len(hit_top_indices) > 0 and (len(hit_bot_indices) == 0 or hit_top_indices[0] <= hit_bot_indices[0]):
+                hit_type = 1
+                hit_idx = hit_top_indices[0]
+                price_hit = top_barrier
+            elif len(hit_bot_indices) > 0:
+                hit_type = -1
+                hit_idx = hit_bot_indices[0]
+                price_hit = bot_barrier
+
+            h_used = hit_idx + 1
+            ret = np.log(price_hit / c0) if price_hit > 0 and c0 > 0 else np.nan
+
+            traj[f'hit_{model_key}'] = hit_type
+            traj[f'ret_{model_key}'] = ret
+            traj[f'h_used_{model_key}'] = h_used
+
+            # Track primary model's h_used for position advancement
+            if model_key == primary_model:
+                primary_h_used = h_used
+                traj['t_hit'] = dates[start_idx + hit_idx] if start_idx + hit_idx < n else dates[-1]
+
+        trajectories.append(traj)
+
+        # Advance position based on primary model
+        if primary_h_used < start_every:
+            pos += primary_h_used
+        else:
+            pos += start_every
+
+    if not trajectories:
+        return pd.DataFrame()
+
+    return pd.DataFrame(trajectories)
+
+
+def generate_multi_targets_parallel(
+    df: pd.DataFrame,
+    model_keys: Optional[List[ModelKey]] = None,
+    n_jobs: int = -1,
+    weight_min_clip: float = 0.01,
+    weight_max_clip: float = 10.0,
+    parallel_config: Optional[ParallelConfig] = None
+) -> pd.DataFrame:
+    """
+    Generate multi-target labels in parallel for the 4-model system.
+
+    This is the recommended entry point for multi-target generation.
+    Each symbol is processed independently with vectorized operations.
+
+    Args:
+        df: Long-format DataFrame with columns: symbol, date, close, high, low, atr
+        model_keys: List of ModelKey to generate targets for (default: all 4)
+        n_jobs: Number of parallel workers (-1 = all cores)
+        weight_min_clip: Minimum weight value
+        weight_max_clip: Maximum weight value
+        parallel_config: ParallelConfig for parallel processing
+
+    Returns:
+        DataFrame with multi-target columns:
+        - symbol, t0, t_hit, entry_px
+        - hit_<model_key>, ret_<model_key>, h_used_<model_key> for each model
+        - weight_overlap, weight_class_balance, weight_final (based on primary model)
+    """
+    if model_keys is None:
+        model_keys = ModelKey.all_keys()
+
+    # Build model configs dict
+    model_configs = {k.value: get_target_config(k) for k in model_keys}
+
+    # Use ParallelConfig if provided
+    if parallel_config is not None:
+        n_jobs = parallel_config.n_jobs
+        backend = parallel_config.backend
+        verbose = parallel_config.verbose
+    else:
+        backend = 'loky'
+        verbose = 0
+
+    if df.empty:
+        logger.warning("Empty DataFrame provided to generate_multi_targets_parallel")
+        return pd.DataFrame()
+
+    # Validate required columns
+    required_cols = {'symbol', 'date', 'close', 'high', 'low', 'atr'}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    logger.info(f"Generating multi-targets for {len(model_keys)} models: {[k.value for k in model_keys]}")
+    for k in model_keys:
+        cfg = model_configs[k.value]
+        logger.info(f"  {k.value}: up_mult={cfg['up_mult']}, dn_mult={cfg['dn_mult']}")
+
+    # Get unique symbols
+    unique_symbols = df['symbol'].dropna().unique()
+    n_symbols = len(unique_symbols)
+
+    if n_symbols == 0:
+        logger.warning("No valid symbols found")
+        return pd.DataFrame()
+
+    # Pre-filter data per symbol
+    symbol_dfs = []
+    for sym in unique_symbols:
+        sym_df = df[df['symbol'] == sym].copy()
+        if len(sym_df) >= 25:  # Minimum data requirement
+            symbol_dfs.append(sym_df)
+
+    if not symbol_dfs:
+        logger.warning("No symbols with sufficient data")
+        return pd.DataFrame()
+
+    logger.info(f"Processing {len(symbol_dfs)} symbols with sufficient data")
+
+    # Process in parallel
+    try:
+        results = Parallel(n_jobs=n_jobs, backend=backend, verbose=verbose)(
+            delayed(_compute_multi_targets_for_symbol)(sym_df, model_configs)
+            for sym_df in symbol_dfs
+        )
+
+        # Filter and combine
+        valid_results = [r for r in results if not r.empty]
+
+        if not valid_results:
+            logger.warning("No valid multi-targets generated")
+            return pd.DataFrame()
+
+        combined = pd.concat(valid_results, ignore_index=True)
+        logger.info(f"Generated {len(combined)} trajectories with {len(model_keys)} target columns each")
+
+        # Add overlap weights based on primary model (long_normal)
+        primary_h_used_col = f'h_used_{ModelKey.LONG_NORMAL.value}'
+        if primary_h_used_col in combined.columns:
+            # Create a temporary DataFrame for overlap calculation
+            temp_df = combined[['symbol', 't0']].copy()
+            temp_df['h_used'] = combined[primary_h_used_col]
+
+            # Use existing overlap counting logic
+            temp_df = _add_overlap_counts(temp_df, {})
+            combined['n_overlapping_trajs'] = temp_df['n_overlapping_trajs']
+
+            # Calculate overlap weights
+            combined['weight_overlap'] = 1.0 / (combined['n_overlapping_trajs'] + 0.5)
+
+            # Class balance weights based on primary model's hit column
+            primary_hit_col = f'hit_{ModelKey.LONG_NORMAL.value}'
+            if primary_hit_col in combined.columns:
+                class_counts = combined[primary_hit_col].value_counts()
+                total_samples = len(combined)
+                n_classes = len(class_counts)
+
+                class_weights = {}
+                for class_val, count in class_counts.items():
+                    class_weights[class_val] = total_samples / (n_classes * count)
+
+                combined['weight_class_balance'] = combined[primary_hit_col].map(class_weights)
+                combined['weight_final'] = combined['weight_overlap'] * combined['weight_class_balance']
+
+                # Clip and normalize
+                combined['weight_final'] = np.clip(combined['weight_final'], weight_min_clip, weight_max_clip)
+                weight_sum = combined['weight_final'].sum()
+                if weight_sum > 0:
+                    combined['weight_final'] = combined['weight_final'] * len(combined) / weight_sum
+                    combined['weight_final'] = np.clip(combined['weight_final'], weight_min_clip, weight_max_clip)
+
+        # Log class distributions for each model
+        logger.info("Target class distributions:")
+        for model_key in model_keys:
+            hit_col = f'hit_{model_key.value}'
+            if hit_col in combined.columns:
+                counts = combined[hit_col].value_counts().sort_index()
+                logger.info(f"  {model_key.value}: +1={counts.get(1, 0)}, 0={counts.get(0, 0)}, -1={counts.get(-1, 0)}")
+
+        return combined
+
+    except Exception as e:
+        logger.error(f"Error in parallel multi-target generation: {e}")
+        raise
+
+
 def validate_and_filter_extreme_targets(
     targets_df: pd.DataFrame,
-    ret_zscore_threshold: float = 5.0,
-    ret_abs_threshold: float = 1.0,
+    ret_zscore_threshold: float = None,
+    ret_abs_threshold: float = None,
     report: bool = True
 ) -> pd.DataFrame:
     """
@@ -636,10 +1124,13 @@ def validate_and_filter_extreme_targets(
     This function detects and removes targets with implausible return values
     that could indicate data errors or extreme outliers that would harm model training.
 
+    Uses centralized validation from src.validation.target_data with configurable
+    thresholds. If thresholds are not provided, uses DEFAULT_VALIDATION_CONFIG.
+
     Args:
         targets_df: DataFrame with target columns including ret_from_entry
-        ret_zscore_threshold: Z-score threshold for return outliers (default 5.0 = ~3 per 10000)
-        ret_abs_threshold: Absolute return threshold (default 1.0 = 100% return, log scale)
+        ret_zscore_threshold: Z-score threshold for return outliers (default from config: 5.0)
+        ret_abs_threshold: Absolute return threshold (default from config: 1.0 = ~170% linear)
         report: Whether to log detailed report of filtered values
 
     Returns:
@@ -648,113 +1139,31 @@ def validate_and_filter_extreme_targets(
     Notes:
         - Filters applied:
           1. NaN/Inf values in ret_from_entry
-          2. Absolute returns > ret_abs_threshold (default 100%, which is extreme for daily/weekly)
+          2. Absolute returns > ret_abs_threshold (default 1.0 log scale)
           3. Z-score outliers > ret_zscore_threshold
         - A warning is logged if >1% of rows are filtered
-        - A detailed report is logged if report=True and any rows are filtered
+        - Thresholds are defined in src/validation/target_data.py for consistency
     """
+    from src.validation.target_data import ValidationConfig, filter_extreme_returns
+
     if targets_df.empty:
         return targets_df
 
+    # Create config with overrides if provided
+    config = ValidationConfig()
+    if ret_zscore_threshold is not None:
+        config.ret_zscore_threshold = ret_zscore_threshold
+    if ret_abs_threshold is not None:
+        config.ret_abs_threshold = ret_abs_threshold
+
+    # Use centralized validation
     initial_count = len(targets_df)
-    targets_df = targets_df.copy()
-
-    # Track filtering reasons for report
-    filter_reasons = {}
-
-    # 1. Check for NaN/Inf in ret_from_entry
-    if 'ret_from_entry' in targets_df.columns:
-        nan_mask = targets_df['ret_from_entry'].isna()
-        inf_mask = ~np.isfinite(targets_df['ret_from_entry'].fillna(0))
-        nan_inf_mask = nan_mask | inf_mask
-        nan_inf_count = nan_inf_mask.sum()
-
-        if nan_inf_count > 0:
-            filter_reasons['nan_inf'] = {
-                'count': nan_inf_count,
-                'pct': 100 * nan_inf_count / initial_count,
-                'description': 'NaN or Inf values in ret_from_entry'
-            }
-            targets_df = targets_df[~nan_inf_mask]
-
-    # 2. Check for extreme absolute returns
-    if 'ret_from_entry' in targets_df.columns and len(targets_df) > 0:
-        extreme_abs_mask = np.abs(targets_df['ret_from_entry']) > ret_abs_threshold
-        extreme_abs_count = extreme_abs_mask.sum()
-
-        if extreme_abs_count > 0:
-            extreme_values = targets_df.loc[extreme_abs_mask, 'ret_from_entry']
-            filter_reasons['extreme_abs'] = {
-                'count': extreme_abs_count,
-                'pct': 100 * extreme_abs_count / initial_count,
-                'description': f'Absolute return > {ret_abs_threshold:.2f} (log scale)',
-                'min_val': extreme_values.min(),
-                'max_val': extreme_values.max(),
-                'examples': extreme_values.head(5).tolist()
-            }
-            targets_df = targets_df[~extreme_abs_mask]
-
-    # 3. Check for z-score outliers
-    if 'ret_from_entry' in targets_df.columns and len(targets_df) > 10:
-        ret_mean = targets_df['ret_from_entry'].mean()
-        ret_std = targets_df['ret_from_entry'].std()
-
-        if ret_std > 0:
-            ret_zscore = (targets_df['ret_from_entry'] - ret_mean) / ret_std
-            zscore_outlier_mask = np.abs(ret_zscore) > ret_zscore_threshold
-            zscore_outlier_count = zscore_outlier_mask.sum()
-
-            if zscore_outlier_count > 0:
-                outlier_values = targets_df.loc[zscore_outlier_mask, 'ret_from_entry']
-                filter_reasons['zscore_outlier'] = {
-                    'count': zscore_outlier_count,
-                    'pct': 100 * zscore_outlier_count / initial_count,
-                    'description': f'Z-score > {ret_zscore_threshold:.1f}',
-                    'min_val': outlier_values.min(),
-                    'max_val': outlier_values.max(),
-                    'examples': outlier_values.head(5).tolist()
-                }
-                targets_df = targets_df[~zscore_outlier_mask]
-
-    # Calculate total filtered
-    final_count = len(targets_df)
-    total_filtered = initial_count - final_count
-    filter_pct = 100 * total_filtered / initial_count if initial_count > 0 else 0
-
-    # Generate report
-    if total_filtered > 0:
-        # Always warn if significant filtering occurred
-        if filter_pct > 1.0:
-            logger.warning(
-                f"EXTREME TARGET VALUES: Filtered {total_filtered:,} rows ({filter_pct:.2f}%) "
-                f"with extreme/invalid target values"
-            )
-        else:
-            logger.info(
-                f"Target validation: filtered {total_filtered:,} rows ({filter_pct:.2f}%) "
-                f"with extreme/invalid values"
-            )
-
-        if report:
-            logger.info("=" * 60)
-            logger.info("TARGET VALIDATION REPORT")
-            logger.info("=" * 60)
-            logger.info(f"Initial rows: {initial_count:,}")
-            logger.info(f"Final rows:   {final_count:,}")
-            logger.info(f"Filtered:     {total_filtered:,} ({filter_pct:.2f}%)")
-            logger.info("-" * 60)
-
-            for reason_key, reason_data in filter_reasons.items():
-                logger.info(f"  {reason_data['description']}:")
-                logger.info(f"    Count: {reason_data['count']:,} ({reason_data['pct']:.2f}%)")
-                if 'min_val' in reason_data:
-                    logger.info(f"    Range: [{reason_data['min_val']:.4f}, {reason_data['max_val']:.4f}]")
-                if 'examples' in reason_data:
-                    logger.info(f"    Examples: {reason_data['examples']}")
-
-            logger.info("=" * 60)
-    else:
-        logger.info("Target validation: no extreme values detected")
+    targets_df, filter_counts = filter_extreme_returns(
+        targets_df,
+        ret_col='ret_from_entry',
+        config=config,
+        report=report
+    )
 
     # Final stats on cleaned data
     if 'ret_from_entry' in targets_df.columns and len(targets_df) > 0:

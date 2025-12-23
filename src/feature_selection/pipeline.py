@@ -35,7 +35,16 @@ from .base_features import (
     EXPANSION_CANDIDATES,
     get_base_features,
     get_expansion_candidates,
+    # Model-aware feature retrieval
+    get_featureset,
+    get_all_selectable_features,
 )
+
+# Import ModelKey for type hints (optional import to avoid circular deps)
+try:
+    from ..config.model_keys import ModelKey
+except ImportError:
+    from src.config.model_keys import ModelKey
 from .config import (
     CVConfig, MetricConfig, MetricType, ModelConfig, SearchConfig, SubsetResult
 )
@@ -102,7 +111,8 @@ class LooseTightConfig:
     n_borderline_features: int = 10  # Features to consider swapping out
 
     # Parallelization (reuse existing infrastructure)
-    n_jobs: int = 8
+    # Default -1 means auto-detect CPU count at runtime
+    n_jobs: int = -1
 
 
 @dataclass

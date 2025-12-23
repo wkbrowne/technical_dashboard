@@ -34,7 +34,7 @@ try:
     from ..features.postprocessing import interpolate_internal_gaps, drop_rows_with_excessive_nans
     from ..features.ohlc_adjustment import adjust_ohlc_to_adjclose
     from ..features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
-    from ..features.target_generation import generate_targets_parallel
+    from ..features.target_generation import generate_multi_targets_parallel
     from ..features.lagging import apply_configurable_lags
     # New unified timeframe handler
     from ..features.timeframe import (
@@ -48,7 +48,12 @@ try:
         ParallelConfig, parallel_stage, get_memory_mb, calculate_workers_from_items
     )
     # Feature output filtering
-    from ..feature_selection.base_features import filter_output_columns, get_output_features
+    from ..feature_selection.base_features import (
+        filter_output_columns, get_output_features, get_retired_features,
+        get_feature_exclusion_report, drop_retired_columns
+    )
+    # Centralized validation
+    from ..validation.target_data import TargetDataValidator
 except ImportError:
     # Fallback to absolute imports (when run directly)
     from src.features.assemble import assemble_indicators_from_wide
@@ -58,7 +63,7 @@ except ImportError:
     from src.features.postprocessing import interpolate_internal_gaps, drop_rows_with_excessive_nans
     from src.features.ohlc_adjustment import adjust_ohlc_to_adjclose
     from src.features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
-    from src.features.target_generation import generate_targets_parallel
+    from src.features.target_generation import generate_multi_targets_parallel
     from src.features.lagging import apply_configurable_lags
     # New unified timeframe handler
     from src.features.timeframe import (
@@ -72,7 +77,12 @@ except ImportError:
         ParallelConfig, parallel_stage, get_memory_mb, calculate_workers_from_items
     )
     # Feature output filtering
-    from src.feature_selection.base_features import filter_output_columns, get_output_features
+    from src.feature_selection.base_features import (
+        filter_output_columns, get_output_features, get_retired_features,
+        get_feature_exclusion_report, drop_retired_columns
+    )
+    # Centralized validation
+    from src.validation.target_data import TargetDataValidator
 
 logger = logging.getLogger(__name__)
 
@@ -444,57 +454,59 @@ def _generate_triple_barrier_targets(
     config: Dict[str, float] = None,
     weight_min_clip: float = 0.01,
     weight_max_clip: float = 10.0,
-    parallel_config: Optional[ParallelConfig] = None
+    parallel_config: Optional[ParallelConfig] = None,
 ) -> pd.DataFrame:
     """
-    Convert indicators to long format and generate triple barrier targets in parallel.
+    Convert indicators to long format and generate multi-target triple barrier targets.
+
+    Generates 4-model targets with model-specific ATR multiples:
+    - LONG_NORMAL: 1.5 ATR up (profit), 1.5 ATR down (stop)
+    - LONG_PARABOLIC: 2.5 ATR up (profit), 1.5 ATR down (stop)
+    - SHORT_NORMAL: 1.5 ATR up (stop), 2.0 ATR down (profit)
+    - SHORT_PARABOLIC: 1.5 ATR up (stop), 2.5 ATR down (profit)
 
     Args:
         indicators_by_symbol: Dictionary of symbol DataFrames with features
-        config: Triple barrier configuration dictionary
+        config: Unused (kept for API compatibility)
         weight_min_clip: Minimum weight value (prevents zero weights)
         weight_max_clip: Maximum weight value (prevents extreme weights)
         parallel_config: ParallelConfig for parallel processing
 
     Returns:
-        DataFrame with triple barrier targets and combined weights
+        DataFrame with multi-target columns: hit_long_normal, hit_long_parabolic,
+        hit_short_normal, hit_short_parabolic (plus ret_* and h_used_* for each).
     """
     if parallel_config is None:
         parallel_config = ParallelConfig.default()
+
+    # Use centralized validation for price filtering
+    validator = TargetDataValidator()
+
     # Convert to long format for target generation
     long_format_data = []
-    
+
     for symbol, df in indicators_by_symbol.items():
         if df.empty:
             continue
-            
+
         # Extract required columns for triple barrier generation
         required_cols = ['adjclose', 'high', 'low']
         missing_cols = [col for col in required_cols if col not in df.columns]
-        
+
         if missing_cols:
             logger.warning(f"Symbol {symbol} missing columns for target generation: {missing_cols}")
             continue
-        
+
         # Check if ATR exists (should be computed in range_breakout features)
         if 'atr14' not in df.columns:
             logger.warning(f"Symbol {symbol} missing ATR for target generation")
             continue
-        
+
         # Create long format record for this symbol
         symbol_data = df[['adjclose', 'high', 'low', 'atr14']].copy()
         symbol_data = symbol_data.dropna()
 
         if symbol_data.empty:
-            continue
-
-        # Defense-in-depth: skip symbols with suspicious prices that may have slipped through
-        # This catches unadjusted reverse splits, data errors, etc.
-        max_price = symbol_data['adjclose'].max()
-        min_price = symbol_data['adjclose'].min()
-        if max_price > 50000 or min_price < 0.01 or (min_price > 0 and max_price / min_price > 1000):
-            logger.warning(f"Skipping {symbol} in target generation: suspicious prices "
-                          f"(min={min_price:.2f}, max={max_price:.2f})")
             continue
 
         # Add symbol column and rename for target generation
@@ -503,62 +515,71 @@ def _generate_triple_barrier_targets(
         symbol_data = symbol_data.rename(columns={'adjclose': 'close', 'atr14': 'atr'})
 
         long_format_data.append(symbol_data[['symbol', 'date', 'close', 'high', 'low', 'atr']])
-    
+
     if not long_format_data:
         logger.warning("No valid data for triple barrier target generation")
         return pd.DataFrame()
-    
+
     # Combine all symbol data
     df_long = pd.concat(long_format_data, ignore_index=True)
+
+    # Apply centralized validation (price filtering, NaN removal, min data per symbol)
+    df_long, validation_summary = validator.validate_input(df_long)
+
+    if df_long.empty:
+        logger.warning("No valid data after validation for triple barrier target generation")
+        return pd.DataFrame()
+
     logger.info(f"Prepared long format data: {len(df_long)} rows across {df_long['symbol'].nunique()} symbols")
-    
-    # Triple barrier configuration (use provided config or defaults)
-    if config is None:
-        config = {
-            'up_mult': 3.0,
-            'dn_mult': 1.5,  # Updated default
-            'max_horizon': 20,
-            'start_every': 3,
-        }
-    
-    logger.info(f"Triple barrier config: up_mult={config['up_mult']}, dn_mult={config['dn_mult']}, "
-                f"max_horizon={config['max_horizon']}, start_every={config['start_every']}")
-    
-    # Generate targets in parallel with combined weights
-    targets_df = generate_targets_parallel(
-        df_long, config,
+
+    # Use multi-target generation for 4-model system
+    logger.info("Using multi-target generation for 4-model system")
+    targets_df = generate_multi_targets_parallel(
+        df_long,
+        model_keys=None,  # All 4 models
         weight_min_clip=weight_min_clip,
         weight_max_clip=weight_max_clip,
         parallel_config=parallel_config
     )
-    
+
     if not targets_df.empty:
-        logger.info(f"Generated {len(targets_df)} triple barrier targets")
-        # Log class distribution
-        _log_target_class_distribution(targets_df)
+        logger.info(f"Generated {len(targets_df)} multi-target trajectories")
+        # Log class distributions for all models
+        _log_multi_target_distribution(targets_df)
     else:
-        logger.warning("No triple barrier targets generated")
-    
+        logger.warning("No multi-target trajectories generated")
+
     return targets_df
 
 
-def _log_target_class_distribution(targets_df: pd.DataFrame) -> None:
-    """Log distribution of triple barrier target classes."""
+def _log_multi_target_distribution(targets_df: pd.DataFrame) -> None:
+    """Log distribution of multi-target triple barrier classes for 4-model system."""
     if targets_df.empty:
-        logger.info("No targets generated for class distribution analysis")
+        logger.info("No multi-targets generated for class distribution analysis")
         return
 
-    hit_counts = targets_df['hit'].value_counts().sort_index()
     total_targets = len(targets_df)
+    logger.info("Multi-Target Class Distributions:")
+    logger.info(f"  Total trajectories: {total_targets:,}")
 
-    logger.info("Triple Barrier Target Class Distribution:")
-    logger.info(f"  Total targets: {total_targets:,}")
+    # Find all hit columns
+    hit_cols = [c for c in targets_df.columns if c.startswith('hit_')]
 
-    for hit_value in [-1, 0, 1]:
-        count = hit_counts.get(hit_value, 0)
-        percentage = (count / total_targets * 100) if total_targets > 0 else 0
-        class_name = {-1: "Lower barrier hit", 0: "Time expired", 1: "Upper barrier hit"}[hit_value]
-        logger.info(f"  {class_name}: {count:,} ({percentage:.1f}%)")
+    for hit_col in sorted(hit_cols):
+        model_name = hit_col.replace('hit_', '')
+        hit_counts = targets_df[hit_col].value_counts().sort_index()
+
+        up_count = hit_counts.get(1, 0)
+        time_count = hit_counts.get(0, 0)
+        down_count = hit_counts.get(-1, 0)
+
+        up_pct = (up_count / total_targets * 100) if total_targets > 0 else 0
+        time_pct = (time_count / total_targets * 100) if total_targets > 0 else 0
+        down_pct = (down_count / total_targets * 100) if total_targets > 0 else 0
+
+        logger.info(f"  {model_name}: +1={up_count:,} ({up_pct:.1f}%), "
+                   f"0={time_count:,} ({time_pct:.1f}%), "
+                   f"-1={down_count:,} ({down_pct:.1f}%)")
 
 
 def _compute_higher_tf_for_symbol(
@@ -934,7 +955,8 @@ def run_pipeline_v2(
     sector_to_etf: Optional[Dict[str, str]] = None,
     sp500_tickers: Optional[List[str]] = None,
     full_output: bool = False,
-    checkpoint_config: Optional[CheckpointConfig] = None
+    checkpoint_config: Optional[CheckpointConfig] = None,
+    exclude_retired: bool = False,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Simplified pipeline using new config system.
@@ -959,13 +981,14 @@ def run_pipeline_v2(
         full_output: If True, primary return is all computed features. If False (default),
             primary return is filtered to curated feature set defined in base_features.py
         checkpoint_config: CheckpointConfig for enabling staged checkpoints and resumption
+        exclude_retired: If True, exclude retired features from output files (saves disk/memory)
 
     Returns:
         Tuple of (features_df, targets_df, features_complete_df, features_filtered_df) where:
         - features_df: Primary output (filtered if full_output=False, complete if True)
         - targets_df: Triple barrier targets (or None if include_targets=False)
-        - features_complete_df: ALL computed features (~600+)
-        - features_filtered_df: Curated ML-ready features (~250)
+        - features_complete_df: ALL computed features (or retired excluded if exclude_retired=True)
+        - features_filtered_df: Curated ML-ready features (BASE_FEATURES set)
     """
     import gc
     from datetime import datetime as dt
@@ -1009,6 +1032,9 @@ def run_pipeline_v2(
     print(f"PIPELINE V2: Processing {len(indicators_by_symbol)} symbols", flush=True)
     print(f"Timeframes: {timeframes}", flush=True)
     print(f"Workers: {parallel_config.effective_n_jobs}", flush=True)
+    if exclude_retired:
+        retired_count = len(get_retired_features())
+        print(f"Exclude retired: Yes ({retired_count} features)", flush=True)
     if date_min and date_max:
         print(f"Date range: {date_min.strftime('%Y-%m-%d')} to {date_max.strftime('%Y-%m-%d')}", flush=True)
     print(f"{'='*60}", flush=True)
@@ -1191,10 +1217,26 @@ def run_pipeline_v2(
     del indicators_by_symbol
     gc.collect()
 
-    # Step 6b: Create filtered version for ML training
-    # ALWAYS create both: full output (features_complete) and filtered (features_filtered)
+    # Step 6b: Apply exclude_retired to complete output if requested
+    # This saves disk space by not storing retired features in features_complete.parquet
+    retired_removed = 0
+    if exclude_retired:
+        cols_before_retire = len(daily_df_complete.columns)
+        daily_df_complete = filter_output_columns(
+            daily_df_complete, keep_all=True, exclude_retired=True
+        )
+        retired_removed = cols_before_retire - len(daily_df_complete.columns)
+        if retired_removed > 0:
+            print(f">>> [Retire Features] Excluded {retired_removed} retired features from complete output", flush=True)
+            logger.info(f"Excluded {retired_removed} retired features from complete output")
+
+    # Step 6c: Create filtered version for ML training
+    # ALWAYS create both: complete output (with/without retired) and filtered (curated set)
+    # Column selection for model-specific features happens at training time, not here
     cols_before = len(daily_df_complete.columns)
-    daily_df_filtered = filter_output_columns(daily_df_complete, keep_all=False)
+    daily_df_filtered = filter_output_columns(
+        daily_df_complete, keep_all=False, exclude_retired=False
+    )
     cols_after = len(daily_df_filtered.columns)
     filtered_count = cols_before - cols_after
     if filtered_count > 0:
@@ -1206,6 +1248,8 @@ def run_pipeline_v2(
     print(f"  Rows: {len(daily_df_complete):,}", flush=True)
     print(f"  Complete columns: {len(daily_df_complete.columns)}", flush=True)
     print(f"  Filtered columns: {len(daily_df_filtered.columns)}", flush=True)
+    if exclude_retired and retired_removed > 0:
+        print(f"  Retired excluded: {retired_removed}", flush=True)
     if targets_df is not None:
         print(f"  Targets: {len(targets_df):,}", flush=True)
     print(f"{'='*60}\n", flush=True)

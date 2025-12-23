@@ -284,6 +284,9 @@ def run_single_model_selection(
         )
 
     if pipeline_config is None:
+        # Auto-detect CPU count for parallelism
+        import os
+        n_jobs = os.cpu_count() or 8
         pipeline_config = LooseTightConfig(
             run_base_elimination=False,
             epsilon_add_loose=0.0002,
@@ -295,7 +298,7 @@ def run_single_model_selection(
             epsilon_add_interaction=0.001,
             epsilon_swap=0.0005,
             max_swap_iterations=50,
-            n_jobs=8,
+            n_jobs=n_jobs,
         )
 
     search_config = SearchConfig(n_jobs=1, random_state=42)
