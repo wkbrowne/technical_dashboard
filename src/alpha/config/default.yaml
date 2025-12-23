@@ -1,0 +1,79 @@
+# Alpha Module Configuration
+# Position sizing, backtesting, and optimization settings
+
+# Cross-validation settings for purged walk-forward
+cv:
+  n_splits: 5
+  min_train_weeks: 52  # Minimum 1 year training
+  test_weeks: 13       # ~1 quarter test period
+  purge_days: 25       # Must be >= horizon_days
+  embargo_days: 5      # Gap after test period
+  horizon_days: 20     # Triple barrier horizon
+
+# Position sizing parameters
+sizing:
+  method: monotone_probability  # monotone_probability, rank_bucket, threshold_confidence, volatility_targeted
+  exposure_mode: nav_fraction   # nav_fraction or vol_targeted
+
+  # Exposure controls
+  max_gross_exposure: 0.6       # 60% of NAV
+  max_name_weight: 0.08         # 8% max per position
+  min_name_weight: 0.01         # 1% minimum to include
+  cash_buffer: 0.05             # 5% cash reserve
+  turnover_penalty: 0.0005      # Penalty per unit turnover
+
+  # Sector caps (optional)
+  # sector_caps:
+  #   Technology: 0.30
+  #   Financial: 0.25
+  #   Healthcare: 0.20
+
+  # Volatility targeting (when exposure_mode = vol_targeted)
+  vol_target_annual: 0.15       # 15% annual vol target
+  vol_lookback_days: 63         # ~3 months lookback
+
+  # Monotone probability parameters: w = slope * (p - intercept)
+  prob_slope: 2.0
+  prob_intercept: 0.5
+
+  # Rank bucket parameters
+  n_buckets: 5
+  bucket_weights: [1.0, 0.8, 0.6, 0.4, 0.2]
+
+  # Threshold-based sizing
+  entry_threshold: 0.55
+  confidence_scale: 1.0
+
+  # Trade selection
+  top_n: 15
+  # top_pct: 0.10  # Alternative: top 10% by score
+
+# Backtest configuration
+backtest:
+  initial_capital: 1000000.0
+  entry_day: 0                  # 0=Monday
+  rebalance_day: 4              # 4=Friday
+  use_barrier_exits: true       # Use actual barrier timestamps
+  reinvest_profits: true
+  track_positions: true
+
+# Transaction costs (20 bps round-trip total)
+costs:
+  spread_bps: 5.0               # Half-spread each way
+  commission_bps: 0.0           # Assume zero commission
+  slippage_bps: 5.0             # Market impact each way
+  min_trade_value: 100.0
+
+# File paths
+artifacts_dir: artifacts
+models_dir: artifacts/models
+sizing_dir: artifacts/sizing
+backtests_dir: artifacts/backtests
+reports_dir: artifacts/reports
+
+features_file: artifacts/features_complete.parquet
+targets_file: artifacts/targets_triple_barrier.parquet
+predictions_file: artifacts/predictions/predictions_latest.parquet
+
+# Reproducibility
+random_state: 42
