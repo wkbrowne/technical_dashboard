@@ -200,31 +200,41 @@ def load_and_prepare_data(
     }
     feature_cols = [c for c in merged.columns if c not in exclude_cols]
 
-    # Create X
+    # Reset index to ensure unique integer indices for row alignment
+    # Store date column for time-series CV splitting
+    merged = merged.reset_index(drop=True)
+
+    # Create X with unique integer index, keep date as column for CV
     X = merged[feature_cols].copy()
-    X.index = merged['date']
+    # Store date for CV time-series awareness (pipeline uses index for CV splits)
+    X.index = pd.Index(merged['date'], name='date')
+    # But we also need a way to filter uniquely - use the integer position
+    X['_row_id'] = np.arange(len(X))
 
     # Create targets DataFrame with model-specific hit columns
-    target_cols = ['symbol', 'date']
+    target_cols = ['symbol', 'date', '_row_id']
     # Add model-specific hit columns if they exist
     for model_hit_col in ['hit_long_normal', 'hit_long_parabolic', 'hit_short_normal', 'hit_short_parabolic']:
         if model_hit_col in merged.columns:
             target_cols.append(model_hit_col)
     # Fallback to 'hit' if no model-specific columns
-    if 'hit' in merged.columns and not any(c.startswith('hit_') for c in target_cols):
+    if 'hit' in merged.columns and not any(c.startswith('hit_') for c in target_cols[3:]):
         target_cols.append('hit')
     if has_weights:
         target_cols.append('weight_final')
+
+    # Build targets_df with _row_id
+    merged['_row_id'] = np.arange(len(merged))
     targets_df = merged[target_cols].copy()
 
-    # Extract sample weights
+    # Extract sample weights with row_id index
     if has_weights:
         sample_weight = merged['weight_final'].copy()
-        sample_weight.index = merged['date']
+        sample_weight.index = merged['_row_id']
 
-    # Align sector index
+    # Align sector with row_id
     if sector is not None:
-        sector.index = merged['date']
+        sector.index = merged['_row_id']
 
     if verbose:
         print(f"\nPrepared data:")
@@ -246,7 +256,7 @@ def get_model_labels(
     targets_df: pd.DataFrame,
     model_key: ModelKey,
     binary: bool = True,
-) -> pd.Series:
+) -> Tuple[pd.Series, pd.Index]:
     """Get target labels for a specific model key.
 
     Uses model-specific hit columns from triple barrier targets:
@@ -261,7 +271,7 @@ def get_model_labels(
         binary: If True, convert to binary (exclude neutral/timeout)
 
     Returns:
-        Target Series with binary labels (1=success, 0=failure)
+        Tuple of (target Series with binary labels, row_ids for alignment)
     """
     # Map model key to corresponding hit column
     label_column_map = {
@@ -301,9 +311,13 @@ def get_model_labels(
         df['target'] = df[label_col] + 1
 
     y = df['target'].copy()
-    y.index = df['date']
+    # Use _row_id for alignment with X
+    row_ids = df['_row_id'].values
 
-    return y
+    # Index y by date for time-series CV
+    y.index = pd.Index(df['date'], name='date')
+
+    return y, row_ids
 
 
 # =============================================================================
@@ -347,8 +361,8 @@ def run_multimodel_selection(
     if candidate_features is None:
         candidate_features = get_all_selectable_features()
 
-    # Filter to features present in X
-    available_features = set(X.columns)
+    # Filter to features present in X (exclude internal columns like _row_id)
+    available_features = set(X.columns) - {'_row_id'}
     candidate_features = [f for f in candidate_features if f in available_features]
 
     if verbose:
@@ -401,12 +415,12 @@ def run_multimodel_selection(
             print(f"\n[{i+1}/{len(model_keys)}] Running {model_key.value.upper()}")
             print("-" * 50)
 
-        # Get labels for this model
-        y = get_model_labels(targets_df, model_key, binary=True)
+        # Get labels for this model (returns y and row_ids for alignment)
+        y, row_ids = get_model_labels(targets_df, model_key, binary=True)
 
-        # Align X with y (binary target excludes neutral samples)
-        X_aligned = X.loc[y.index].copy()
-        sample_weight_aligned = sample_weight.loc[y.index] if sample_weight is not None else None
+        # Align X with y using row_ids (binary target excludes neutral samples)
+        X_aligned = X[X['_row_id'].isin(row_ids)].drop(columns=['_row_id']).copy()
+        sample_weight_aligned = sample_weight.loc[row_ids] if sample_weight is not None else None
 
         if verbose:
             pos_rate = y.mean()
