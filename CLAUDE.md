@@ -104,6 +104,22 @@ chunk_benchmarks = get_required_benchmarks_for_batch(chunk, all_benchmarks)
 delayed(process)(sym, full_universe_df)  # BAD: Serializes everything N times
 ```
 
+### 6. Row Alignment with Non-Unique Indices
+
+When data has multiple rows per date (e.g., multiple symbols), **NEVER** use `.loc[date_index]` for row alignment - it causes a silent cross-join explosion.
+
+```python
+# WRONG: Causes cross-join when dates are not unique
+X_aligned = X.loc[y.index]  # 25k rows → 500k rows silently!
+
+# CORRECT: Use a unique row identifier
+df['_row_id'] = range(len(df))  # Add unique ID during data loading
+row_ids = valid_rows['_row_id'].values  # Get IDs for target subset
+X_aligned = X[X['_row_id'].isin(row_ids)]  # Filter by unique ID
+```
+
+This is critical for panel data where (date, symbol) pairs are unique but date alone is not.
+
 ## BASE_FEATURES (Golden Reference)
 
 The curated feature set lives in `src/feature_selection/base_features.py`:
@@ -148,7 +164,7 @@ R_stock = α + β_market × R_SPY
 ### Artifacts (Output)
 | File | Description |
 |------|-------------|
-| `artifacts/features_complete.parquet` | All features (~600) |
+| `artifacts/features_complete.parquet` | All computed features |
 | `artifacts/targets_triple_barrier.parquet` | ML targets with sample weights |
 
 ## Environment Setup
@@ -169,6 +185,33 @@ FRED_API_KEY=your-fred-key
 | Memory errors | Use `--max-stocks 100 --timeframes D` |
 | Rate limiting | Use `--rate-limit 0.5` |
 | Missing features | Check `run_data_quality.py --verbose` |
+| Row count explosion after `.loc[]` | Use `_row_id` with `.isin()` for panel data alignment |
+
+## Documentation Guidelines
+
+### File Naming Convention
+
+All documentation files in `docs/` must use **UPPER_SNAKE_CASE** with `.md` extension:
+- `FEATURE_SELECTION.md` (correct)
+- `POSITION_SIZING.md` (correct)
+- `PositionSizing.md` (wrong)
+- `feature-selection.md` (wrong)
+
+### Avoid Explicit Feature Lists
+
+Features evolve frequently. **Never hardcode specific feature names or counts** in documentation. Instead:
+- Reference the source of truth: `src/feature_selection/base_features.py`
+- Use dynamic counts like "current feature set" instead of "53 features"
+- Document the validation pattern, not the feature list
+
+```python
+# CORRECT: Reference the source
+from src.feature_selection.base_features import BASE_FEATURES
+print(f"Using {len(BASE_FEATURES)} features")
+
+# WRONG: Hardcoded in docs
+"The model uses 53 features including rsi_14, macd_histogram..."
+```
 
 ## Removed Files
 

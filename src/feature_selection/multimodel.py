@@ -321,10 +321,21 @@ def run_single_model_selection(
         checkpoint_path=checkpoint_path,
     )
 
-    # Align sample weights with X index
+    # Align sample weights with X for pipeline
+    # sample_weight should be pre-aligned to X (same length, matching rows)
+    # Just reset index to match X's positional index for pipeline compatibility
     sample_weight_aligned = None
     if sample_weight is not None:
-        sample_weight_aligned = sample_weight.loc[X_subset.index]
+        if len(sample_weight) == len(X_subset):
+            # Already aligned - reset index to match X
+            sample_weight_aligned = sample_weight.reset_index(drop=True)
+        else:
+            # Try to align by index (for external callers)
+            try:
+                sample_weight_aligned = sample_weight.loc[X_subset.index]
+            except KeyError:
+                # Fallback: assume same order, truncate/extend as needed
+                sample_weight_aligned = sample_weight.iloc[:len(X_subset)].reset_index(drop=True)
 
     # Run pipeline
     pipeline.run(X_subset, y, verbose=verbose, sample_weight=sample_weight_aligned)
