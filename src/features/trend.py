@@ -155,6 +155,131 @@ def add_rsi_features(
     return df
 
 
+def add_chop_features(
+    df: pd.DataFrame,
+    length: int = 14
+) -> pd.DataFrame:
+    """
+    Add Choppiness Index (CHOP) features using pandas-ta.
+
+    CHOP measures whether the market is choppy (trading sideways) or trending.
+    Values range from 0 to 100:
+    - High values (>61.8) indicate choppy, sideways market
+    - Low values (<38.2) indicate strong trending market
+
+    Features added:
+    - chop_{length}: Raw Choppiness Index
+
+    Args:
+        df: Input DataFrame with OHLC data (requires 'high', 'low', 'close')
+        length: Lookback period for CHOP calculation (default: 14)
+
+    Returns:
+        DataFrame with added CHOP features (mutates input DataFrame)
+    """
+    logger.debug(f"Adding CHOP features (length={length})")
+
+    required = {'high', 'low', 'close'}
+    if not required.issubset(df.columns):
+        logger.warning(f"Required columns {required} not found for CHOP calculation")
+        return df
+
+    high = pd.to_numeric(df['high'], errors='coerce')
+    low = pd.to_numeric(df['low'], errors='coerce')
+    close = pd.to_numeric(df['close'], errors='coerce')
+
+    try:
+        # Use pandas-ta for CHOP calculation
+        chop_result = ta.chop(high=high, low=low, close=close, length=length)
+
+        if chop_result is not None:
+            df[f'chop_{length}'] = chop_result.astype('float32')
+            logger.debug(f"Added chop_{length} feature")
+        else:
+            logger.debug(f"CHOP calculation returned None, creating NaN series")
+            df[f'chop_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+
+    except Exception as e:
+        logger.warning(f"Failed to compute CHOP: {e}")
+        df[f'chop_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+
+    logger.debug("CHOP features computation completed")
+    return df
+
+
+def add_adx_features(
+    df: pd.DataFrame,
+    length: int = 14
+) -> pd.DataFrame:
+    """
+    Add ADX (Average Directional Index) features using pandas-ta.
+
+    ADX measures trend strength regardless of direction:
+    - ADX < 20: Weak or no trend
+    - ADX 20-40: Developing trend
+    - ADX > 40: Strong trend
+
+    Features added:
+    - adx_{length}: ADX value (0-100)
+    - di_plus_{length}: +DI (Positive Directional Indicator)
+    - di_minus_{length}: -DI (Negative Directional Indicator)
+
+    Args:
+        df: Input DataFrame with OHLC data (requires 'high', 'low', 'close')
+        length: Lookback period for ADX calculation (default: 14)
+
+    Returns:
+        DataFrame with added ADX features (mutates input DataFrame)
+    """
+    logger.debug(f"Adding ADX features (length={length})")
+
+    required = {'high', 'low', 'close'}
+    if not required.issubset(df.columns):
+        logger.warning(f"Required columns {required} not found for ADX calculation")
+        return df
+
+    high = pd.to_numeric(df['high'], errors='coerce')
+    low = pd.to_numeric(df['low'], errors='coerce')
+    close = pd.to_numeric(df['close'], errors='coerce')
+
+    try:
+        # Use pandas-ta for ADX calculation
+        # Returns DataFrame with columns: ADX_{length}, DMP_{length}, DMN_{length}
+        adx_result = ta.adx(high=high, low=low, close=close, length=length)
+
+        if adx_result is not None and not adx_result.empty:
+            # pandas-ta naming convention: ADX_14, DMP_14, DMN_14
+            adx_col = f'ADX_{length}'
+            dmp_col = f'DMP_{length}'
+            dmn_col = f'DMN_{length}'
+
+            if adx_col in adx_result.columns:
+                df[f'adx_{length}'] = adx_result[adx_col].astype('float32')
+                logger.debug(f"Added adx_{length} feature")
+
+            if dmp_col in adx_result.columns:
+                df[f'di_plus_{length}'] = adx_result[dmp_col].astype('float32')
+                logger.debug(f"Added di_plus_{length} feature")
+
+            if dmn_col in adx_result.columns:
+                df[f'di_minus_{length}'] = adx_result[dmn_col].astype('float32')
+                logger.debug(f"Added di_minus_{length} feature")
+        else:
+            logger.debug("ADX calculation returned None/empty, creating NaN series")
+            df[f'adx_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+            df[f'di_plus_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+            df[f'di_minus_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+
+    except Exception as e:
+        logger.warning(f"Failed to compute ADX: {e}")
+        df[f'adx_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+        df[f'di_plus_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+        df[f'di_minus_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+
+    logger.debug("ADX features computation completed")
+    return df
+
+
 def add_macd_features(
     df: pd.DataFrame,
     src_col: str = 'adjclose',

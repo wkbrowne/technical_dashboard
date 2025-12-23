@@ -85,6 +85,50 @@ def add_range_breakout_features(
     df["gap_pct"] = _safe_div(close, prev_close) - 1.0
     df["gap_atr_ratio"] = _safe_div(df["gap_pct"], df["atr_percent"])  # NaN if ATR% ~ 0
 
+    # --- Overnight/Gap Features (not in pandas-ta, implemented manually) ---
+    # Overnight return = open / prev_close - 1
+    open_price = pd.to_numeric(df["open"], errors="coerce") if "open" in df.columns else close
+    overnight_ret = _safe_div(open_price, prev_close) - 1.0
+    df["overnight_ret"] = overnight_ret.astype("float32")
+
+    # Gap size in ATR units (using raw ATR, not ATR%)
+    # gap_atr_ratio_raw = (open - prev_close) / atr14
+    gap_size = open_price - prev_close
+    df["gap_atr_ratio_raw"] = _safe_div(gap_size, atr14).astype("float32")
+
+    # Gap fill fraction: how much of the gap was filled during the day
+    # For gap up: clip((open - low) / (open - prev_close), 0, 1)
+    # For gap down: clip((high - open) / (prev_close - open), 0, 1)
+    gap_up_fill_num = open_price - low
+    gap_up_fill_den = open_price - prev_close
+    gap_dn_fill_num = high - open_price
+    gap_dn_fill_den = prev_close - open_price
+
+    # Gap up condition: open > prev_close
+    is_gap_up = (open_price > prev_close).fillna(False)
+    is_gap_dn = (open_price < prev_close).fillna(False)
+
+    gap_fill_frac = pd.Series(0.0, index=df.index, dtype="float64")
+
+    # Gap up: (open - low) / (open - prev_close)
+    gap_up_mask = is_gap_up & (gap_up_fill_den.abs() > EPS)
+    gap_fill_frac.loc[gap_up_mask] = (gap_up_fill_num[gap_up_mask] / gap_up_fill_den[gap_up_mask]).clip(0, 1)
+
+    # Gap down: (high - open) / (prev_close - open)
+    gap_dn_mask = is_gap_dn & (gap_dn_fill_den.abs() > EPS)
+    gap_fill_frac.loc[gap_dn_mask] = (gap_dn_fill_num[gap_dn_mask] / gap_dn_fill_den[gap_dn_mask]).clip(0, 1)
+
+    df["gap_fill_frac"] = gap_fill_frac.astype("float32")
+
+    # --- ATR% change feature ---
+    # atr_percent_chg_5 = pct_change of atr_percent over 5 days
+    atr_pct = df["atr_percent"]
+    atr_pct_prev5 = atr_pct.shift(5)
+    atr_percent_chg_5 = _safe_div(atr_pct - atr_pct_prev5, atr_pct_prev5)
+    # Replace inf with NaN
+    atr_percent_chg_5 = atr_percent_chg_5.replace([np.inf, -np.inf], np.nan)
+    df["atr_percent_chg_5"] = atr_percent_chg_5.astype("float32")
+
     # --- Multi-timeframe features ---
     for w in win_list:
         hi = _rolling_max(high, w)
