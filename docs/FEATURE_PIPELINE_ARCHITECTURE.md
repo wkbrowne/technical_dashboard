@@ -77,12 +77,22 @@ For the high-level ML pipeline (feature selection, hyperparameter tuning, model 
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                            TARGET GENERATION                                     │
+│                      MULTI-TARGET GENERATION (4-Model System)                    │
 ├─────────────────────────────────────────────────────────────────────────────────┤
-│  Triple barrier labeling using atr_percent                                       │
-│  - Upper barrier: +3 ATR (profit target)                                         │
-│  - Lower barrier: -1.5 ATR (stop loss)                                           │
-│  - Time barrier: 10 days max holding                                             │
+│  Triple barrier labeling with model-specific ATR multiples:                      │
+│                                                                                  │
+│  LONG_NORMAL:     up_mult=1.5 (profit), dn_mult=1.5 (stop)                       │
+│  LONG_PARABOLIC:  up_mult=2.5 (profit), dn_mult=1.5 (stop)                       │
+│  SHORT_NORMAL:    up_mult=1.5 (stop),   dn_mult=2.0 (profit)                     │
+│  SHORT_PARABOLIC: up_mult=1.5 (stop),   dn_mult=2.5 (profit)                     │
+│                                                                                  │
+│  Time barrier: 20 days max holding, start_every=3 days                           │
+│                                                                                  │
+│  Output columns per trajectory:                                                  │
+│  - hit_<model>: Target label (-1, 0, +1) for each model                          │
+│  - ret_<model>: Log return from entry to exit                                    │
+│  - h_used_<model>: Horizon used (1-20 days)                                      │
+│  - weight_final: Combined sample weight (overlap + class balance)                │
 │                                                                                  │
 │  Output: artifacts/targets_triple_barrier.parquet                                │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -321,12 +331,73 @@ Daily features are computed in parallel at the symbol level. Symbols are batched
 
 | Category | Module | Features | Typical NaN % |
 |----------|--------|----------|---------------|
-| Trend | `trend.py` | `rsi_14`, `macd_histogram`, `trend_score_*` | 5-10% |
-| Volatility | `volatility.py` | `atr_percent`, `vol_regime_*`, `rv_z_*` | 5-10% |
+| Trend | `trend.py` | `rsi_14`, `macd_histogram`, `trend_score_*`, `chop_14`, `adx_14` | 5-10% |
+| Volatility | `volatility.py` | `atr_percent`, `vol_regime_*`, `rv_z_*`, `bb_width_*`, `squeeze_*` | 5-10% |
 | Volume | `volume.py` | `volshock_ema`, `obv_z_60` | 5-10% |
 | Distance | `distance.py` | `pct_dist_ma_*_z`, `pos_in_*_range` | 5-10% |
+| Range/Gap | `range_breakout.py` | `overnight_ret`, `gap_atr_ratio*`, `gap_fill_frac`, `atr_percent_chg_5` | 5-10% |
 | Alpha | `alpha.py` | `alpha_mom_spy_*`, `alpha_mom_sector_*` | 15-25% |
 | Cross-Sectional | `xsec.py` | `xsec_mom_*_z` | 10-15% |
+
+### 3.4.1 Trend Quality / Chop Filter (NEW)
+
+**Module:** [src/features/trend.py](../src/features/trend.py)
+
+Features to filter out choppy, sideways markets and identify trending conditions:
+
+| Feature | Description | Range | Computation |
+|---------|-------------|-------|-------------|
+| `chop_14` | Choppiness Index (14-period) | [0, 100] | pandas-ta `chop()` |
+| `adx_14` | Average Directional Index | [0, 100] | pandas-ta `adx()` |
+| `di_plus_14` | +DI (Positive Directional Indicator) | [0, 100] | From ADX computation |
+| `di_minus_14` | -DI (Negative Directional Indicator) | [0, 100] | From ADX computation |
+
+**Interpretation:**
+- `chop_14` > 61.8: Choppy, sideways market (avoid momentum signals)
+- `chop_14` < 38.2: Strong trending market (momentum signals reliable)
+- `adx_14` < 20: Weak or no trend
+- `adx_14` > 40: Strong trend
+
+### 3.4.2 Volatility Compression / Squeeze (NEW)
+
+**Module:** [src/features/volatility.py](../src/features/volatility.py)
+
+Features to detect volatility compression (potential breakout setups):
+
+| Feature | Description | Range | Computation |
+|---------|-------------|-------|-------------|
+| `bb_width_20_2` | Bollinger Bandwidth | > 0 | (BBU - BBL) / BBM via pandas-ta |
+| `bb_width_20_2_z60` | Z-score of BB width | unbounded | Rolling z-score over 60d |
+| `squeeze_on_20` | Squeeze state (BB inside KC 1.5x) | {0, 1} | BB inside Keltner Channels |
+| `squeeze_on_wide_20` | Stricter squeeze (BB inside KC 2.0x) | {0, 1} | BB inside wider KC |
+| `squeeze_intensity_20` | Compression intensity | [-1, 1] | (KC_width - BB_width) / KC_width |
+| `squeeze_release_20` | Squeeze release signal | {0, 1} | Transition from on → off |
+| `days_in_squeeze_20` | Consecutive days in squeeze | [0, 50] | Capped at 50 |
+
+**Squeeze Logic:**
+```
+squeeze_on = (BB_upper < KC_upper) AND (BB_lower > KC_lower)
+```
+
+When Bollinger Bands contract inside Keltner Channels, it indicates volatility compression that often precedes a directional breakout.
+
+### 3.4.3 Gap / Overnight Features (NEW)
+
+**Module:** [src/features/range_breakout.py](../src/features/range_breakout.py)
+
+Features to model gap behavior and overnight price movement:
+
+| Feature | Description | Range | Computation |
+|---------|-------------|-------|-------------|
+| `overnight_ret` | Overnight return | unbounded | open / prev_close - 1 |
+| `gap_atr_ratio_raw` | Gap size in ATR units | unbounded | (open - prev_close) / atr14 |
+| `gap_fill_frac` | Gap fill fraction | [0, 1] | How much gap was filled during the day |
+| `atr_percent_chg_5` | ATR% change over 5 days | unbounded | pct_change(atr_percent, 5) |
+
+**Gap Fill Logic:**
+- Gap up: `clip((open - low) / (open - prev_close), 0, 1)`
+- Gap down: `clip((high - open) / (prev_close - open), 0, 1)`
+- Denominator == 0 → 0
 
 ### 3.5 Spread Features
 
@@ -483,8 +554,8 @@ The pipeline produces **two output files** at the end:
 
 | File | Contents | Use Case |
 |------|----------|----------|
-| `features_complete.parquet` | ALL computed features (~600+) | Debugging, feature exploration, re-running selection |
-| `features_filtered.parquet` | Curated ML-ready features (~250) | Model training, production |
+| `features_complete.parquet` | All computed features | Debugging, feature exploration, re-running selection |
+| `features_filtered.parquet` | Curated ML-ready features | Model training, production |
 
 **Why Two Files:**
 
@@ -506,13 +577,17 @@ The filtering step removes intermediate/raw features not suitable for ML.
 
 **Feature Categories:**
 
-| Category | Purpose | Count |
-|----------|---------|-------|
-| `BASE_FEATURES` | Core features for model training | ~38 |
-| `EXPANSION_CANDIDATES` | Additional features for selection experiments | ~200 |
-| `EXCLUDED_FEATURES` | Raw/unnormalized values (dropped) | ~50 |
-| `META_COLUMNS` | Always kept: `symbol`, `date`, `ret` | 3 |
-| `REQUIRED_FEATURES` | Always kept: `atr_percent` (for targets) | 1 |
+| Category | Purpose |
+|----------|---------|
+| `BASE_FEATURES` | Core features for model training |
+| `EXPANSION_CANDIDATES` | Additional features for selection experiments |
+| `EXCLUDED_FEATURES` | Raw/unnormalized values (dropped) |
+| `RETIRED_FEATURES` | Features tested but consistently not selected |
+| `INTERMEDIATE_FEATURES` | Required to compute kept features but not stored |
+| `META_COLUMNS` | Always kept: `symbol`, `date`, `ret` |
+| `REQUIRED_FEATURES` | Always kept: `atr_percent` (for targets) |
+
+See `src/feature_selection/base_features.py` for current feature counts.
 
 **Excluded Feature Types (examples):**
 
@@ -534,18 +609,184 @@ from src.feature_selection.base_features import filter_output_columns
 
 # After all features computed, filter to curated set
 df_filtered = filter_output_columns(df, keep_all=False)
+
+# With retired feature exclusion (saves disk space)
+df_filtered = filter_output_columns(df, keep_all=True, exclude_retired=True)
 ```
 
 **Output Validation:**
 
 The output should contain:
-- All 38 `BASE_FEATURES` (verify with `validate_features()`)
-- All ~200 `EXPANSION_CANDIDATES` (for selection experiments)
+- All `BASE_FEATURES` (verify with `validate_features()`)
+- All `EXPANSION_CANDIDATES` (for selection experiments)
 - Required columns: `symbol`, `date`, `ret`, `atr_percent`
 
 ---
 
-## 3.11 Intermediate Checkpoint Architecture
+### 3.11 Feature Classification System
+
+**Module:** [src/feature_selection/base_features.py](../src/feature_selection/base_features.py)
+
+Features in the pipeline are classified into three distinct categories:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         FEATURE CLASSIFICATION                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  1. KEPT OUTPUTS (ML-ready)                                                      │
+│     ├── BASE_FEATURES - Core curated set for production models                  │
+│     ├── EXPANSION_CANDIDATES - Promising features for experiments               │
+│     ├── META_COLUMNS - symbol, date, ret                                         │
+│     └── REQUIRED_FEATURES - atr_percent (needed for targets)                     │
+│                                                                                  │
+│  2. INTERMEDIATE DEPENDENCIES (computed but not stored)                          │
+│     ├── Raw moving averages: ma_10, ma_20, ..., ma_200                           │
+│     ├── Raw ATR: atr14 (needed for atr_percent)                                  │
+│     ├── Raw realized volatility: rv_10, rv_20, rv_60, rv_100                     │
+│     ├── Sign columns: sign_ma_10, sign_ma_20, ... (for trend_score)              │
+│     └── Breadth intermediates: sector_breadth_adv, sector_breadth_dec            │
+│                                                                                  │
+│  3. RETIRED FEATURES (optionally excluded from computation and storage)          │
+│     ├── trend: macd_hist_deriv_ema3, rsi_21, rsi_30, trend_score_granular        │
+│     ├── range_breakout: breakout_up_*, breakout_dn_*, range_expansion_*          │
+│     ├── volatility: vol_regime, rv_ratio_*, vol_regime_cs_median                 │
+│     ├── volume: obv_z_60, volshock_z, volshock_dir                               │
+│     ├── alpha: beta_market, beta_qqq (daily; weekly versions kept)               │
+│     └── macro: vix_ma20_ratio, vix_change_*, vix_regime                          │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**RETIRED_FEATURES_BY_MODULE:**
+
+Retired features are organized by their source module for maintainability:
+
+```python
+RETIRED_FEATURES_BY_MODULE = {
+    "trend": [
+        "macd_hist_deriv_ema3",    # MACD derivative doesn't add value
+        "rsi_21", "rsi_30",        # rsi_14 sufficient
+        "trend_score_granular",    # trend_score_sign/slope sufficient
+        ...
+    ],
+    "range_breakout": [
+        "breakout_up_5d", "breakout_up_10d", "breakout_up_20d",
+        "breakout_dn_5d", "breakout_dn_10d", "breakout_dn_20d",
+        ...
+    ],
+    "volatility": [...],
+    "volume": [...],
+    "alpha": [...],
+    "macro": [...],
+}
+
+# Flattened for efficient lookup
+RETIRED_FEATURES = set()
+for features in RETIRED_FEATURES_BY_MODULE.values():
+    RETIRED_FEATURES.update(features)
+```
+
+**FEATURE_DEPENDENCIES:**
+
+Maps derived features to their required intermediates, ensuring intermediates are computed even when filtering:
+
+```python
+FEATURE_DEPENDENCIES = {
+    "atr_percent": {"atr14"},
+    "vol_regime_ema10": {"vol_regime", "rv_20", "rv_100"},
+    "trend_score_sign": {"sign_ma_10", "sign_ma_20", ...},
+    "pct_dist_ma_20_z": {"pct_dist_ma_20", "ma_20"},
+    "pos_in_20d_range": {"20d_high", "20d_low"},
+}
+```
+
+**Helper Functions:**
+
+```python
+from src.feature_selection.base_features import (
+    get_retired_features,           # Returns set of retired feature names
+    get_retired_features_by_module, # Returns dict by module
+    get_intermediate_features,      # Returns set of intermediate feature names
+    get_feature_dependencies,       # Returns dependency map
+    filter_output_columns,          # Filter with exclude_retired option
+    drop_retired_columns,           # Drop retired from existing DataFrame
+    get_feature_exclusion_report,   # Statistics on excluded features
+)
+```
+
+### 3.12 Excluding Retired Features (--exclude-retired)
+
+**CLI Flag:** `--exclude-retired`
+
+When running with `--exclude-retired`, the pipeline:
+1. Computes all features (including intermediates needed for derived features)
+2. Excludes retired features from `features_complete.parquet`
+3. Curated filtering for `features_filtered.parquet` is unchanged
+
+**Usage:**
+
+```bash
+# Normal run (all features computed and stored)
+python -m src.cli.compute --timeframes D,W
+
+# Exclude retired features from output (saves disk space)
+python -m src.cli.compute --timeframes D,W --exclude-retired
+```
+
+**Runtime Output:**
+
+```
+============================================================
+PIPELINE V2: Processing 2847 symbols
+Timeframes: ['D', 'W']
+Workers: 8
+Exclude retired: Yes (152 features)
+Date range: 2019-01-02 to 2024-12-20
+============================================================
+
+>>> [Stage 1] Computing single-stock features...
+<<< [Stage 1] Done: 2847 symbols (4.2 sec)
+
+...
+
+>>> [Retire Features] Excluded 89 retired features from complete output
+>>> [Output Filtering] Filtered 312 intermediate columns, keeping 256
+
+============================================================
+PIPELINE V2 COMPLETE
+  Rows: 2,847,000
+  Complete columns: 423  (vs 512 without --exclude-retired)
+  Filtered columns: 256
+  Retired excluded: 89
+  Targets: 2,234,567
+============================================================
+```
+
+**Disk Space Savings:**
+
+| Mode | features_complete.parquet | features_filtered.parquet |
+|------|---------------------------|---------------------------|
+| Normal | ~2.1 GB | ~0.8 GB |
+| --exclude-retired | ~1.7 GB | ~0.8 GB |
+
+**Benefits:**
+1. **Disk savings** - ~20% smaller complete parquet file
+2. **Clarity** - Retired features not cluttering exploration
+3. **Backwards compatible** - Flag is optional, default behavior unchanged
+
+**Behavior Matrix:**
+
+| Flag Combination | features_complete.parquet | features_filtered.parquet |
+|-----------------|---------------------------|---------------------------|
+| (default) | All computed features | Curated ML-ready features |
+| `--exclude-retired` | Fewer features (no retired) | Curated ML-ready features |
+| `--full-output` | All computed features | N/A (primary = complete) |
+| `--full-output --exclude-retired` | Fewer features (no retired) | N/A |
+
+---
+
+## 3.13 Intermediate Checkpoint Architecture
 
 **[FULLY IMPLEMENTED] Checkpoint system for staged processing**
 
@@ -1316,7 +1557,77 @@ ANOMALIES:
 
 ---
 
-## 8. File Reference
+## 8. Model-Aware Feature Sets (4-Model System)
+
+The pipeline supports four distinct models, each with a tailored feature set:
+
+| Model Key | Direction | Style | Target Setup |
+|-----------|-----------|-------|--------------|
+| `LONG_NORMAL` | Long | Standard | Impulse, gap behavior, 1.5 ATR |
+| `LONG_PARABOLIC` | Long | Extended | Trend persistence, continuation |
+| `SHORT_NORMAL` | Short | Standard | Breakdown, fragility, liquidity stress |
+| `SHORT_PARABOLIC` | Short | Panic | Regime shift, vol-of-vol |
+
+### Feature Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      CORE_FEATURES                          │
+│         (Shared backbone across all 4 models)               │
+│   Alpha, macro, trend, price position, volatility,          │
+│   breadth, volume/liquidity, momentum                       │
+└─────────────────────────────────────────────────────────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         ▼                   ▼                   ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│  HEAD_FEATURES  │ │  HEAD_FEATURES  │ │  HEAD_FEATURES  │
+│  LONG_NORMAL    │ │  LONG_PARABOLIC │ │  SHORT_*        │
+│                 │ │                 │ │                 │
+│ - Gap/overnight │ │ - Persistence   │ │ - Drawdown      │
+│ - Squeeze       │ │ - Breakouts     │ │ - VIX dynamics  │
+│ - ADX/DI        │ │ - Xsec 60d      │ │ - Credit spread │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+```
+
+### Pipeline Output
+
+The pipeline outputs a **single dataset** containing all computed features. Model-specific column selection happens at **training time**, not during feature production:
+
+```bash
+# Compute features (single output with ALL features)
+python -m src.cli.compute --timeframes D,W
+
+# Output files:
+#   artifacts/features_complete.parquet  - All computed features (~600+)
+#   artifacts/features_filtered.parquet  - BASE_FEATURES curated set
+```
+
+### Python API (Training Time)
+
+```python
+import pandas as pd
+from src.config.model_keys import ModelKey
+from src.feature_selection.base_features import get_featureset, validate_features
+
+# Load the complete feature file
+df = pd.read_parquet('artifacts/features_complete.parquet')
+
+# Get feature list for a specific model
+features = get_featureset(ModelKey.LONG_NORMAL)
+
+# Select columns for training
+df_model = df[['symbol', 'date'] + [f for f in features if f in df.columns]]
+
+# Validate features are present
+result = validate_features(df, model_key=ModelKey.LONG_NORMAL)
+```
+
+See [MODEL_FEATURIZATION.md](MODEL_FEATURIZATION.md) for detailed feature lists and API reference.
+
+---
+
+## 9. File Reference
 
 ### Source Files
 
@@ -1327,13 +1638,15 @@ ANOMALIES:
 | `src/features/cross_sectional.py` | Cross-sectional feature computation |
 | `src/features/timeframe.py` | D/W/M resampling utilities |
 | `src/data/loader.py` | Data loading and caching |
+| `src/config/model_keys.py` | ModelKey enum for 4-model system |
+| `src/feature_selection/base_features.py` | Feature registry and retrieval |
 
 ### Output Files
 
 | File | Contents |
 |------|----------|
-| `artifacts/features_complete.parquet` | ALL computed features (~600+) |
-| `artifacts/features_filtered.parquet` | Curated ML-ready features (~250) |
+| `artifacts/features_complete.parquet` | All computed features |
+| `artifacts/features_filtered.parquet` | Curated ML-ready features |
 | `artifacts/targets_triple_barrier.parquet` | ML target labels with sample weights |
 
 **Note:** Both feature files are produced on every pipeline run:
@@ -1352,16 +1665,9 @@ ANOMALIES:
 
 ---
 
-## 9. Related Documentation
+## 10. Related Documentation
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) - High-level ML pipeline
 - [CLAUDE.md](../CLAUDE.md) - Developer quick reference
 - [PIPELINE_ISSUES.md](../PIPELINE_ISSUES.md) - Known issues tracking
 
-### Archived/Consolidated Docs
-
-The following docs have been consolidated into this document:
-- `docs/WEEKLY_MULTIPROCESSING_OPTIMIZATION.md` - Parallelism patterns
-- `docs/WEEKLY_MERGE_OPTIMIZATION.md` - Merge strategies
-- `docs/WEEKLY_FEATURES_ENHANCEMENT.md` - Error handling
-- `docs/XSEC_FRAGMENTATION_FIX.md` - DataFrame patterns

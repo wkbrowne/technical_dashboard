@@ -11,6 +11,7 @@ For detailed implementation guides, see:
 | [docs/DOWNLOADER.md](docs/DOWNLOADER.md) | Data download CLI, cache structure, ETF/FRED lists, API keys |
 | [docs/FEATURE_PIPELINE_ARCHITECTURE.md](docs/FEATURE_PIPELINE_ARCHITECTURE.md) | Pipeline stages, parallelism, data flow, target generation |
 | [docs/FEATURE_SELECTION.md](docs/FEATURE_SELECTION.md) | Feature selection methodology, sample weighting, CV strategy |
+| [docs/TARGETS.md](docs/TARGETS.md) | Triple barrier targets, barrier calibration, targets-only recomputation |
 
 ## Quick Commands
 
@@ -31,6 +32,10 @@ python -m src.cli.compute --checkpoint-dir artifacts/checkpoints  # Resumable
 # Quality checks
 python run_data_quality.py --verbose
 pytest tests/ -v
+
+# Target calibration & recomputation
+python scripts/calibrate_barriers.py --start 2018-01-01 --end 2024-12-31  # Calibrate barrier thresholds
+python scripts/recompute_targets.py --target-config artifacts/targets/barrier_calibration.json  # Recompute targets
 ```
 
 ## Architecture Overview
@@ -166,6 +171,7 @@ R_stock = α + β_market × R_SPY
 |------|-------------|
 | `artifacts/features_complete.parquet` | All computed features |
 | `artifacts/targets_triple_barrier.parquet` | ML targets with sample weights |
+| `artifacts/targets/barrier_calibration.json` | Calibrated barrier thresholds (optional) |
 
 ## Environment Setup
 

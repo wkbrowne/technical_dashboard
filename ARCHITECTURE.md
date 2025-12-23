@@ -120,7 +120,7 @@ artifacts/feature_selection/
 
 **Purpose**: Optimize LightGBM hyperparameters for the fixed feature set.
 
-**Script**: `python run_hyperopt.py --n-trials 500`
+**Script**: `python run_model_tuning.py --n-trials 500`
 
 **When to run**:
 - Quarterly (calendar-based)
@@ -347,7 +347,7 @@ Performance drops detected
 | Script | Purpose | Command |
 |--------|---------|---------|
 | Feature Selection | Select optimal features | `python run_feature_selection.py` |
-| Hyperopt | Tune hyperparameters | `python run_hyperopt.py --n-trials 500` |
+| Hyperopt | Tune hyperparameters | `python run_model_tuning.py --n-trials 500` |
 | Training | Train production model | `python run_training.py` |
 | Prediction | Generate predictions | `python run_predict.py [--date YYYY-MM-DD]` |
 | Dashboard | Interactive web UI | `streamlit run app.py` |
@@ -400,7 +400,7 @@ streamlit run app.py --server.address 0.0.0.0
 As of the last run:
 
 - **Features**: 52 selected (0.6932 AUC ± 0.0625)
-- **Hyperparameters**: Run `python run_hyperopt.py` to generate
+- **Hyperparameters**: Run `python run_model_tuning.py` to generate
 - **Model**: Run `python run_training.py` to train
 - **Predictions**: Run `python run_predict.py` to generate
 - **Dashboard**: Run `streamlit run app.py` to view
