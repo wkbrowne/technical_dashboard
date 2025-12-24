@@ -5,20 +5,134 @@ A production-quality position sizing, optimization, and backtesting system for t
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Weekly Trading Protocol](#weekly-trading-protocol)
-3. [Overlapping Labels and Purge/Embargo Logic](#overlapping-labels-and-purgeembargo-logic)
-4. [Model Training and Calibration](#model-training-and-calibration)
-5. [Position Sizing Rules](#position-sizing-rules)
-6. [NAV Exposure vs Volatility-Targeted Exposure](#nav-exposure-vs-volatility-targeted-exposure)
-7. [Optimizer Design](#optimizer-design)
-8. [Backtest Assumptions](#backtest-assumptions)
-9. [Running the Pipeline](#running-the-pipeline)
-10. [Configuration Examples](#configuration-examples)
-11. [Known Failure Modes and Sanity Checks](#known-failure-modes-and-sanity-checks)
+2. [Multi-Model Sizing System](#multi-model-sizing-system)
+3. [Weekly Trading Protocol](#weekly-trading-protocol)
+4. [Overlapping Labels and Purge/Embargo Logic](#overlapping-labels-and-purgeembargo-logic)
+5. [Model Training and Calibration](#model-training-and-calibration)
+6. [Position Sizing Rules](#position-sizing-rules)
+7. [NAV Exposure vs Volatility-Targeted Exposure](#nav-exposure-vs-volatility-targeted-exposure)
+8. [Regime Gating](#regime-gating)
+9. [Optimizer Design](#optimizer-design)
+10. [Backtest Assumptions](#backtest-assumptions)
+11. [Running the Pipeline](#running-the-pipeline)
+12. [Configuration Examples](#configuration-examples)
+13. [Known Failure Modes and Sanity Checks](#known-failure-modes-and-sanity-checks)
 
 ---
 
 ## Overview
+
+The position sizing system sits on top of an existing LightGBM binary classifier that predicts the probability of hitting a triple-barrier target within a 20 trading-day horizon. The system:
+
+---
+
+## Multi-Model Sizing System
+
+The multi-model sizing system extends the single-model approach to support four models with different targets and directions.
+
+### The Four Models
+
+| Model | Target | Direction | Use Case |
+|-------|--------|-----------|----------|
+| LONG_NORMAL | Upper barrier hit (normal move) | Long (+) | Standard bullish bets |
+| LONG_PARABOLIC | Upper barrier hit (parabolic move) | Long (+) | High-conviction momentum |
+| SHORT_NORMAL | Lower barrier hit (normal move) | Short (-) | Standard bearish bets |
+| SHORT_PARABOLIC | Lower barrier hit (parabolic move) | Short (-) | High-conviction reversals |
+
+Parabolic models have higher thresholds (via `parabolic_threshold_offset`) because parabolic moves are rarer but have larger expected returns.
+
+### Module Structure
+
+```
+src/sizing/
+├── __init__.py          # Module exports
+├── config.py            # Configuration dataclasses
+├── predictions.py       # Multi-model prediction loading
+├── multi_model.py       # Core sizing engine
+├── regime_gating.py     # Regime-based exposure gating
+└── optimizer.py         # TPE optimization
+```
+
+### Quick Start
+
+```bash
+# Optimize sizing for all 4 models
+python scripts/run_multi_model_sizing.py \
+    --prediction-path artifacts/predictions/cv_predictions_multi.parquet \
+    --n-trials 200
+
+# Run backtest with optimized config
+python scripts/run_multi_model_backtest.py \
+    --prediction-path artifacts/predictions/cv_predictions_multi.parquet \
+    --sizing-config artifacts/sizing/best_config_multi_model.json
+```
+
+### Prediction Format
+
+**Wide format** (recommended): Single parquet with all model predictions:
+```
+date        symbol  p_long_normal  p_long_parabolic  p_short_normal  p_short_parabolic
+2024-01-01  AAPL    0.65           0.45              0.32            0.28
+```
+
+**Separate files**: Directory with per-model parquets.
+
+### Combining Policies
+
+#### Mode Priority (Default)
+For each symbol, pick the model with highest "edge score":
+```python
+edge_score = probability - intercept
+```
+The winning model's weight is used with its direction sign.
+
+#### Blend
+Average all model weights (after applying direction signs):
+```python
+combined = mean(w_long_normal, w_long_parabolic, w_short_normal, w_short_parabolic)
+```
+
+### Direction and Netting
+
+Long models contribute positive weights, short models negative weights.
+
+When both long and short signals exist:
+- **Strongest (default)**: Pick direction with larger absolute edge
+- **Net**: Subtract short weight from long weight
+
+### Configuration Example
+
+```json
+{
+  "models": ["long_normal", "long_parabolic", "short_normal", "short_parabolic"],
+  "combine_policy": "mode_priority",
+  "netting_policy": "strongest",
+  "sizing_params": {
+    "slope": 2.0,
+    "intercept": 0.5,
+    "exposure_mult": 0.9
+  },
+  "parabolic_threshold_offset": 0.05,
+  "regime_gating": {"enabled": true},
+  "max_gross_exposure": 1.0,
+  "max_net_exposure": 0.5
+}
+```
+
+### Backward Compatibility
+
+Legacy single-model configs are automatically converted:
+```json
+{"slope": 1.5, "intercept": 0.58}
+```
+Becomes:
+```json
+{"models": ["long_normal"], "sizing_params": {"slope": 1.5, "intercept": 0.58}}
+```
+
+---
+
+## Original Single-Model Overview
 
 The position sizing system sits on top of an existing LightGBM binary classifier that predicts the probability of hitting a triple-barrier target within a 20 trading-day horizon. The system:
 
@@ -297,6 +411,83 @@ exposure = min(exposure, max_exposure_cap)
 - Risk parity approach
 
 **Important**: NAV exposure cap always applies as a ceiling.
+
+---
+
+## Regime Gating
+
+Regime gating is a **risk-control overlay** that adjusts exposure based on market conditions, independent of model predictions.
+
+### Why Gating If Regime Is in the Model?
+
+| Aspect | Model Features | Gating Overlay |
+|--------|---------------|----------------|
+| Purpose | Alpha generation | Risk control |
+| Effect | Affects predictions | Affects position sizes |
+| Nature | Soft (influences output) | Hard (exposure limits) |
+| Control | Learned from data | Configurable rules |
+
+Models include regime features to predict returns better. Gating provides hard limits that override model confidence when risk is elevated.
+
+### Gating Rules
+
+```yaml
+regime_gating:
+  enabled: true
+
+  # VIX-based: reduce exposure when VIX is high
+  vix_high_threshold: 80.0       # 80th percentile
+  vix_high_exposure_mult: 0.7    # Scale to 70%
+
+  # Credit spread: reduce when credit stress
+  credit_risk_threshold: 1.5     # Z-score
+  credit_risk_exposure_mult: 0.8 # Scale to 80%
+
+  # Breadth: reduce longs when breadth is poor
+  breadth_poor_threshold: 30.0   # 30th percentile
+  breadth_poor_long_mult: 0.8    # Scale longs to 80%
+```
+
+Rules combine multiplicatively:
+```
+final_mult = vix_mult * credit_mult * breadth_mult
+```
+
+### Available Regime Features
+
+| Feature | Description |
+|---------|-------------|
+| `vix_percentile_252d` | VIX relative to 252-day history |
+| `vix_zscore_60d` | VIX z-score over 60 days |
+| `fred_bamlh0a0hym2_z60` | Credit spread z-score |
+| `sector_breadth_pct_above_ma200` | Breadth indicator |
+| `w_equity_bond_corr_60d` | Stock-bond correlation |
+
+### Disabling Gating
+
+Set thresholds to never trigger and multipliers to 1:
+
+```json
+{
+  "regime_gating": {
+    "enabled": false,
+    "vix_high_threshold": 100.0,
+    "vix_high_exposure_mult": 1.0
+  }
+}
+```
+
+### TPE Optimization of Gating
+
+Gating parameters can be optimized alongside sizing parameters:
+
+```bash
+python scripts/run_multi_model_sizing.py \
+    --regime-gating on \
+    --n-trials 300
+```
+
+Optimized parameters are saved in `best_config_*.json` and included in trial logs.
 
 ---
 
