@@ -8,6 +8,7 @@ For detailed implementation guides, see:
 
 | Document | Description |
 |----------|-------------|
+| [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | Data quality checks, model diagnostics, validation workflow |
 | [docs/DOWNLOADER.md](docs/DOWNLOADER.md) | Data download CLI, cache structure, ETF/FRED lists, API keys |
 | [docs/FEATURE_PIPELINE_ARCHITECTURE.md](docs/FEATURE_PIPELINE_ARCHITECTURE.md) | Pipeline stages, parallelism, data flow, target generation |
 | [docs/FEATURE_SELECTION.md](docs/FEATURE_SELECTION.md) | Feature selection methodology, sample weighting, CV strategy |
@@ -124,6 +125,24 @@ X_aligned = X[X['_row_id'].isin(row_ids)]  # Filter by unique ID
 ```
 
 This is critical for panel data where (date, symbol) pairs are unique but date alone is not.
+
+### 7. Use NumPy for Correlation Matrices
+
+**NEVER** use pandas `.corr()` for large correlation matrices - it is extremely slow. Use numpy instead.
+
+```python
+# WRONG: Pandas correlation is very slow for large matrices
+corr_matrix = df[feature_cols].corr()  # Takes minutes for 100+ features
+
+# CORRECT: Use numpy (orders of magnitude faster)
+X = df[feature_cols].values
+X_clean = np.nan_to_num(X, nan=0.0)
+X_centered = X_clean - X_clean.mean(axis=0)
+X_normed = X_centered / (np.std(X_centered, axis=0) + 1e-10)
+corr_matrix = (X_normed.T @ X_normed) / X_normed.shape[0]
+```
+
+This applies to any pairwise correlation computation (feature duplicates, feature selection, etc.).
 
 ## BASE_FEATURES (Golden Reference)
 

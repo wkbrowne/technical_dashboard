@@ -439,20 +439,83 @@ Pairs and triples should represent **meaningful thematic combinations**, not arb
 
 ### 6.3 Domain-Aware Interaction Patterns
 
-The pipeline uses domain knowledge to filter interaction candidates:
+The pipeline uses comprehensive domain knowledge from quantitative trading research to filter and prioritize interaction candidates. Pattern matching is substring-based.
 
 ```python
-DOMAIN_PATTERNS = [
-    ('vol', 'momentum'),     # Volatility * momentum
-    ('regime', 'rsi'),       # Regime * momentum oscillator
-    ('alpha', 'vol'),        # Alpha * volatility
-    ('vix', 'return'),       # Market fear * returns
-    ('breadth', 'trend'),    # Market breadth * stock trend
-    ('macro', 'alpha'),      # Economic regime * stock alpha
-]
+# From src/feature_selection/interactions.py - DOMAIN_PATTERNS
+# Curated from 20+ years of systematic trading experience
+
+# === VOLATILITY REGIME × SIGNALS (The Regime Gate) ===
+# Volatility regime is the single most important conditioning variable.
+# In high-vol, mean-reversion dominates; in low-vol, trends persist.
+('vol', 'momentum'),      # RSI, MACD effectiveness depends on vol regime
+('vol', 'rsi'),           # RSI overbought/oversold zones widen in high vol
+('regime', 'momentum'),   # Regime state gates momentum signals
+('regime', 'alpha'),      # Alpha decay rate differs by regime
+
+# === BREADTH × LOCAL STOCK GEOMETRY (Confirmation Patterns) ===
+# Individual stock signals are more reliable when confirmed by market breadth
+('breadth', 'momentum'),  # Stock momentum × market participation
+('breadth', 'pos'),       # pos_in_*d_range features × breadth
+('breadth', 'trend'),     # Trend strength × breadth confirmation
+
+# === CROSS-SECTIONAL × TIME-SERIES (Compounding Effects) ===
+# Top-decile stocks with strong TS momentum = "winners that are winning more"
+('xsec', 'momentum'),     # XS momentum z-score × individual signals
+('rank', 'trend'),        # Cross-sectional rank × trend strength
+
+# === VIX/MACRO × SIGNALS (Fear Gate) ===
+# High VIX = correlated selloffs, stock-specific signals less reliable
+('vix', 'momentum'),      # Momentum signals × fear level
+('vix', 'alpha'),         # Alpha signals fail in high VIX
+
+# === ATR/RANGE × MOMENTUM (Volatility-Adjusted Signals) ===
+# Raw momentum signals must be scaled by recent volatility
+('atr', 'momentum'),      # ATR-scaled momentum
+('atr', 'return'),        # ATR-scaled returns
+
+# ... 100+ more patterns covering macro, liquidity, candlestick, etc.
 ```
 
-### 6.4 Implementation in Pipeline
+See `src/feature_selection/interactions.py` for the complete `DOMAIN_PATTERNS` list with detailed rationale for each pattern category.
+
+### 6.4 Interaction Types
+
+The pipeline supports four interaction types based on the economic relationship between features:
+
+| Type | Formula | Use Case | Example |
+|------|---------|----------|---------|
+| **PRODUCT** | `f1 × f2` | Multiplicative confirmation - both signals reinforce | `breadth × momentum` |
+| **GATED** | `f1 × sign(f2)` | One feature conditions another's reliability | `momentum × sign(vol_regime)` |
+| **RATIO** | `f1 / (\|f2\| + ε)` | Scale-invariant comparison | `momentum / ATR` |
+| **THRESHOLD** | `I(f1 > med) × I(f2 > med)` | Non-linear regime switching | `squeeze × breakout` |
+
+**Pattern-to-Type Mapping:**
+
+```python
+# From src/feature_selection/interactions.py - PATTERN_INTERACTION_TYPES
+PATTERN_INTERACTION_TYPES = {
+    # Regime-gating patterns (one feature conditions the other)
+    ('vol', 'momentum'): [InteractionType.GATED, InteractionType.PRODUCT],
+    ('vix', 'alpha'): [InteractionType.GATED],
+    ('regime', 'momentum'): [InteractionType.GATED],
+
+    # Confirmation patterns (multiplicative)
+    ('breadth', 'momentum'): [InteractionType.PRODUCT],
+    ('xsec', 'momentum'): [InteractionType.PRODUCT],
+    ('vwap', 'trend'): [InteractionType.PRODUCT],
+
+    # Scale-invariant patterns
+    ('atr', 'momentum'): [InteractionType.RATIO, InteractionType.PRODUCT],
+    ('atr', 'return'): [InteractionType.RATIO],
+
+    # Threshold patterns (regime switching)
+    ('squeeze', 'momentum'): [InteractionType.THRESHOLD, InteractionType.GATED],
+    ('drawdown', 'momentum'): [InteractionType.THRESHOLD, InteractionType.GATED],
+}
+```
+
+### 6.5 Implementation in Pipeline
 
 **Step 4 (Light Interaction Pass):**
 ```python
@@ -460,13 +523,16 @@ DOMAIN_PATTERNS = [
 interaction_candidates = []
 for i, f1 in enumerate(top_features):
     for f2 in top_features[i+1:]:
-        # Create product interaction
-        interaction_name = f"{f1}_x_{f2}"
-        interaction_values = X[f1] * X[f2]
+        # Check domain pattern for recommended interaction types
+        recommended_types = get_recommended_interaction_types(f1, f2)
 
-        # Accept if improvement >= epsilon_add_interaction
-        if improvement >= config.epsilon_add_interaction:
-            current_set.add(interaction_name)
+        for interaction_type in config.interaction_types:
+            # Generate the interaction feature
+            name, values = generate_interaction_feature(X, f1, f2, interaction_type)
+
+            # Accept if improvement >= epsilon_add_interaction
+            if improvement >= config.epsilon_add_interaction:
+                current_set.add(name)
 ```
 
 ---
@@ -678,19 +744,87 @@ python run_feature_selection.py --prune-base
 python run_feature_selection.py --resume
 ```
 
-### 11.2 Programmatic Usage
+### 11.2 Stage Execution Modes
+
+The pipeline supports running specific stages independently for faster iteration:
+
+```bash
+# Run only forward selection (steps 1-2)
+python run_feature_selection.py --forward-only
+
+# Run only backward elimination (step 3)
+python run_feature_selection.py --backward-only
+
+# Run only interaction pass (step 4)
+python run_feature_selection.py --interactions-only
+
+# Run only swapping (step 5)
+python run_feature_selection.py --swapping-only
+
+# Skip interaction pass entirely
+python run_feature_selection.py --no-interactions
+
+# Skip swapping pass
+python run_feature_selection.py --no-swapping
+```
+
+**Available Stage Modes:**
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| `FULL` | (default) | Run all stages |
+| `FORWARD_ONLY` | `--forward-only` | Only forward selection (steps 1-2) |
+| `BACKWARD_ONLY` | `--backward-only` | Only backward elimination (step 3) |
+| `INTERACTIONS_ONLY` | `--interactions-only` | Only interaction pass (step 4) |
+| `SWAPPING_ONLY` | `--swapping-only` | Only swapping (step 5) |
+| `NO_INTERACTIONS` | `--no-interactions` | Skip interaction pass |
+| `NO_SWAPPING` | `--no-swapping` | Skip swapping pass |
+
+### 11.3 Interaction Configuration
+
+Configure the interaction search parameters:
+
+```bash
+# Control number of interactions to add
+python run_feature_selection.py --max-interactions 12
+
+# Control how many top features to consider for interactions
+python run_feature_selection.py --n-top-interactions 30
+
+# Specify interaction types (comma-separated)
+python run_feature_selection.py --interaction-types product,gated,ratio
+
+# Disable domain-guided filtering (explore all pairs)
+python run_feature_selection.py --no-domain-interactions
+```
+
+**Interaction Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--max-interactions` | 8 | Maximum interaction features to add |
+| `--n-top-interactions` | 20 | Top N features considered for interaction pairs |
+| `--interaction-types` | `product` | Types: `product`, `gated`, `ratio`, `threshold` |
+| `--no-domain-interactions` | False | Disable domain pattern filtering |
+
+### 11.4 Programmatic Usage
 
 ```python
-from src.feature_selection.pipeline import LooseTightPipeline, LooseTightConfig
+from src.feature_selection.pipeline import LooseTightPipeline, LooseTightConfig, StageMode
 from src.feature_selection.config import ModelConfig, CVConfig
 
-# Configure pipeline
+# Configure pipeline with stage mode and interactions
 config = LooseTightConfig(
     n_jobs=8,
     epsilon_add_loose=0.0002,
     epsilon_remove_strict=0.0,
     max_features_loose=80,
     run_interactions=True,
+    stage_mode=StageMode.FULL,  # or INTERACTIONS_ONLY, etc.
+    max_interactions=8,
+    n_top_features_for_interactions=20,
+    interaction_types=['product', 'gated'],
+    use_domain_interactions=True,
 )
 
 # Create and run pipeline
@@ -703,7 +837,7 @@ best_metric = pipeline.get_best_metric()  # (mean, std)
 stage_summary = pipeline.get_stage_summary()
 ```
 
-### 11.3 Using Sample Weights
+### 11.5 Using Sample Weights
 
 Sample weights from triple barrier targets (overlap inverse) are automatically loaded and passed through the pipeline when using `run_feature_selection.py`:
 
@@ -792,8 +926,9 @@ trend_score_sign
 
 | File | Purpose |
 |------|---------|
-| `src/feature_selection/pipeline.py` | Loose-Then-Tight pipeline implementation |
+| `src/feature_selection/pipeline.py` | Loose-Then-Tight pipeline implementation, `StageMode` enum |
 | `src/feature_selection/base_features.py` | BASE_FEATURES, EXPANSION_CANDIDATES, EXCLUDED_FEATURES |
+| `src/feature_selection/interactions.py` | DOMAIN_PATTERNS, InteractionType, interaction generation |
 | `src/feature_selection/config.py` | Configuration dataclasses |
 | `src/feature_selection/evaluation.py` | SubsetEvaluator for CV evaluation |
 | `src/feature_selection/algorithms.py` | Forward/backward/swap algorithms |
