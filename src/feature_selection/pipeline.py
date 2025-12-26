@@ -23,6 +23,7 @@ import logging
 import pickle
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
@@ -58,11 +59,25 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
+class StageMode(Enum):
+    """Feature selection stage execution modes."""
+    FULL = "full"                      # Run all stages (default)
+    FORWARD_ONLY = "forward_only"      # Only run forward selection (steps 1-2)
+    BACKWARD_ONLY = "backward_only"    # Only run backward elimination (step 3)
+    INTERACTIONS_ONLY = "interactions_only"  # Only run interaction pass (step 4)
+    SWAPPING_ONLY = "swapping_only"    # Only run swapping (step 5)
+    NO_INTERACTIONS = "no_interactions"  # Skip interaction pass
+    NO_SWAPPING = "no_swapping"        # Skip swapping pass
+
+
 @dataclass
 class LooseTightConfig:
     """Configuration for the loose-then-tight pipeline.
 
     Attributes:
+        # Stage execution mode
+        stage_mode: Which stages to run (FULL runs all stages)
+
         # Base feature elimination
         run_base_elimination: Whether to run reverse elimination on base features
         epsilon_remove_base: Tolerance for removal during base elimination
@@ -79,6 +94,9 @@ class LooseTightConfig:
         run_interactions: Whether to run interaction discovery
         max_interactions: Maximum interaction features to add
         epsilon_add_interaction: Threshold for adding interactions
+        n_top_features_for_interactions: Top N features to consider for interactions
+        interaction_types: Types of interactions to generate ('product', 'gated', 'ratio', 'threshold')
+        use_domain_interactions: Whether to use domain-guided interaction patterns
 
         # Swapping
         epsilon_swap: Minimum improvement to accept a swap
@@ -87,6 +105,9 @@ class LooseTightConfig:
         # Parallelization
         n_jobs: Number of parallel workers
     """
+    # Stage execution mode
+    stage_mode: StageMode = StageMode.FULL
+
     # Base feature elimination (quick pruning of BASE_FEATURES)
     run_base_elimination: bool = False  # Disabled by default
     epsilon_remove_base: float = 0.0005  # Slightly more lenient than strict elimination
@@ -104,6 +125,8 @@ class LooseTightConfig:
     max_interactions: int = 8
     epsilon_add_interaction: float = 0.001  # Stricter than loose FS
     n_top_features_for_interactions: int = 20
+    interaction_types: List[str] = field(default_factory=lambda: ['product'])
+    use_domain_interactions: bool = True  # Use domain-guided patterns
 
     # Hill climbing / swapping
     epsilon_swap: float = 0.0005
@@ -113,6 +136,34 @@ class LooseTightConfig:
     # Parallelization (reuse existing infrastructure)
     # Default -1 means auto-detect CPU count at runtime
     n_jobs: int = -1
+
+    def should_run_stage(self, stage: str) -> bool:
+        """Check if a stage should run based on stage_mode.
+
+        Args:
+            stage: Stage name ('forward', 'backward', 'interactions', 'swapping')
+
+        Returns:
+            True if the stage should run
+        """
+        mode = self.stage_mode
+
+        if mode == StageMode.FULL:
+            return True
+        elif mode == StageMode.FORWARD_ONLY:
+            return stage in ('base', 'forward')
+        elif mode == StageMode.BACKWARD_ONLY:
+            return stage == 'backward'
+        elif mode == StageMode.INTERACTIONS_ONLY:
+            return stage == 'interactions'
+        elif mode == StageMode.SWAPPING_ONLY:
+            return stage == 'swapping'
+        elif mode == StageMode.NO_INTERACTIONS:
+            return stage != 'interactions'
+        elif mode == StageMode.NO_SWAPPING:
+            return stage != 'swapping'
+        else:
+            return True
 
 
 @dataclass
@@ -815,10 +866,14 @@ class LooseTightPipeline:
         base_features = [f for f in get_base_features() if f in X.columns]
         all_expansion = [f for f in get_expansion_candidates(flat=True) if f in X.columns]
 
+        # Determine stage mode description
+        mode_desc = self.config.stage_mode.value if hasattr(self.config.stage_mode, 'value') else str(self.config.stage_mode)
+
         if verbose:
             print(f"\n{'='*70}")
             print("LOOSE-THEN-TIGHT FEATURE SELECTION PIPELINE")
             print(f"{'='*70}")
+            print(f"Stage mode: {mode_desc}")
             print(f"Base features available: {len(base_features)}")
             print(f"Expansion candidates available: {len(all_expansion)}")
             print()
@@ -840,10 +895,11 @@ class LooseTightPipeline:
 
         # Store baseline for comparison
         initial_baseline = baseline_result
+        result = baseline_result
 
         # STEP 1b: Optional base feature elimination (quick pruning)
         pre_forward_result = baseline_result  # Use baseline as starting point for comparison
-        if self.config.run_base_elimination:
+        if self.config.run_base_elimination and self.config.should_run_stage('base'):
             current_features, result = self._base_feature_elimination(current_features)
             self._completed_stages.append("1b_base_elimination")
             self._record_snapshot("1b_base_elimination", current_features, result)
@@ -854,33 +910,35 @@ class LooseTightPipeline:
                 print(f"  [Checkpoint saved]")
 
         # STEP 2: Loose forward selection
-        gc.collect()  # MEMORY: Clean up before forward selection
-        current_features, result = self._loose_forward_selection(
-            current_features, all_expansion
-        )
-        self._completed_stages.append("2_loose_forward")
-        self._record_snapshot("2_loose_forward", current_features, result)
-        self._save_checkpoint("2_loose_forward", current_features, result)
-        if verbose:
-            self._print_extended_metrics("2_loose_forward", result, len(current_features))
-            self._print_comparison_table(pre_forward_result, result, "Loose Forward Selection")
-            print(f"  [Checkpoint saved]")
+        if self.config.should_run_stage('forward'):
+            gc.collect()  # MEMORY: Clean up before forward selection
+            current_features, result = self._loose_forward_selection(
+                current_features, all_expansion
+            )
+            self._completed_stages.append("2_loose_forward")
+            self._record_snapshot("2_loose_forward", current_features, result)
+            self._save_checkpoint("2_loose_forward", current_features, result)
+            if verbose:
+                self._print_extended_metrics("2_loose_forward", result, len(current_features))
+                self._print_comparison_table(pre_forward_result, result, "Loose Forward Selection")
+                print(f"  [Checkpoint saved]")
 
         # STEP 3: Strict backward elimination
-        gc.collect()  # MEMORY: Clean up before backward elimination
-        pre_backward_result = result
-        current_features, result = self._strict_backward_elimination(current_features)
-        self._completed_stages.append("3_strict_backward")
-        self._record_snapshot("3_strict_backward", current_features, result)
-        self._save_checkpoint("3_strict_backward", current_features, result)
-        if verbose:
-            self._print_extended_metrics("3_strict_backward", result, len(current_features))
-            self._print_comparison_table(pre_backward_result, result, "Strict Backward Elimination")
-            print(f"  [Checkpoint saved]")
+        if self.config.should_run_stage('backward'):
+            gc.collect()  # MEMORY: Clean up before backward elimination
+            pre_backward_result = result
+            current_features, result = self._strict_backward_elimination(current_features)
+            self._completed_stages.append("3_strict_backward")
+            self._record_snapshot("3_strict_backward", current_features, result)
+            self._save_checkpoint("3_strict_backward", current_features, result)
+            if verbose:
+                self._print_extended_metrics("3_strict_backward", result, len(current_features))
+                self._print_comparison_table(pre_backward_result, result, "Strict Backward Elimination")
+                print(f"  [Checkpoint saved]")
 
         # STEP 4: Light interaction pass (optional)
-        gc.collect()  # MEMORY: Clean up before interaction pass
-        if self.config.run_interactions:
+        if self.config.run_interactions and self.config.should_run_stage('interactions'):
+            gc.collect()  # MEMORY: Clean up before interaction pass
             pre_interaction_result = result
             current_features, result = self._light_interaction_pass(
                 current_features, all_expansion
@@ -894,30 +952,32 @@ class LooseTightPipeline:
                 print(f"  [Checkpoint saved]")
 
         # STEP 5: Hill climbing / swapping
-        gc.collect()  # MEMORY: Clean up before swapping
-        pre_swap_result = result
-        current_features, result = self._hill_climbing_swapping(
-            current_features, all_expansion
-        )
-        self._completed_stages.append("5_swapping")
-        self._record_snapshot("5_swapping", current_features, result)
-        self._save_checkpoint("5_swapping", current_features, result)
-        if verbose:
-            self._print_extended_metrics("5_swapping", result, len(current_features))
-            self._print_comparison_table(pre_swap_result, result, "Hill Climbing / Swapping")
-            print(f"  [Checkpoint saved]")
+        if self.config.should_run_stage('swapping'):
+            gc.collect()  # MEMORY: Clean up before swapping
+            pre_swap_result = result
+            current_features, result = self._hill_climbing_swapping(
+                current_features, all_expansion
+            )
+            self._completed_stages.append("5_swapping")
+            self._record_snapshot("5_swapping", current_features, result)
+            self._save_checkpoint("5_swapping", current_features, result)
+            if verbose:
+                self._print_extended_metrics("5_swapping", result, len(current_features))
+                self._print_comparison_table(pre_swap_result, result, "Hill Climbing / Swapping")
+                print(f"  [Checkpoint saved]")
 
-        # STEP 6: Final cleanup pass
-        gc.collect()  # MEMORY: Clean up before final cleanup
-        pre_cleanup_result = result
-        current_features, result = self._final_cleanup(current_features)
-        self._completed_stages.append("6_final_cleanup")
-        self._record_snapshot("6_final_cleanup", current_features, result)
-        self._save_checkpoint("6_final_cleanup", current_features, result)
-        if verbose:
-            self._print_extended_metrics("6_final_cleanup", result, len(current_features))
-            self._print_comparison_table(pre_cleanup_result, result, "Final Cleanup")
-            print(f"  [Checkpoint saved]")
+        # STEP 6: Final cleanup pass (only if we ran backward elimination)
+        if self.config.should_run_stage('backward'):
+            gc.collect()  # MEMORY: Clean up before final cleanup
+            pre_cleanup_result = result
+            current_features, result = self._final_cleanup(current_features)
+            self._completed_stages.append("6_final_cleanup")
+            self._record_snapshot("6_final_cleanup", current_features, result)
+            self._save_checkpoint("6_final_cleanup", current_features, result)
+            if verbose:
+                self._print_extended_metrics("6_final_cleanup", result, len(current_features))
+                self._print_comparison_table(pre_cleanup_result, result, "Final Cleanup")
+                print(f"  [Checkpoint saved]")
 
         # STEP 7: Select best subset seen anywhere
         self._select_best_subset()
@@ -1133,6 +1193,7 @@ class LooseTightPipeline:
     def _strict_backward_elimination(
         self,
         features: Set[str],
+        step_label: str = "STEP 3: Strict Backward Elimination",
     ) -> Tuple[Set[str], SubsetResult]:
         """
         STEP 3: Strict backward elimination with high precision.
@@ -1142,9 +1203,13 @@ class LooseTightPipeline:
         - Does not worsen the metric beyond epsilon_remove_strict
 
         Base features are NOT protected - they can be removed.
+
+        Args:
+            features: Set of feature names to eliminate from.
+            step_label: Label to print for this step (allows reuse in final cleanup).
         """
         if self._verbose:
-            print(f"STEP 3: Strict Backward Elimination")
+            print(step_label)
             print(f"  epsilon_remove_strict={self.config.epsilon_remove_strict}")
             print(f"  (base features NOT protected)")
             print("-" * 50)
@@ -1478,12 +1543,11 @@ class LooseTightPipeline:
         One last backward elimination with strict criteria.
         Goal is stability and simplicity.
         """
-        if self._verbose:
-            print(f"STEP 6: Final Cleanup Pass")
-            print("-" * 50)
-
-        # Reuse strict backward elimination
-        return self._strict_backward_elimination(features)
+        # Reuse strict backward elimination with appropriate step label
+        return self._strict_backward_elimination(
+            features,
+            step_label="STEP 6: Final Cleanup Pass"
+        )
 
     # =========================================================================
     # STEP 7: Best Subset Selection

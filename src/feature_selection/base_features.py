@@ -41,80 +41,79 @@ except ImportError:
 
 
 # =============================================================================
-# CORE FEATURES - Shared backbone across all models (50 features)
+# CORE FEATURES - Shared backbone across all models (49 features)
 # =============================================================================
-# Auto-generated from multi-model selection: 2025-12-23 15:51:09 UTC
-# Run signature: 9cee9ff7f14c
+# Auto-generated from multi-model selection: 2025-12-24 15:44:29 UTC
+# Run signature: 6bf1994a6423
 # These features represent the intersection of all 4 model selections.
 
 CORE_FEATURES: List[str] = [
-    # === RELATIVE PERFORMANCE / ALPHA (8 features) ===
+    # === RELATIVE PERFORMANCE / ALPHA (7 features) ===
     "alpha_mom_qqq_20_ema10",
     "alpha_mom_sector_20_ema10",
-    "rel_strength_sector",
     "w_alpha_mom_qqq_60_ema10",
     "w_alpha_mom_spy_20_ema10",
+    "w_beta_qqq",
     "w_rel_strength_sector",
-    "w_xsec_mom_4w_z",
     "xsec_mom_20d_z",
 
-    # === MACRO / INTERMARKET (12 features) ===
+    # === MACRO / INTERMARKET (13 features) ===
     "copper_gold_zscore",
     "fred_bamlh0a0hym2_z60",
     "fred_ccsa_z52w",
     "fred_t10y2y_z60",
-    "gold_spy_ratio_zscore",
     "qqq_spy_cumret_20",
     "qqq_spy_cumret_60",
     "qqq_spy_slope_20",
     "vix_percentile_252d",
     "vix_zscore_60d",
+    "w_cyclical_defensive_ratio",
     "w_equity_bond_corr_60d",
+    "w_fred_bamlh0a0hym2_z60",
     "w_fred_icsa_z52w",
 
-    # === TREND STRENGTH (5 features) ===
+    # === TREND STRENGTH (3 features) ===
     "pct_slope_ma_100",
     "pct_slope_ma_20",
-    "trend_score_sign",
-    "trend_score_slope",
     "w_macd_histogram",
 
-    # === PRICE POSITION / MEAN REVERSION (5 features) ===
-    "days_since_high_20d_norm",
+    # === PRICE POSITION / MEAN REVERSION (4 features) ===
     "pct_dist_ma_20_z",
     "pct_dist_ma_50_z",
     "pos_in_20d_range",
     "relative_dist_20_50_z",
 
-    # === VOLATILITY / REGIME (7 features) ===
-    "atr_percent",
+    # === VOLATILITY / REGIME (8 features) ===
     "bb_width_20_2",
     "days_in_squeeze_20",
+    "gap_atr_ratio",
     "gap_atr_ratio_raw",
     "rv_z_60",
     "squeeze_intensity_20",
+    "squeeze_release_20",
     "vol_regime_ema10",
 
     # === SECTOR BREADTH (3 features) ===
     "sector_breadth_ad_line",
-    "sector_breadth_mcclellan_osc",
+    "sector_breadth_pct_above_ma200",
     "w_sector_breadth_mcclellan_osc",
 
-    # === VOLUME / LIQUIDITY (5 features) ===
-    "lower_shadow_ratio",
-    "pv_divergence_5d",
-    "vwap_dist_20d_zscore",
+    # === VOLUME / LIQUIDITY (2 features) ===
     "vwap_dist_5d_zscore",
     "w_volshock_ema",
 
-    # === MOMENTUM / TREND QUALITY (4 features) ===
+    # === MOMENTUM / TREND QUALITY (6 features) ===
     "adx_14",
     "chop_14",
+    "di_minus_14",
     "di_plus_14",
+    "gap_fill_frac",
     "rsi_14",
 
-    # === RANGE / BREAKOUT (1 features) ===
+    # === RANGE / BREAKOUT (3 features) ===
+    "overnight_ratio",
     "overnight_ret",
+    "range_efficiency",
 
 ]
 
@@ -122,96 +121,111 @@ CORE_FEATURES: List[str] = [
 # =============================================================================
 # HEAD FEATURES - Model-specific additive features
 # =============================================================================
-# Auto-generated from multi-model selection: 2025-12-23 15:51:09 UTC
+# Auto-generated from multi-model selection: 2025-12-24 15:44:29 UTC
 # These are features selected by specific models but not in CORE.
 
 HEAD_FEATURES: Dict[ModelKey, List[str]] = {
     # LONG_NORMAL: Standard long momentum (1.5 ATR style)
     ModelKey.LONG_NORMAL: [
-        "di_minus_14",
-        "gap_atr_ratio",
-        "gap_fill_frac",
-        "overnight_ratio",
-        "range_efficiency",
-        "sector_breadth_pct_above_ma200",
-        "squeeze_release_20",
+        "atr_percent",
+        "bestmatch_spy_zscore_60",
+        "drawdown_expanding",
+        "drawdown_velocity_20d",
+        "fred_ccsa_chg4w",
+        "fred_dgs10_chg20d",
+        "gold_spy_ratio_zscore",
+        "gold_spy_ratio_zscore_x_w_rsp_spy_cumret_12",
+        "lower_shadow_ratio",
+        "pv_divergence_5d",
+        "recovery_120d_z",
+        "rel_strength_qqq",
+        "rel_strength_sector",
+        "rsp_spy_cumret_20",
+        "rsp_spy_cumret_60",
+        "sector_breadth_pct_above_ma50",
+        "trend_score_slope",
         "upper_shadow_ratio",
+        "vwap_dist_20d_zscore",
         "w_alpha_mom_sector_60_ema10",
-        "w_beta_qqq",
-        "w_cyclical_defensive_ratio",
-        "w_fred_bamlh0a0hym2_z60",
+        "w_fred_ccsa_z52w",
+        "w_fred_nfci_chg4w",
         "w_pct_slope_ma_50",
+        "w_rsi_price_div_20d",
+        "w_rsp_spy_cumret_12",
+        "w_sector_breadth_pct_above_ma10",
+        "w_sector_breadth_pct_above_ma40",
+        "w_xsec_mom_4w_z",
     ],
 
     # LONG_PARABOLIC: Extended momentum / trend persistence
     ModelKey.LONG_PARABOLIC: [
-        "credit_spread_zscore",
-        "di_minus_14",
-        "fred_ccsa_chg4w",
-        "fred_dgs2_chg20d",
-        "overnight_ratio",
-        "pct_dist_ma_100_z",
-        "range_efficiency",
+        "atr_percent",
+        "bb_width_20_2_z60",
+        "bestmatch_spy_zscore_60",
+        "days_since_high_20d_norm",
+        "drawdown_120d_z",
+        "drawdown_60d_z",
+        "fred_dgs10_chg20d",
+        "fred_nfci_z52w",
+        "gold_spy_ratio_zscore",
+        "lower_shadow_ratio",
         "recovery_120d",
-        "rel_strength_spy",
-        "rsp_spy_cumret_60",
-        "rsp_spy_cumret_60_x_qqq_spy_cumret_20",
-        "rsp_spy_cumret_60_x_w_fred_icsa_z52w",
-        "sector_breadth_pct_above_ma200",
-        "squeeze_release_20",
+        "recovery_20d",
+        "rel_strength_qqq",
+        "rel_strength_sector",
+        "rsi_price_div_20d",
+        "trend_score_sign",
+        "trend_score_slope",
         "upper_shadow_ratio",
-        "w_alpha_mom_sector_60_ema10",
-        "w_beta_qqq",
+        "vwap_dist_20d_zscore",
+        "w_days_since_high_60d_norm",
+        "w_fred_ccsa_z52w",
+        "w_pct_dist_ma_20_z",
         "w_pct_slope_ma_50",
-        "w_vix_vxn_spread",
+        "w_rel_strength_qqq",
+        "w_relative_dist_20_50_z",
+        "w_rsi_price_div_20d",
+        "w_sector_breadth_pct_above_ma10",
+        "w_xsec_mom_4w_z",
     ],
 
     # SHORT_NORMAL: Breakdown / fragility / liquidity stress
     ModelKey.SHORT_NORMAL: [
-        "alpha_mom_spy_120_ema10",
-        "credit_spread_zscore",
-        "di_minus_14",
-        "fred_ccsa_chg4w",
-        "fred_dgs10_chg20d",
-        "fred_dgs2_chg20d",
-        "fred_nfci_z52w",
-        "gap_fill_frac",
-        "range_efficiency",
-        "rel_strength_spy",
-        "sector_breadth_ad_line_x_w_fred_bamlh0a0hym2_z60",
-        "sector_breadth_pct_above_ma50",
-        "squeeze_release_20",
+        "atr_percent",
+        "days_since_high_20d_norm",
+        "gold_spy_ratio_zscore",
+        "lower_shadow_ratio",
+        "pv_divergence_5d",
+        "rel_strength_sector",
+        "rsp_spy_cumret_60",
+        "sector_breadth_mcclellan_osc",
+        "trend_score_sign",
         "upper_shadow_ratio",
         "w_alpha_mom_sector_60_ema10",
-        "w_beta_qqq",
-        "w_credit_spread_zscore",
-        "w_cyclical_defensive_ratio",
-        "w_fred_bamlh0a0hym2_z60",
-        "w_fred_ccsa_z52w",
+        "w_fred_nfci_chg4w",
         "w_pct_slope_ma_50",
-        "w_vix_vxn_spread",
-        "w_xsec_pct_4w",
-        "w_yield_curve_zscore",
+        "w_rel_strength_spy",
+        "w_xsec_mom_4w_z",
     ],
 
     # SHORT_PARABOLIC: Panic / regime shift / vol-of-vol
     ModelKey.SHORT_PARABOLIC: [
+        "alpha_mom_qqq_60_ema10",
+        "bestmatch_spy_cumret_60",
         "drawdown_60d_z",
-        "fred_dgs10_chg20d",
+        "drawdown_velocity_60d",
         "fred_dgs10_z60",
-        "fred_dgs2_chg20d",
-        "gap_fill_frac",
-        "min_pct_dist_ma",
-        "recovery_20d",
-        "rsp_spy_cumret_60",
-        "sector_breadth_pct_above_ma200",
-        "sector_breadth_pct_above_ma50",
-        "w_cyclical_defensive_ratio",
-        "w_fred_bamlh0a0hym2_z60",
-        "w_rel_strength_spy_zscore",
-        "w_rsp_spy_cumret_12",
-        "w_vix_vxn_spread",
-        "yield_curve_zscore",
+        "pct_dist_ma_100_z",
+        "rel_strength_spy",
+        "sector_breadth_mcclellan_osc",
+        "trend_score_sign",
+        "vwap_dist_20d_zscore",
+        "w_alpha_mom_sector_60_ema10",
+        "w_fred_nfci_chg4w",
+        "w_fred_t10y2y_z60",
+        "w_rel_strength_qqq",
+        "w_sector_breadth_pct_above_ma40",
+        "xsec_pct_20d",
     ],
 
 }
@@ -237,6 +251,9 @@ FEATURE_CATEGORIES = {
         "bb_width_20_2_z60", "squeeze_on_20", "squeeze_on_wide_20",
         "squeeze_intensity_20", "squeeze_release_20", "days_in_squeeze_20",
         "atr_percent_chg_5",
+        # Volatility acceleration (2nd derivatives)
+        "rv_delta_10_60", "rv_delta_10_60_z", "rv_accel_20", "rv_accel_60",
+        "rv_impulse_5d_z", "w_rv_delta_10_60_z", "w_rv_accel_20",
     ],
     "price_position": [
         "pct_dist_ma_20", "pct_dist_ma_50", "pct_dist_ma_100_z",
@@ -316,6 +333,11 @@ FEATURE_CATEGORIES = {
         "sector_breadth_mcclellan_osc", "sector_breadth_ad_line",
         "w_sector_breadth_pct_above_ma10", "w_sector_breadth_pct_above_ma40",
         "w_sector_breadth_mcclellan_osc",
+        # Breadth motion (slopes and changes)
+        "sector_breadth_ad_chg_10d", "sector_breadth_ad_slope_20d",
+        "sector_breadth_mcclellan_chg_5d", "sector_breadth_mcclellan_slope_10d",
+        "sector_breadth_pct_ma50_chg_10d",
+        "w_sector_breadth_ad_slope_8w", "w_sector_breadth_mcclellan_chg_2w",
     ],
     "macro": [
         "vix_regime", "vix_percentile_252d", "vix_zscore_60d",
@@ -357,6 +379,8 @@ EXPANSION_CANDIDATES = {
         "alpha_mom_qqq_60_ema10", "alpha_mom_sector_60_ema10",
         "alpha_mom_combo_20_ema10", "alpha_mom_combo_60_ema10",
         "w_alpha_mom_spy_60_ema10",
+        "residual_cumret", "residual_vol", "residual_mean",
+        "w_residual_cumret", "w_residual_vol",
     ],
     "factor_spreads": [
         "qqq_spy_zscore_60", "rsp_spy_cumret_20", "rsp_spy_cumret_60",
@@ -401,10 +425,15 @@ EXPANSION_CANDIDATES = {
     "gaps": [
         "gap_atr_ratio", "overnight_ret", "gap_fill_frac", "atr_percent_chg_5",
     ],
-    "trend_quality": ["adx_14", "di_plus_14"],
+    "trend_quality": [
+        "adx_14", "di_plus_14",
+        "trend_persist_ema", "quiet_trend", "trend_alignment",
+        "w_trend_persist_ema", "w_quiet_trend", "w_trend_alignment",
+    ],
     "volatility_squeeze": [
         "bb_width_20_2_z60", "squeeze_on_20", "squeeze_on_wide_20",
         "squeeze_intensity_20", "squeeze_release_20", "days_in_squeeze_20",
+        "rv_ratio_10_60", "rv_ratio_20_100",
     ],
     "divergence": [
         "rsi_price_div_10d", "rsi_price_div_20d",
@@ -414,7 +443,39 @@ EXPANSION_CANDIDATES = {
         "vol_trend_div_10d", "vol_trend_div_20d",
         "w_rsi_price_div_20d", "w_macd_price_div_20d",
     ],
-    "volume_liquidity": ["pv_divergence_5d"],
+    "volume_liquidity": [
+        "pv_divergence_5d",
+        "amihud_illiq_ratio", "illiquidity_score", "w_illiquidity_score",
+        "rel_volume_5d", "rel_volume_10d", "rel_volume_20d",
+        "w_rel_volume_5d", "w_rel_volume_10d", "w_rel_volume_20d",
+        "volume_direction", "volume_trend_10d",
+    ],
+    "volatility_acceleration": [
+        # Volatility delta (signed difference, not ratio)
+        "rv_delta_10_60",        # rv_10 - rv_60: captures vol premium direction
+        "rv_delta_10_60_z",      # Z-scored (60d) delta for cross-time comparability
+        # Volatility acceleration (2nd derivative)
+        "rv_accel_20",           # 5-day change in rv_20, z-scored over 60d
+        "rv_accel_60",           # 10-day change in rv_60, z-scored over 120d
+        # Volatility impulse (sudden expansion detection)
+        "rv_impulse_5d_z",       # 5-day pct_change of rv_10, z-scored - spike detector
+        # Weekly versions for medium-horizon models
+        "w_rv_delta_10_60_z",    # Weekly z-scored vol delta
+        "w_rv_accel_20",         # Weekly vol acceleration
+    ],
+    "breadth_motion": [
+        # AD Line momentum
+        "sector_breadth_ad_chg_10d",       # 10-day change in cumulative AD line
+        "sector_breadth_ad_slope_20d",     # 20-day linear regression slope of AD line
+        # McClellan dynamics
+        "sector_breadth_mcclellan_chg_5d", # 5-day change in McClellan oscillator
+        "sector_breadth_mcclellan_slope_10d",  # 10-day slope of McClellan
+        # Percent-above-MA motion
+        "sector_breadth_pct_ma50_chg_10d", # 10-day change in % above MA50
+        # Weekly versions
+        "w_sector_breadth_ad_slope_8w",    # 8-week slope of weekly AD line
+        "w_sector_breadth_mcclellan_chg_2w",  # 2-week change in weekly McClellan
+    ],
 }
 
 
@@ -466,8 +527,6 @@ RETIRED_FEATURES_BY_MODULE = {
         "macd_hist_deriv_ema3", "w_macd_hist_deriv_ema3",
         "rsi_21", "rsi_30", "w_rsi_14", "w_rsi_21",
         "trend_score_granular", "w_trend_score_granular",
-        "trend_persist_ema", "w_trend_persist_ema",
-        "quiet_trend", "w_quiet_trend", "trend_alignment", "w_trend_alignment",
         "pct_slope_ma_10", "pct_slope_ma_30", "pct_slope_ma_50",
         "pct_slope_ma_75", "pct_slope_ma_150", "pct_slope_ma_200",
         "w_pct_slope_ma_10", "w_pct_slope_ma_20", "w_pct_slope_ma_30",
@@ -487,7 +546,7 @@ RETIRED_FEATURES_BY_MODULE = {
         "w_pos_in_5d_range", "w_pos_in_10d_range", "w_pos_in_20d_range",
     ],
     "volatility": [
-        "vol_regime", "rv_ratio_10_60", "rv_ratio_20_100",
+        "vol_regime",
         "vol_z_20", "vol_z_60", "rvol_20", "w_rvol_20",
         "vol_regime_cs_median", "vol_regime_rel",
         "w_rv_z_60", "w_vol_z_60",
@@ -503,19 +562,13 @@ RETIRED_FEATURES_BY_MODULE = {
         "vwap_dist_10d_zscore", "w_vwap_dist_20d_zscore",
         # NOTE: lower_shadow_ratio, overnight_ratio, range_efficiency are now
         # HEAD_FEATURES for LONG_NORMAL/SHORT_NORMAL - do not retire them
-        "w_range_efficiency", "amihud_illiq_ratio",
-        "rel_volume_5d", "rel_volume_10d", "rel_volume_20d",
-        "w_rel_volume_5d", "w_rel_volume_10d", "w_rel_volume_20d",
-        "volume_direction", "volume_trend_10d",
-        "illiquidity_score", "w_illiquidity_score",
+        "w_range_efficiency",
     ],
     "alpha": [
         "beta_market", "beta_qqq", "beta_bestmatch", "beta_breadth",
         "beta_spy_simple", "beta_qqq_simple", "beta_sector",
-        "residual_cumret", "residual_vol", "residual_mean",
         "w_beta_market", "w_beta_bestmatch", "w_beta_breadth",
         "w_beta_spy_simple", "w_beta_qqq_simple",
-        "w_residual_cumret", "w_residual_vol",
     ],
     "macro": [
         "vix_ma20_ratio", "vix_vxn_spread",

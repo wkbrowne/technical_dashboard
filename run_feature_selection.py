@@ -56,6 +56,7 @@ from src.feature_selection import (
     filter_correlated_features,
     print_feature_summary,
 )
+from src.feature_selection.pipeline import StageMode
 
 
 def compute_scale_pos_weight(y: pd.Series) -> float:
@@ -273,6 +274,11 @@ def run_feature_selection(
     scale_pos_weight: float = None,
     prune_base: bool = False,
     checkpoint_path: str = None,
+    stage_mode: StageMode = StageMode.FULL,
+    max_interactions: int = 8,
+    n_top_features_for_interactions: int = 20,
+    interaction_types: list[str] = None,
+    use_domain_interactions: bool = True,
 ) -> LooseTightPipeline:
     """Run the LOOSE-THEN-TIGHT feature selection pipeline.
 
@@ -299,10 +305,17 @@ def run_feature_selection(
         prune_base: If True, run quick reverse elimination on BASE_FEATURES before
                    forward selection to prune weak base features early.
         checkpoint_path: Custom path for checkpoint file. None = default location.
+        stage_mode: Which stages to run (FULL, FORWARD_ONLY, INTERACTIONS_ONLY, etc.)
+        max_interactions: Maximum number of interaction features to add.
+        n_top_features_for_interactions: Number of top features to consider for interactions.
+        interaction_types: Types of interactions to generate ('product', 'gated', 'ratio', 'threshold').
+        use_domain_interactions: Whether to use domain-guided interaction patterns.
 
     Returns:
         Fitted LooseTightPipeline object.
     """
+    if interaction_types is None:
+        interaction_types = ['product']
     import os as _os
     effective_n_jobs = n_jobs if n_jobs > 0 else (_os.cpu_count() or 1)
 
@@ -401,6 +414,9 @@ def run_feature_selection(
 
     # Configure the loose-then-tight pipeline
     pipeline_config = LooseTightConfig(
+        # Stage execution mode
+        stage_mode=stage_mode,
+
         # Base feature elimination (optional quick pruning)
         run_base_elimination=prune_base,
         epsilon_remove_base=0.0005,  # Slightly more lenient than strict
@@ -415,9 +431,11 @@ def run_feature_selection(
 
         # Interactions
         run_interactions=True,
-        max_interactions=8,
+        max_interactions=max_interactions,
         epsilon_add_interaction=0.001,  # Stricter than loose FS
-        n_top_features_for_interactions=20,
+        n_top_features_for_interactions=n_top_features_for_interactions,
+        interaction_types=interaction_types,
+        use_domain_interactions=use_domain_interactions,
 
         # Swapping
         epsilon_swap=0.0005,
@@ -458,6 +476,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='LOOSE-THEN-TIGHT Feature Selection')
+
+    # Basic options
     parser.add_argument('--balanced', action='store_true',
                         help='Use class weights (scale_pos_weight) for balanced training')
     parser.add_argument('--max-symbols', type=int, default=5000,
@@ -472,6 +492,33 @@ def main():
                         help='Run quick reverse elimination on BASE_FEATURES before forward selection')
     parser.add_argument('--no-weights', action='store_true',
                         help='Disable sample weighting even if weights are available in targets')
+
+    # Stage mode options (mutually exclusive)
+    stage_group = parser.add_mutually_exclusive_group()
+    stage_group.add_argument('--forward-only', action='store_true',
+                             help='Only run forward selection stages (steps 1-2)')
+    stage_group.add_argument('--backward-only', action='store_true',
+                             help='Only run backward elimination (step 3)')
+    stage_group.add_argument('--interactions-only', action='store_true',
+                             help='Only run interaction pass (step 4)')
+    stage_group.add_argument('--swapping-only', action='store_true',
+                             help='Only run swapping (step 5)')
+    stage_group.add_argument('--no-interactions', action='store_true',
+                             help='Skip interaction pass')
+    stage_group.add_argument('--no-swapping', action='store_true',
+                             help='Skip swapping pass')
+
+    # Interaction configuration
+    parser.add_argument('--max-interactions', type=int, default=8,
+                        help='Maximum number of interaction features to add (default: 8)')
+    parser.add_argument('--n-top-interactions', type=int, default=20,
+                        help='Number of top features to consider for interactions (default: 20)')
+    parser.add_argument('--interaction-types', type=str, default='product',
+                        help='Comma-separated interaction types: product,gated,ratio,threshold (default: product)')
+    parser.add_argument('--no-domain-interactions', action='store_true',
+                        help='Disable domain-guided interaction pattern filtering')
+
+    # Checkpoint options
     parser.add_argument('--resume', action='store_true',
                         help='Resume from last checkpoint if available')
     parser.add_argument('--checkpoint-info', action='store_true',
@@ -479,6 +526,25 @@ def main():
     parser.add_argument('--checkpoint-path', type=str, default=None,
                         help='Custom checkpoint file path (default: artifacts/feature_selection/checkpoint.pkl)')
     args = parser.parse_args()
+
+    # Parse stage mode from flags
+    if args.forward_only:
+        stage_mode = StageMode.FORWARD_ONLY
+    elif args.backward_only:
+        stage_mode = StageMode.BACKWARD_ONLY
+    elif args.interactions_only:
+        stage_mode = StageMode.INTERACTIONS_ONLY
+    elif args.swapping_only:
+        stage_mode = StageMode.SWAPPING_ONLY
+    elif args.no_interactions:
+        stage_mode = StageMode.NO_INTERACTIONS
+    elif args.no_swapping:
+        stage_mode = StageMode.NO_SWAPPING
+    else:
+        stage_mode = StageMode.FULL
+
+    # Parse interaction types
+    interaction_types = [t.strip() for t in args.interaction_types.split(',')]
 
     # Handle checkpoint info request
     if args.checkpoint_info:
@@ -584,6 +650,11 @@ def main():
             scale_pos_weight=scale_pos_weight,
             prune_base=args.prune_base,
             checkpoint_path=args.checkpoint_path,
+            stage_mode=stage_mode,
+            max_interactions=args.max_interactions,
+            n_top_features_for_interactions=args.n_top_interactions,
+            interaction_types=interaction_types,
+            use_domain_interactions=not args.no_domain_interactions,
         )
 
     # Print results
