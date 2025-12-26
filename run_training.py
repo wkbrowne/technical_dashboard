@@ -2,18 +2,32 @@
 """
 Production Model Training Script.
 
-Trains a LightGBM model using:
-- Fixed features from feature selection (selected_features.txt)
-- Fixed hyperparameters from hyperopt (best_params.json)
-- All available historical data
+Supports the 4-model system with per-model features and configurations:
+- LONG_NORMAL: Standard long momentum
+- LONG_PARABOLIC: Extended momentum / trend persistence
+- SHORT_NORMAL: Breakdown / fragility setups
+- SHORT_PARABOLIC: Panic / regime shift scenarios
+
+Trains LightGBM models using:
+- Model-specific features from base_features.py (CORE + HEAD)
+- Per-model hyperparameters from hyperopt (model_configs.json)
+- Model-specific target labels from triple barrier targets
 
 Outputs:
-- Trained model (production_model.pkl)
-- Feature importance (feature_importance.csv)
-- Model metadata (model_metadata.json)
+- artifacts/models/{model_key}/production_model.pkl
+- artifacts/models/{model_key}/feature_importance.csv
+- artifacts/models/{model_key}/model_metadata.json
+- artifacts/models/training_registry.json (combined registry)
 
 Usage:
-    python run_training.py [--output-dir artifacts/models]
+    # Train all 4 models
+    python run_training.py --all-models
+
+    # Train specific model
+    python run_training.py --model long_normal
+
+    # Train default model (LONG_NORMAL)
+    python run_training.py
 """
 
 import gc
@@ -25,6 +39,7 @@ import argparse
 import warnings
 from pathlib import Path
 from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
 
 # Suppress warnings
 warnings.filterwarnings('ignore', message='.*feature_name.*')
@@ -39,14 +54,30 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from src.config.model_keys import ModelKey, TARGET_CONFIGS
+from src.feature_selection.base_features import get_featureset, CORE_FEATURES, HEAD_FEATURES
 
-def load_selected_features() -> list[str]:
-    """Load the selected features from feature selection output."""
+
+def load_model_features(model_key: ModelKey) -> List[str]:
+    """
+    Load features for a specific model from the feature registry.
+
+    Uses the CORE + HEAD feature architecture from base_features.py.
+    """
+    return get_featureset(model_key, include_expansion=False, flat=True)
+
+
+def load_selected_features_legacy() -> List[str]:
+    """
+    Load selected features from legacy feature selection output.
+
+    DEPRECATED: Use load_model_features(model_key) for 4-model system.
+    """
     features_file = Path('artifacts/feature_selection/selected_features.txt')
     if not features_file.exists():
         raise FileNotFoundError(
             f"Selected features file not found: {features_file}\n"
-            "Run feature selection first: python run_feature_selection.py"
+            "Run feature selection first or use --model flag for 4-model system."
         )
 
     features = []
@@ -59,50 +90,94 @@ def load_selected_features() -> list[str]:
     return features
 
 
-def load_best_params() -> tuple[dict, bool, float]:
-    """Load the best hyperparameters from hyperopt output.
+def load_model_configs() -> Dict[str, Any]:
+    """Load the combined model configs from hyperopt."""
+    config_file = Path('artifacts/hyperopt/model_configs.json')
+    if config_file.exists():
+        with open(config_file) as f:
+            return json.load(f)
+    return {'models': {}}
+
+
+def load_best_params(model_key: Optional[ModelKey] = None) -> Tuple[dict, bool, float]:
+    """
+    Load the best hyperparameters from hyperopt output.
+
+    Args:
+        model_key: If provided, load params for this specific model.
+                   Otherwise, try legacy path.
 
     Returns:
         Tuple of (params, balanced, scale_pos_weight)
-        - params: dict of hyperparameters
-        - balanced: whether hyperopt was run with balanced mode
-        - scale_pos_weight: the weight used (or None if not balanced)
     """
-    params_file = Path('artifacts/hyperopt/best_params.json')
+    param_keys = [
+        'max_depth', 'num_leaves', 'min_child_samples', 'learning_rate',
+        'n_estimators', 'reg_alpha', 'reg_lambda', 'min_split_gain',
+        'subsample', 'subsample_freq', 'colsample_bytree', 'max_bin'
+    ]
 
+    # Try model-specific path first
+    if model_key is not None:
+        # First try the combined config registry
+        model_configs = load_model_configs()
+        if model_key.value in model_configs.get('models', {}):
+            model_config = model_configs['models'][model_key.value]
+            params = model_config.get('hyperparameters', {})
+            params = {k: v for k, v in params.items() if k in param_keys}
+            balanced = params.get('use_balanced', False)
+            scale_pos_weight = params.get('scale_pos_weight', None)
+            print(f"  Loaded hyperparameters from model_configs.json [{model_key.value}]")
+            return params, balanced, scale_pos_weight
+
+        # Fall back to per-model best_params.json
+        params_file = Path(f'artifacts/hyperopt/{model_key.value}/best_params.json')
+        if params_file.exists():
+            with open(params_file) as f:
+                data = json.load(f)
+            params = {k: v for k, v in data.items() if k in param_keys}
+            balanced = data.get('use_balanced', False)
+            scale_pos_weight = data.get('scale_pos_weight', None)
+            print(f"  Loaded hyperparameters from {params_file}")
+            return params, balanced, scale_pos_weight
+
+    # Legacy path
+    params_file = Path('artifacts/hyperopt/best_params.json')
     if params_file.exists():
         with open(params_file) as f:
             data = json.load(f)
-        # Extract just the hyperparameters (exclude metadata like 'best_auc', 'features', etc.)
-        param_keys = [
-            'max_depth', 'num_leaves', 'min_child_samples', 'learning_rate',
-            'n_estimators', 'reg_alpha', 'reg_lambda', 'min_split_gain',
-            'subsample', 'subsample_freq', 'colsample_bytree', 'max_bin'
-        ]
         params = {k: v for k, v in data.items() if k in param_keys}
-        balanced = data.get('balanced', False)
+        balanced = data.get('use_balanced', False)
         scale_pos_weight = data.get('scale_pos_weight', None)
-        print(f"  Loaded hyperparameters from {params_file}")
-        if balanced:
-            print(f"  Hyperopt was run with balanced=True, scale_pos_weight={scale_pos_weight:.3f}")
+        print(f"  Loaded hyperparameters from {params_file} (legacy)")
         return params, balanced, scale_pos_weight
-    else:
-        # Default conservative parameters
-        print("  Warning: No hyperopt results found, using default parameters")
-        return {
-            'max_depth': 6,
-            'num_leaves': 31,
-            'min_child_samples': 100,
-            'learning_rate': 0.05,
-            'n_estimators': 300,
-            'reg_alpha': 0.1,
-            'reg_lambda': 0.1,
-            'min_split_gain': 0.01,
-            'subsample': 0.8,
-            'subsample_freq': 5,
-            'colsample_bytree': 0.8,
-            'max_bin': 255,
-        }, False, None
+
+    # Default conservative parameters
+    print("  Warning: No hyperopt results found, using default parameters")
+    return {
+        'max_depth': 6,
+        'num_leaves': 31,
+        'min_child_samples': 100,
+        'learning_rate': 0.05,
+        'n_estimators': 300,
+        'reg_alpha': 0.1,
+        'reg_lambda': 0.1,
+        'min_split_gain': 0.01,
+        'subsample': 0.8,
+        'subsample_freq': 5,
+        'colsample_bytree': 0.8,
+        'max_bin': 255,
+    }, False, None
+
+
+def get_model_target_column(model_key: ModelKey) -> str:
+    """Get the target column name for a specific model."""
+    target_col_map = {
+        ModelKey.LONG_NORMAL: 'hit_long_normal',
+        ModelKey.LONG_PARABOLIC: 'hit_long_parabolic',
+        ModelKey.SHORT_NORMAL: 'hit_short_normal',
+        ModelKey.SHORT_PARABOLIC: 'hit_short_parabolic',
+    }
+    return target_col_map.get(model_key, 'hit')
 
 
 def compute_scale_pos_weight(y: pd.Series) -> float:
@@ -122,14 +197,16 @@ def compute_scale_pos_weight(y: pd.Series) -> float:
 
 
 def load_training_data(
-    selected_features: list[str],
+    selected_features: List[str],
+    model_key: Optional[ModelKey] = None,
     min_samples_per_symbol: int = 5,
     use_sample_weights: bool = True
-) -> tuple[pd.DataFrame, pd.Series, np.ndarray | None, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.Series, Optional[np.ndarray], pd.DataFrame]:
     """Load and prepare training data.
 
     Args:
         selected_features: List of feature column names to use
+        model_key: Optional ModelKey for model-specific target labels
         min_samples_per_symbol: Minimum samples required per symbol
         use_sample_weights: Whether to load and return sample weights
 
@@ -163,8 +240,24 @@ def load_training_data(
     features = features[features['symbol'].isin(valid_symbols)].copy()
     targets = targets[targets['symbol'].isin(valid_symbols)].copy()
 
-    # Columns to merge from targets
-    target_cols = ['symbol', 'date', 'hit', 'entry_price', 'target_price', 'stop_price']
+    # Determine which columns to merge from targets
+    base_cols = ['symbol', 'date', 'entry_price', 'target_price', 'stop_price']
+    target_cols = base_cols.copy()
+
+    # Get the appropriate hit column for this model
+    if model_key is not None:
+        hit_col = get_model_target_column(model_key)
+        if hit_col in targets.columns:
+            target_cols.append(hit_col)
+            print(f"  Using model-specific target: {hit_col}")
+        else:
+            target_cols.append('hit')
+            hit_col = 'hit'
+            print(f"  Warning: {get_model_target_column(model_key)} not found, using 'hit'")
+    else:
+        target_cols.append('hit')
+        hit_col = 'hit'
+
     if use_sample_weights and 'weight_final' in targets.columns:
         target_cols.append('weight_final')
 
@@ -176,8 +269,14 @@ def load_training_data(
     )
 
     # Binary target (exclude neutral hit=0)
-    merged = merged[merged['hit'] != 0].copy()
-    merged['target'] = (merged['hit'] == 1).astype(int)
+    merged = merged[merged[hit_col] != 0].copy()
+
+    # For long models: upper barrier hit (1) = success
+    # For short models: lower barrier hit (-1) = success
+    if model_key is not None and model_key.is_short():
+        merged['target'] = (merged[hit_col] == -1).astype(int)
+    else:
+        merged['target'] = (merged[hit_col] == 1).astype(int)
 
     # Sort by date
     merged = merged.sort_values(['date', 'symbol']).reset_index(drop=True)
@@ -203,8 +302,10 @@ def load_training_data(
         print("  Warning: Sample weights requested but 'weight_final' not in targets")
 
     # Metadata for later use
-    metadata_cols = ['symbol', 'date', 'entry_price', 'target_price', 'stop_price', 'hit']
+    metadata_cols = ['symbol', 'date', 'entry_price', 'target_price', 'stop_price', hit_col]
     metadata = merged[metadata_cols].copy()
+    if hit_col != 'hit':
+        metadata = metadata.rename(columns={hit_col: 'hit'})
 
     print(f"\nTraining data:")
     print(f"  Samples: {len(X):,}")
@@ -287,10 +388,11 @@ def train_production_model(
 
 def save_model_artifacts(
     model: lgb.LGBMClassifier,
-    feature_names: list[str],
+    feature_names: List[str],
     params: dict,
     output_dir: Path,
-    train_metrics: dict
+    train_metrics: dict,
+    model_key: Optional[ModelKey] = None
 ):
     """Save model and associated artifacts.
 
@@ -300,6 +402,7 @@ def save_model_artifacts(
         params: Hyperparameters used
         output_dir: Output directory
         train_metrics: Training metrics
+        model_key: Optional ModelKey for additional metadata
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -328,6 +431,7 @@ def save_model_artifacts(
     # Save metadata
     metadata = {
         'training_date': datetime.now().isoformat(),
+        'model_key': model_key.value if model_key else None,
         'n_features': len(feature_names),
         'features': feature_names,
         'params': params,
@@ -342,76 +446,119 @@ def save_model_artifacts(
         'sample_weights_used': train_metrics.get('sample_weights_used', False),
     }
 
+    # Add model-specific metadata
+    if model_key is not None:
+        target_config = TARGET_CONFIGS.get(model_key, {})
+        metadata['target_config'] = {
+            'up_mult': target_config.get('up_mult'),
+            'dn_mult': target_config.get('dn_mult'),
+            'max_horizon': target_config.get('max_horizon'),
+        }
+        metadata['feature_breakdown'] = {
+            'core_count': len(CORE_FEATURES),
+            'head_count': len(HEAD_FEATURES.get(model_key, [])),
+        }
+
     metadata_file = output_dir / 'model_metadata.json'
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2, default=str)
     print(f"Metadata saved to: {metadata_file}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Train Production Model')
-    parser.add_argument('--output-dir', type=str, default='artifacts/models',
-                        help='Output directory for model artifacts')
-    parser.add_argument('--n-jobs', type=int, default=8,
-                        help='Number of threads for training')
-    parser.add_argument('--balanced', action='store_true',
-                        help='Use class weights for balanced training (auto if hyperopt used --balanced)')
-    parser.add_argument('--no-balanced', action='store_true',
-                        help='Force disable balanced training even if hyperopt used it')
-    parser.add_argument('--no-sample-weights', action='store_true',
-                        help='Disable sample weights from triple barrier overlap inverse')
+def update_training_registry(
+    model_key: ModelKey,
+    output_dir: Path,
+    train_metrics: dict
+) -> None:
+    """
+    Update the combined training registry with results for a model.
 
-    args = parser.parse_args()
-    output_dir = Path(args.output_dir)
-    use_sample_weights = not args.no_sample_weights
+    Args:
+        model_key: The model key
+        output_dir: Directory where model was saved
+        train_metrics: Training metrics
+    """
+    registry_file = Path('artifacts/models/training_registry.json')
+    registry_file.parent.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 60)
-    print("Production Model Training")
-    print("=" * 60)
-    print()
+    if registry_file.exists():
+        with open(registry_file) as f:
+            registry = json.load(f)
+    else:
+        registry = {'models': {}, 'updated': None}
 
-    # Load configuration
-    print("Loading configuration...")
-    selected_features = load_selected_features()
-    print(f"  {len(selected_features)} selected features")
+    registry['models'][model_key.value] = {
+        'model_path': str(output_dir / 'production_model.pkl'),
+        'metadata_path': str(output_dir / 'model_metadata.json'),
+        'train_auc': train_metrics['train_auc'],
+        'train_aupr': train_metrics['train_aupr'],
+        'n_samples': train_metrics['n_samples'],
+        'positive_rate': train_metrics['positive_rate'],
+        'training_date': datetime.now().isoformat(),
+    }
+    registry['updated'] = datetime.now().isoformat()
 
-    params, hyperopt_balanced, hyperopt_scale_pos_weight = load_best_params()
+    with open(registry_file, 'w') as f:
+        json.dump(registry, f, indent=2)
+    print(f"Training registry updated: {registry_file}")
 
-    # Load data
+
+def train_single_model(
+    model_key: ModelKey,
+    base_output_dir: Path,
+    n_jobs: int = 8,
+    use_sample_weights: bool = True,
+    force_balanced: Optional[bool] = None,
+) -> dict:
+    """
+    Train a single model.
+
+    Args:
+        model_key: The model to train
+        base_output_dir: Base output directory (model-specific subdir created)
+        n_jobs: Number of threads
+        use_sample_weights: Whether to use sample weights
+        force_balanced: True/False to force, None to use hyperopt setting
+
+    Returns:
+        Dict with training metrics
+    """
+    print(f"\nTraining {model_key.value.upper()}")
+    print("-" * 50)
+
+    # Load features for this model
+    selected_features = load_model_features(model_key)
+    print(f"  {len(selected_features)} features (CORE: {len(CORE_FEATURES)}, HEAD: {len(HEAD_FEATURES.get(model_key, []))})")
+
+    # Load hyperparameters for this model
+    params, hyperopt_balanced, hyperopt_scale_pos_weight = load_best_params(model_key)
+
+    # Load data with model-specific target
     X, y, sample_weight, metadata = load_training_data(
         selected_features,
+        model_key=model_key,
         use_sample_weights=use_sample_weights
     )
 
-    # Determine whether to use balanced training
-    # Priority: --no-balanced > --balanced > hyperopt setting
-    if args.no_balanced:
+    # Determine balanced training
+    if force_balanced is False:
         scale_pos_weight = None
-        print("\n  Balanced training DISABLED (--no-balanced flag)")
-    elif args.balanced:
-        # Recompute scale_pos_weight from current data
+    elif force_balanced is True:
         scale_pos_weight = compute_scale_pos_weight(y)
-        print(f"\n  Balanced training ENABLED (--balanced flag)")
-        print(f"    scale_pos_weight: {scale_pos_weight:.3f}")
-    elif hyperopt_balanced and hyperopt_scale_pos_weight is not None:
-        # Use the weight from hyperopt (recalculate to match current data)
+    elif hyperopt_balanced:
         scale_pos_weight = compute_scale_pos_weight(y)
-        print(f"\n  Balanced training ENABLED (from hyperopt config)")
-        print(f"    scale_pos_weight: {scale_pos_weight:.3f}")
-        print(f"    (hyperopt used: {hyperopt_scale_pos_weight:.3f})")
     else:
         scale_pos_weight = None
-        print("\n  Balanced training: disabled")
 
-    # Train model
+    # Train
     model = train_production_model(
         X, y, params,
-        n_jobs=args.n_jobs,
+        n_jobs=n_jobs,
         sample_weight=sample_weight,
         scale_pos_weight=scale_pos_weight
     )
 
-    # Calculate metrics for metadata
+    # Calculate metrics
     X_clean = X.fillna(0).replace([np.inf, -np.inf], 0)
     y_pred = model.predict_proba(X_clean)[:, 1]
 
@@ -426,19 +573,150 @@ def main():
         'sample_weights_used': sample_weight is not None,
     }
 
-    # Save artifacts
+    # Save to model-specific directory
+    output_dir = base_output_dir / model_key.value
     save_model_artifacts(
         model=model,
         feature_names=X.columns.tolist(),
         params=params,
         output_dir=output_dir,
-        train_metrics=train_metrics
+        train_metrics=train_metrics,
+        model_key=model_key
     )
 
-    print()
-    print("=" * 60)
-    print("Training complete!")
-    print("=" * 60)
+    # Update training registry
+    update_training_registry(model_key, output_dir, train_metrics)
+
+    return train_metrics
+
+
+def train_all_models(
+    base_output_dir: Path,
+    n_jobs: int = 8,
+    use_sample_weights: bool = True,
+    force_balanced: Optional[bool] = None,
+) -> Dict[str, dict]:
+    """
+    Train all 4 models.
+
+    Returns:
+        Dict mapping model_key to training metrics
+    """
+    print("=" * 70)
+    print("MULTI-MODEL PRODUCTION TRAINING")
+    print(f"  Models: {', '.join(mk.value for mk in ModelKey.all_keys())}")
+    print("=" * 70)
+
+    results = {}
+
+    for i, model_key in enumerate(ModelKey.all_keys()):
+        print(f"\n[{i+1}/4] Training {model_key.value.upper()}")
+        print("=" * 70)
+
+        metrics = train_single_model(
+            model_key=model_key,
+            base_output_dir=base_output_dir,
+            n_jobs=n_jobs,
+            use_sample_weights=use_sample_weights,
+            force_balanced=force_balanced,
+        )
+        results[model_key.value] = metrics
+
+        gc.collect()
+
+    # Print summary
+    print("\n" + "=" * 70)
+    print("MULTI-MODEL TRAINING COMPLETE")
+    print("=" * 70)
+    print("\nResults per model:")
+    print("-" * 60)
+    print(f"{'Model':<20} {'Train AUC':>12} {'Train AUPR':>12} {'Samples':>12}")
+    print("-" * 60)
+
+    for model_key in ModelKey.all_keys():
+        metrics = results.get(model_key.value, {})
+        auc = metrics.get('train_auc', 0)
+        aupr = metrics.get('train_aupr', 0)
+        n = metrics.get('n_samples', 0)
+        print(f"{model_key.value:<20} {auc:>12.4f} {aupr:>12.4f} {n:>12,}")
+
+    print(f"\nTraining registry: {base_output_dir}/training_registry.json")
+    print("Next step: python run_predict.py --all-models")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Train Production Model',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Train all 4 models
+    python run_training.py --all-models
+
+    # Train specific model
+    python run_training.py --model long_normal
+
+    # Train default model (LONG_NORMAL)
+    python run_training.py
+        """
+    )
+    parser.add_argument('--model', type=str, default=None,
+                        choices=['long_normal', 'long_parabolic', 'short_normal', 'short_parabolic'],
+                        help='Model key to train (default: long_normal)')
+    parser.add_argument('--all-models', action='store_true',
+                        help='Train all 4 models')
+    parser.add_argument('--output-dir', type=str, default='artifacts/models',
+                        help='Output directory for model artifacts')
+    parser.add_argument('--n-jobs', type=int, default=8,
+                        help='Number of threads for training')
+    parser.add_argument('--balanced', action='store_true',
+                        help='Use class weights for balanced training')
+    parser.add_argument('--no-balanced', action='store_true',
+                        help='Force disable balanced training')
+    parser.add_argument('--no-sample-weights', action='store_true',
+                        help='Disable sample weights from triple barrier overlap inverse')
+
+    args = parser.parse_args()
+    base_output_dir = Path(args.output_dir)
+    use_sample_weights = not args.no_sample_weights
+
+    # Determine balanced setting
+    force_balanced = None
+    if args.no_balanced:
+        force_balanced = False
+    elif args.balanced:
+        force_balanced = True
+
+    if args.all_models:
+        train_all_models(
+            base_output_dir=base_output_dir,
+            n_jobs=args.n_jobs,
+            use_sample_weights=use_sample_weights,
+            force_balanced=force_balanced,
+        )
+    else:
+        # Single model training
+        model_key = ModelKey(args.model) if args.model else ModelKey.LONG_NORMAL
+
+        print("=" * 60)
+        print("Production Model Training")
+        print(f"  Model: {model_key.value.upper()}")
+        print("=" * 60)
+
+        train_single_model(
+            model_key=model_key,
+            base_output_dir=base_output_dir,
+            n_jobs=args.n_jobs,
+            use_sample_weights=use_sample_weights,
+            force_balanced=force_balanced,
+        )
+
+        print()
+        print("=" * 60)
+        print("Training complete!")
+        print("=" * 60)
 
 
 if __name__ == '__main__':

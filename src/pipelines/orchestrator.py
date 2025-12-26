@@ -52,6 +52,10 @@ try:
         filter_output_columns, get_output_features, get_retired_features,
         get_feature_exclusion_report, drop_retired_columns
     )
+    # Interaction feature production
+    from ..features.interaction_production import (
+        add_interactions_to_features, get_registered_interaction_features
+    )
     # Centralized validation
     from ..validation.target_data import TargetDataValidator
 except ImportError:
@@ -80,6 +84,10 @@ except ImportError:
     from src.feature_selection.base_features import (
         filter_output_columns, get_output_features, get_retired_features,
         get_feature_exclusion_report, drop_retired_columns
+    )
+    # Interaction feature production
+    from src.features.interaction_production import (
+        add_interactions_to_features, get_registered_interaction_features
     )
     # Centralized validation
     from src.validation.target_data import TargetDataValidator
@@ -1189,6 +1197,41 @@ def run_pipeline_v2(
             checkpoint_mgr.save_pipeline_state("07_interpolated", "running")
             checkpoint_mgr.save_checkpoint("07_interpolated", indicators_by_symbol, stage_start)
             gc.collect()
+
+    # Step 4b: Compute registered interaction features
+    # These are interactions from HEAD_FEATURES/CORE_FEATURES that need to be
+    # generated from base features before they're available for model training
+    with profile_stage("Interaction Features"):
+        interaction_features = get_registered_interaction_features()
+        if interaction_features:
+            print(f"\n>>> [Interaction Features] Computing {len(interaction_features)} registered interactions...", flush=True)
+
+            # Convert dict of DataFrames to long format for interaction computation
+            temp_long = combine_to_long(indicators_by_symbol)
+
+            # Add interaction features
+            temp_long = add_interactions_to_features(temp_long, verbose=True)
+
+            # Now we need to add the new interaction columns back to indicators_by_symbol
+            # Get the list of newly added columns
+            interaction_cols = [f for f in interaction_features if f in temp_long.columns]
+
+            if interaction_cols:
+                # Partition back by symbol and add new columns
+                for symbol in indicators_by_symbol:
+                    symbol_data = temp_long[temp_long['symbol'] == symbol].set_index('date')
+                    for col in interaction_cols:
+                        if col in symbol_data.columns and col not in indicators_by_symbol[symbol].columns:
+                            indicators_by_symbol[symbol][col] = symbol_data[col].values
+
+                print(f"<<< [Interaction Features] Added {len(interaction_cols)} interaction columns", flush=True)
+            else:
+                print(f"<<< [Interaction Features] No interaction columns could be computed (missing base features)", flush=True)
+
+            del temp_long
+            gc.collect()
+        else:
+            print(f">>> [Interaction Features] No interactions registered, skipping", flush=True)
 
     # Step 5: Generate targets (after all features computed and interpolated)
     targets_df = None

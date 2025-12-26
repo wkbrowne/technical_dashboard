@@ -10,6 +10,7 @@ Features:
 - Configurable combining policy
 - Optional regime gating
 - Detailed diagnostics (longs vs shorts, model contributions, gating effects)
+- Sizing diagnostics with warnings (data integrity, drift, concentration, etc.)
 
 Usage:
     # Basic multi-model backtest
@@ -22,6 +23,17 @@ Usage:
         --prediction-path artifacts/predictions/ \\
         --sizing-config artifacts/sizing/best_config_multi_model.json \\
         --regime-gating on
+
+    # With diagnostics
+    python scripts/run_multi_model_backtest.py \\
+        --prediction-path artifacts/predictions/cv_predictions_multi.parquet \\
+        --sizing-config artifacts/sizing/best_config_multi_model.json \\
+        --diagnostics on
+
+    # Compute diagnostic baselines from historical data
+    python scripts/run_multi_model_backtest.py \\
+        --prediction-path artifacts/predictions/cv_predictions_multi.parquet \\
+        --compute-diagnostic-baselines
 
     # Single model backward-compatible mode
     python scripts/run_multi_model_backtest.py \\
@@ -332,6 +344,32 @@ def main():
         help="Name prefix for output files",
     )
 
+    # Diagnostics
+    parser.add_argument(
+        "--diagnostics",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Enable sizing diagnostics with warnings",
+    )
+    parser.add_argument(
+        "--diagnostics-output-dir",
+        type=str,
+        default="artifacts/diagnostics",
+        help="Output directory for diagnostics",
+    )
+    parser.add_argument(
+        "--compute-diagnostic-baselines",
+        action="store_true",
+        help="Compute and save baseline distributions for drift metrics",
+    )
+    parser.add_argument(
+        "--diagnostics-thresholds",
+        type=str,
+        default=None,
+        help="Path to custom diagnostics thresholds JSON",
+    )
+
     args = parser.parse_args()
 
     print("=" * 60)
@@ -485,6 +523,79 @@ def main():
     signals_path = output_dir / f"{args.name}_weighted_signals.parquet"
     weighted_signals.to_parquet(signals_path)
     print(f"Weighted signals saved to: {signals_path}")
+
+    # =========================================================================
+    # DIAGNOSTICS
+    # =========================================================================
+
+    # Handle baseline computation (separate mode)
+    if args.compute_diagnostic_baselines:
+        print("\n" + "=" * 60)
+        print("COMPUTING DIAGNOSTIC BASELINES")
+        print("=" * 60)
+
+        from src.diagnostics.sizing import BaselineManager
+
+        baseline_manager = BaselineManager(
+            baseline_dir=str(Path(args.diagnostics_output_dir) / "baselines")
+        )
+
+        print("\nComputing baselines from predictions...")
+        baselines = baseline_manager.compute_baselines(
+            predictions=weighted_signals,
+            models=[m.value for m in models],
+            metrics=["probability", "edge"],
+            overwrite=True,
+        )
+
+        print(f"\nComputed {len(baselines)} baselines")
+        print(f"Baselines saved to: {args.diagnostics_output_dir}/baselines/")
+
+    # Run diagnostics if enabled
+    if args.diagnostics == "on":
+        print("\n" + "=" * 60)
+        print("RUNNING SIZING DIAGNOSTICS")
+        print("=" * 60)
+
+        from src.diagnostics.sizing import (
+            SizingDiagnosticsRunner,
+            SizingDiagnosticThresholds,
+        )
+
+        # Load custom thresholds if provided
+        thresholds = None
+        if args.diagnostics_thresholds:
+            thresholds = SizingDiagnosticThresholds.from_json(args.diagnostics_thresholds)
+            print(f"\nLoaded custom thresholds from: {args.diagnostics_thresholds}")
+
+        # Create runner
+        diag_runner = SizingDiagnosticsRunner(
+            weighted_signals=weighted_signals,
+            sizing_config=config.to_dict(),
+            models=[m.value for m in models],
+            thresholds=thresholds,
+            baseline_dir=str(Path(args.diagnostics_output_dir) / "baselines"),
+            backtest_mode=True,
+            run_id=args.name,
+        )
+
+        # Run diagnostics
+        diag_report = diag_runner.run()
+
+        # Save reports
+        diag_paths = diag_runner.save_report(
+            output_dir=args.diagnostics_output_dir,
+            save_json=True,
+            save_csv=True,
+            save_md=True,
+        )
+
+        # Print summary
+        diag_runner.print_summary()
+
+        print(f"\nDiagnostics saved to:")
+        for fmt, path in diag_paths.items():
+            print(f"  {fmt.upper()}: {path}")
 
     print("\n" + "=" * 60)
     print("Backtest complete!")
