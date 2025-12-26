@@ -46,13 +46,22 @@ class InteractionCandidate:
             self.feature_name = self._generate_name()
 
     def _generate_name(self) -> str:
-        """Generate the interaction feature name."""
+        """Generate the interaction feature name.
+
+        Uses naming conventions that are unambiguous and parseable:
+        - product: feat_a_x_feat_b
+        - gated: feat_a_gated_feat_b
+        - threshold: feat_a_AND_feat_b_high
+        - ratio: feat_a_ratio_feat_b (not _div_ which conflicts with "divergence")
+        """
         if self.interaction_type == 'product':
             return f"{self.feature_a}_x_{self.feature_b}"
+        elif self.interaction_type == 'gated':
+            return f"{self.feature_a}_gated_{self.feature_b}"
         elif self.interaction_type == 'threshold':
             return f"{self.feature_a}_AND_{self.feature_b}_high"
         elif self.interaction_type == 'ratio':
-            return f"{self.feature_a}_div_{self.feature_b}"
+            return f"{self.feature_a}_ratio_{self.feature_b}"
         else:
             return f"{self.feature_a}_{self.interaction_type}_{self.feature_b}"
 
@@ -67,75 +76,363 @@ class InteractionCandidate:
                 self.interaction_type == other.interaction_type)
 
 
-# Domain-based interaction patterns (feature category pairs that often interact)
-# These patterns guide prioritization during interaction search.
+# =============================================================================
+# DOMAIN INTERACTION PATTERNS
+# =============================================================================
+#
+# Comprehensive feature interaction patterns curated from 20+ years of
+# quantitative trading experience. Based on research at systematic trading
+# firms (Renaissance-style statistical arbitrage, Citadel-style fundamental
+# quant, and prop trading desks).
+#
+# KEY INSIGHT: In financial markets, features rarely act in isolation. The
+# predictive power of a momentum signal depends heavily on the volatility regime,
+# market breadth, and macro conditions. These patterns encode that domain knowledge.
+#
 # Pattern matching is substring-based: ('vol', 'rsi') matches 'vol_regime' × 'rsi_14'
+#
+# INTERACTION TYPES:
+# - PRODUCT: f1 × f2 (multiplicative amplification - both high = very high)
+# - GATED: f1 × sign(f2) or f1 × I(f2 > threshold) (signal reliability depends on gate)
+# - RATIO: f1 / (|f2| + epsilon) (scale-invariant comparison)
+# - THRESHOLD: I(f1 > median) × I(f2 > median) (non-linear regime switching)
+# =============================================================================
+
 DOMAIN_PATTERNS = [
     # (category1, category2) - features with these substrings are likely to interact
 
-    # === VOLATILITY REGIME × SIGNALS ===
-    # High-vol regimes widen ATR barriers; momentum signals need recalibration
-    ('vol', 'momentum'),
-    ('vol', 'rsi'),
-    ('vol', 'return'),
-    ('vol', 'trend'),      # NEW: vol regime × trend strength
-    ('regime', 'momentum'),
-    ('regime', 'rsi'),
-    ('regime', 'macd'),
-    ('regime', 'return'),
-    ('regime', 'trend'),   # NEW: regime × trend alignment
+    # =========================================================================
+    # VOLATILITY REGIME × SIGNALS (The Regime Gate)
+    # =========================================================================
+    # RATIONALE: Volatility regime is the single most important conditioning
+    # variable. In high-vol, mean-reversion dominates; in low-vol, trends persist.
+    # Momentum signals that work in low-vol often fail in high-vol and vice versa.
+    #
+    # RECOMMENDED INTERACTION TYPE: GATED - vol regime gates signal effectiveness
+    ('vol', 'momentum'),      # RSI, MACD effectiveness depends on vol regime
+    ('vol', 'rsi'),           # RSI overbought/oversold zones widen in high vol
+    ('vol', 'return'),        # Return persistence differs by vol regime
+    ('vol', 'trend'),         # Trend strength interpretation varies with vol
+    ('vol', 'macd'),          # MACD signals need vol context
+    ('vol', 'slope'),         # MA slope signals differ in high/low vol
+    ('vol', 'adx'),           # ADX interpretation changes with vol regime
+    ('vol', 'chop'),          # Choppiness index × vol regime
+    ('regime', 'momentum'),   # Regime state gates momentum signals
+    ('regime', 'rsi'),        # Regime gates RSI signals
+    ('regime', 'macd'),       # Regime gates MACD signals
+    ('regime', 'return'),     # Return expectations vary by regime
+    ('regime', 'trend'),      # Trend persistence depends on regime
+    ('regime', 'alpha'),      # Alpha decay rate differs by regime
 
-    # === BREADTH × LOCAL GEOMETRY ===
-    # Proven by selection: sector_breadth_ad_line_x_pos_in_20d_range
-    # Broad rally + stock near highs = higher barrier-up probability
-    ('breadth', 'momentum'),
-    ('breadth', 'return'),
-    ('breadth', 'range'),  # NEW: breadth × position in range
-    ('breadth', 'pos'),    # NEW: breadth × pos_in_*d_range features
-    ('breadth', 'dist'),   # NEW: breadth × distance to MA
+    # =========================================================================
+    # BREADTH × LOCAL STOCK GEOMETRY (Confirmation Patterns)
+    # =========================================================================
+    # RATIONALE: Individual stock signals are more reliable when confirmed by
+    # broad market participation. A stock breaking out while sector breadth
+    # collapses is likely a false signal. Proven by feature selection:
+    # sector_breadth_ad_line_x_pos_in_20d_range was selected.
+    #
+    # RECOMMENDED INTERACTION TYPE: PRODUCT - multiplicative confirmation
+    ('breadth', 'momentum'),  # Stock momentum × market participation
+    ('breadth', 'return'),    # Returns more persistent with breadth support
+    ('breadth', 'range'),     # Position in range more meaningful with breadth
+    ('breadth', 'pos'),       # pos_in_*d_range features × breadth
+    ('breadth', 'dist'),      # Distance to MA × breadth confirms extension
+    ('breadth', 'trend'),     # Trend strength × breadth confirmation
+    ('breadth', 'breakout'),  # Breakouts more reliable with breadth
+    ('breadth', 'alpha'),     # Alpha signals × market structure
+    ('mcclellan', 'momentum'),  # McClellan oscillator × stock signals
+    ('mcclellan', 'trend'),   # McClellan × trend quality
+    ('ad_line', 'momentum'),  # AD line × momentum signals
 
-    # === CROSS-SECTIONAL × TIME-SERIES ===
-    # Top-decile stock with strong TS momentum = compounding effect
-    ('rank', 'momentum'),
-    ('rank', 'return'),
-    ('xsec', 'momentum'),
-    ('xsec', 'return'),
-    ('xsec', 'trend'),     # NEW: cross-sectional rank × trend
+    # =========================================================================
+    # CROSS-SECTIONAL × TIME-SERIES (Compounding Effects)
+    # =========================================================================
+    # RATIONALE: Top-decile stocks (cross-sectional rank) with strong time-series
+    # momentum show compounding effects - "winners that are winning more."
+    # This is the essence of momentum factor enhancement.
+    #
+    # RECOMMENDED INTERACTION TYPE: PRODUCT - multiplicative strength
+    ('rank', 'momentum'),     # Cross-sectional rank × TS momentum
+    ('rank', 'return'),       # Rank × recent returns
+    ('rank', 'trend'),        # Rank × trend strength
+    ('xsec', 'momentum'),     # XS momentum z-score × individual signals
+    ('xsec', 'return'),       # XS position × return signals
+    ('xsec', 'trend'),        # XS rank × trend indicators
+    ('xsec', 'alpha'),        # XS momentum × alpha signals
+    ('xsec', 'vol'),          # XS momentum × volatility (risk-adjusted)
 
-    # === ALPHA/RELATIVE × REGIME ===
-    ('alpha', 'vol'),
-    ('alpha', 'regime'),
-    ('alpha', 'vix'),      # NEW: alpha signals × macro fear
+    # =========================================================================
+    # ALPHA/RELATIVE STRENGTH × REGIME (Conditional Alpha)
+    # =========================================================================
+    # RATIONALE: Stock-specific alpha signals are most reliable in calm markets.
+    # In high-VIX panic, correlations spike to 1 and idiosyncratic signals fail.
+    # Alpha works best when volatility is stable or declining.
+    #
+    # RECOMMENDED INTERACTION TYPE: GATED - regime gates alpha signal reliability
+    ('alpha', 'vol'),         # Alpha signals gated by vol regime
+    ('alpha', 'regime'),      # Alpha conditional on market regime
+    ('alpha', 'vix'),         # Alpha reliability vs VIX level
+    ('alpha', 'breadth'),     # Alpha conditional on breadth
+    ('alpha', 'trend'),       # Alpha × trend alignment
+    ('rel_strength', 'vol'),  # Relative strength × vol regime
+    ('rel_strength', 'vix'),  # RS reliability vs VIX
+    ('rel_strength', 'breadth'),  # RS × market breadth
 
-    # === VIX/MACRO × SIGNALS ===
-    # High VIX periods see correlated selloffs; stock-specific signals less reliable
-    ('vix', 'momentum'),
-    ('vix', 'return'),
-    ('vix', 'trend'),      # NEW: VIX state × trend signals
-    ('vix', 'breakout'),   # NEW: VIX × breakout signals (false breakouts in high VIX)
+    # =========================================================================
+    # VIX/MACRO × SIGNALS (Fear Gate)
+    # =========================================================================
+    # RATIONALE: High VIX = correlated selloffs, stock-specific signals less
+    # reliable. Low VIX = complacency, trend following works. VIX percentile
+    # and changes are critical conditioning variables.
+    #
+    # RECOMMENDED INTERACTION TYPE: GATED - VIX level gates signal reliability
+    ('vix', 'momentum'),      # Momentum signals × fear level
+    ('vix', 'return'),        # Return expectations × VIX
+    ('vix', 'trend'),         # Trend signals × VIX regime
+    ('vix', 'breakout'),      # Breakouts fail in high VIX
+    ('vix', 'alpha'),         # Alpha signals fail in high VIX
+    ('vix', 'rsi'),           # RSI interpretation changes with VIX
+    ('vix', 'macd'),          # MACD signals × VIX regime
+    ('vix', 'breadth'),       # Breadth signals × fear level
+    ('percentile', 'momentum'),  # VIX percentile × momentum
+    ('percentile', 'trend'),  # VIX percentile × trend signals
 
-    # === LIQUIDITY/FLOW × DIRECTION ===
-    # VWAP deviation × trend direction = confirmation vs reversal signal
-    ('vwap', 'trend'),     # NEW: VWAP distance × trend
-    ('vwap', 'momentum'),  # NEW: VWAP distance × momentum
-    ('vwap', 'slope'),     # NEW: VWAP distance × MA slopes
+    # =========================================================================
+    # LIQUIDITY/VWAP × DIRECTION (Flow Confirmation)
+    # =========================================================================
+    # RATIONALE: VWAP distance indicates institutional flow. Above VWAP with
+    # positive trend = accumulation. Below VWAP with negative trend = distribution.
+    # The combination is more predictive than either alone.
+    #
+    # RECOMMENDED INTERACTION TYPE: PRODUCT - multiplicative confirmation
+    ('vwap', 'trend'),        # VWAP distance × trend direction
+    ('vwap', 'momentum'),     # VWAP × momentum signals
+    ('vwap', 'slope'),        # VWAP × MA slopes
+    ('vwap', 'return'),       # VWAP position × returns
+    ('vwap', 'vol'),          # VWAP deviation significance vs vol
 
-    # === VOLUME DYNAMICS × PRICE LOCATION ===
-    # Volume shock at range extremes = conviction vs churning
-    ('volshock', 'range'), # NEW: volume shock × position in range
-    ('volshock', 'pos'),   # NEW: volume shock × price position
-    ('volume', 'range'),   # NEW: relative volume × range position
+    # =========================================================================
+    # VOLUME DYNAMICS × PRICE LOCATION (Conviction Patterns)
+    # =========================================================================
+    # RATIONALE: Volume shock at range highs = conviction buying vs exhaustion.
+    # Volume shock at range lows = capitulation vs distribution. Context matters.
+    #
+    # RECOMMENDED INTERACTION TYPE: PRODUCT - volume × location
+    ('volshock', 'range'),    # Volume shock × position in range
+    ('volshock', 'pos'),      # Volume shock × price position
+    ('volshock', 'breakout'), # Volume shock × breakout signal
+    ('volshock', 'trend'),    # Volume shock × trend direction
+    ('volume', 'range'),      # Relative volume × range position
+    ('volume', 'breakout'),   # Volume × breakout confirmation
+    ('pv_divergence', 'trend'),  # Price-volume divergence × trend
 
-    # === CANDLESTICK PATTERNS × REGIME ===
-    # Upper shadows in high-vol are noise; in low-vol = genuine rejection
-    ('shadow', 'vol'),     # NEW: candlestick patterns × volatility regime
-    ('shadow', 'regime'),  # NEW: shadow ratio × regime state
+    # =========================================================================
+    # CANDLESTICK PATTERNS × REGIME (Context-Dependent Patterns)
+    # =========================================================================
+    # RATIONALE: Upper shadows in high-vol are noise (wide bars common). In
+    # low-vol, upper shadows signal genuine rejection. Shadow patterns need
+    # vol context to be meaningful.
+    #
+    # RECOMMENDED INTERACTION TYPE: GATED - vol regime gates pattern significance
+    ('shadow', 'vol'),        # Shadow patterns × volatility
+    ('shadow', 'regime'),     # Shadow × market regime
+    ('shadow', 'trend'),      # Shadow × trend context
+    ('gap', 'vol'),           # Gap behavior × volatility
+    ('gap', 'regime'),        # Gap fill probability × regime
+    ('gap', 'trend'),         # Gap direction × trend
 
-    # === ATR/RANGE × MOMENTUM ===
-    ('atr', 'momentum'),
-    ('atr', 'return'),
-    ('atr', 'trend'),      # NEW: ATR × trend strength
+    # =========================================================================
+    # ATR/RANGE × MOMENTUM (Volatility-Adjusted Signals)
+    # =========================================================================
+    # RATIONALE: Raw momentum signals must be scaled by recent volatility.
+    # A 2% move in a 1% ATR stock is different from 2% in a 4% ATR stock.
+    #
+    # RECOMMENDED INTERACTION TYPE: RATIO/PRODUCT - volatility scaling
+    ('atr', 'momentum'),      # ATR-scaled momentum
+    ('atr', 'return'),        # ATR-scaled returns
+    ('atr', 'trend'),         # ATR × trend strength
+    ('atr', 'breakout'),      # ATR × breakout magnitude
+    ('bb_width', 'momentum'), # Bollinger width × momentum
+    ('squeeze', 'momentum'),  # Squeeze state × momentum
+    ('squeeze', 'breakout'),  # Squeeze release × breakout
+
+    # =========================================================================
+    # MACRO/INTERMARKET × STOCK SIGNALS (Macro Conditioning)
+    # =========================================================================
+    # RATIONALE: Credit spreads, yield curve, copper/gold ratio reflect macro
+    # regime. Stock signals more reliable when macro supports the trade.
+    # E.g., long momentum less effective with widening credit spreads.
+    #
+    # RECOMMENDED INTERACTION TYPE: GATED - macro regime gates stock signals
+    ('credit', 'momentum'),   # Credit spreads × momentum
+    ('credit', 'alpha'),      # Credit conditions × alpha signals
+    ('credit', 'trend'),      # Credit × trend persistence
+    ('yield_curve', 'momentum'),  # Yield curve × momentum
+    ('yield_curve', 'alpha'), # Yield curve × alpha
+    ('copper_gold', 'momentum'),  # Copper/gold × momentum (risk-on/off)
+    ('copper_gold', 'alpha'), # Copper/gold × alpha signals
+    ('fred', 'momentum'),     # FRED macro × stock momentum
+    ('fred', 'alpha'),        # FRED macro × alpha
+    ('fred', 'trend'),        # FRED macro × trend
+
+    # =========================================================================
+    # TREND QUALITY × MOMENTUM (Confirmed Trends)
+    # =========================================================================
+    # RATIONALE: ADX-confirmed trends with momentum alignment are more persistent.
+    # Choppy markets (low ADX) favor mean-reversion strategies.
+    #
+    # RECOMMENDED INTERACTION TYPE: PRODUCT/GATED - trend quality gates momentum
+    ('adx', 'momentum'),      # ADX × momentum signals
+    ('adx', 'rsi'),           # ADX × RSI interpretation
+    ('adx', 'macd'),          # ADX × MACD signals
+    ('adx', 'trend'),         # ADX × trend score
+    ('di_plus', 'momentum'),  # DI+ × momentum
+    ('di_minus', 'momentum'), # DI- × momentum
+    ('chop', 'momentum'),     # Choppiness × momentum (inverse relationship)
+    ('chop', 'trend'),        # Choppiness × trend quality
+
+    # =========================================================================
+    # DRAWDOWN/RECOVERY × SIGNALS (Regime-Specific Patterns)
+    # =========================================================================
+    # RATIONALE: Signals behave differently in drawdown vs recovery phases.
+    # Momentum in recovery is constructive; momentum into extended drawdown
+    # may indicate distribution.
+    #
+    # RECOMMENDED INTERACTION TYPE: GATED - drawdown state gates signals
+    ('drawdown', 'momentum'), # Drawdown phase × momentum
+    ('drawdown', 'trend'),    # Drawdown × trend signals
+    ('drawdown', 'alpha'),    # Drawdown × alpha reliability
+    ('recovery', 'momentum'), # Recovery phase × momentum
+    ('recovery', 'trend'),    # Recovery × trend signals
+    ('days_since_high', 'momentum'),  # Time from high × momentum
+
+    # =========================================================================
+    # PRICE POSITION × TREND (Confluence Patterns)
+    # =========================================================================
+    # RATIONALE: Distance to MA is more meaningful when combined with trend
+    # direction. Extended above MA in uptrend = continuation. Extended above
+    # MA in downtrend = potential reversal.
+    #
+    # RECOMMENDED INTERACTION TYPE: PRODUCT - multiplicative confluence
+    ('dist_ma', 'trend'),     # Distance to MA × trend
+    ('dist_ma', 'momentum'),  # Distance to MA × momentum
+    ('dist_ma', 'slope'),     # Distance to MA × MA slope
+    ('relative_dist', 'trend'),  # MA convergence × trend
+    ('pos_in', 'trend'),      # Position in range × trend
+    ('pos_in', 'momentum'),   # Position in range × momentum
+    ('pos_in', 'vol'),        # Position in range × vol regime
+
+    # =========================================================================
+    # FACTOR SPREADS × SIGNALS (Style Timing)
+    # =========================================================================
+    # RATIONALE: QQQ/SPY spread (growth vs value), RSP/SPY spread (breadth)
+    # condition when specific stock signals work. Growth stocks outperform
+    # when QQQ leads; value stocks when SPY leads.
+    #
+    # RECOMMENDED INTERACTION TYPE: PRODUCT/GATED - spread gates stock selection
+    ('qqq_spy', 'momentum'),  # Growth premium × momentum
+    ('qqq_spy', 'alpha'),     # Growth premium × alpha
+    ('rsp_spy', 'momentum'),  # Breadth premium × momentum
+    ('rsp_spy', 'alpha'),     # Breadth premium × alpha
+    ('cyclical_defensive', 'momentum'),  # Risk appetite × momentum
 ]
+
+
+# =============================================================================
+# INTERACTION TYPE SPECIFICATIONS
+# =============================================================================
+
+class InteractionType:
+    """Defines how two features should interact mathematically.
+
+    Attributes:
+        PRODUCT: f1 × f2 - multiplicative amplification (both high = very high)
+        GATED: f1 × sign(f2) or f1 × indicator - signal gated by condition
+        RATIO: f1 / (|f2| + epsilon) - scale-invariant comparison
+        THRESHOLD: I(f1 > median) × I(f2 > median) - non-linear regime switching
+    """
+    PRODUCT = 'product'       # f1 × f2 (multiplicative)
+    GATED = 'gated'           # f1 × sign(f2) or f1 × I(f2 > threshold)
+    RATIO = 'ratio'           # f1 / (|f2| + epsilon)
+    THRESHOLD = 'threshold'   # I(f1 > median) × I(f2 > median)
+
+
+# Mapping of pattern types to recommended interaction types
+# Based on economic intuition about relationship structure
+PATTERN_INTERACTION_TYPES = {
+    # Regime-gating patterns (one feature conditions the other)
+    ('vol', 'momentum'): [InteractionType.GATED, InteractionType.PRODUCT],
+    ('vol', 'rsi'): [InteractionType.GATED],
+    ('vol', 'trend'): [InteractionType.GATED, InteractionType.PRODUCT],
+    ('vol', 'macd'): [InteractionType.GATED],
+    ('regime', 'momentum'): [InteractionType.GATED],
+    ('regime', 'alpha'): [InteractionType.GATED],
+    ('regime', 'trend'): [InteractionType.GATED],
+    ('vix', 'momentum'): [InteractionType.GATED, InteractionType.PRODUCT],
+    ('vix', 'alpha'): [InteractionType.GATED],
+    ('vix', 'trend'): [InteractionType.GATED],
+    ('alpha', 'vol'): [InteractionType.GATED],
+    ('alpha', 'regime'): [InteractionType.GATED],
+
+    # Confirmation patterns (multiplicative)
+    ('breadth', 'momentum'): [InteractionType.PRODUCT],
+    ('breadth', 'trend'): [InteractionType.PRODUCT],
+    ('breadth', 'pos'): [InteractionType.PRODUCT],
+    ('breadth', 'range'): [InteractionType.PRODUCT],
+    ('xsec', 'momentum'): [InteractionType.PRODUCT],
+    ('xsec', 'trend'): [InteractionType.PRODUCT],
+    ('alpha', 'trend'): [InteractionType.PRODUCT],
+    ('vwap', 'trend'): [InteractionType.PRODUCT],
+    ('vwap', 'momentum'): [InteractionType.PRODUCT],
+    ('volshock', 'breakout'): [InteractionType.PRODUCT],
+    ('volshock', 'range'): [InteractionType.PRODUCT],
+    ('adx', 'momentum'): [InteractionType.PRODUCT, InteractionType.GATED],
+
+    # Scale-invariant patterns
+    ('atr', 'momentum'): [InteractionType.RATIO, InteractionType.PRODUCT],
+    ('atr', 'return'): [InteractionType.RATIO],
+    ('atr', 'trend'): [InteractionType.RATIO, InteractionType.PRODUCT],
+
+    # Threshold patterns (regime switching)
+    ('squeeze', 'momentum'): [InteractionType.THRESHOLD, InteractionType.GATED],
+    ('squeeze', 'breakout'): [InteractionType.THRESHOLD],
+    ('drawdown', 'momentum'): [InteractionType.THRESHOLD, InteractionType.GATED],
+    ('drawdown', 'trend'): [InteractionType.THRESHOLD],
+
+    # Macro conditioning
+    ('credit', 'momentum'): [InteractionType.GATED, InteractionType.PRODUCT],
+    ('credit', 'alpha'): [InteractionType.GATED],
+    ('fred', 'momentum'): [InteractionType.GATED, InteractionType.PRODUCT],
+    ('fred', 'alpha'): [InteractionType.GATED],
+    ('copper_gold', 'momentum'): [InteractionType.PRODUCT],
+}
+
+
+def get_recommended_interaction_types(feat_a: str, feat_b: str) -> list:
+    """Get recommended interaction types for a feature pair.
+
+    Based on domain knowledge of how the features should interact
+    economically/statistically.
+
+    Args:
+        feat_a: First feature name.
+        feat_b: Second feature name.
+
+    Returns:
+        List of recommended InteractionType values (e.g., ['gated', 'product']).
+    """
+    feat_a_lower = feat_a.lower()
+    feat_b_lower = feat_b.lower()
+
+    # Check each pattern in PATTERN_INTERACTION_TYPES
+    for (pattern_a, pattern_b), types in PATTERN_INTERACTION_TYPES.items():
+        if (pattern_a in feat_a_lower and pattern_b in feat_b_lower) or \
+           (pattern_b in feat_a_lower and pattern_a in feat_b_lower):
+            return types
+
+    # Default to product for unmatched patterns
+    return [InteractionType.PRODUCT]
 
 
 def matches_domain_pattern(feat_a: str, feat_b: str) -> bool:
@@ -289,11 +586,17 @@ def generate_interaction_feature(
 ) -> Tuple[str, pd.Series]:
     """Generate an interaction feature from two base features.
 
+    Supports four interaction types based on economic intuition:
+    - PRODUCT: f1 × f2 - multiplicative amplification (both high = very high)
+    - GATED: f1 × sign(f2) - signal f1 gated by direction of f2
+    - RATIO: f1 / (|f2| + epsilon) - scale-invariant comparison
+    - THRESHOLD: I(f1 > median) × I(f2 > median) - non-linear regime switching
+
     Args:
         X: Feature DataFrame.
         feat_a: First feature name.
         feat_b: Second feature name.
-        interaction_type: Type of interaction ('product', 'threshold', 'ratio').
+        interaction_type: Type of interaction ('product', 'gated', 'threshold', 'ratio').
 
     Returns:
         Tuple of (new_feature_name, feature_values).
@@ -303,11 +606,29 @@ def generate_interaction_feature(
 
     if interaction_type == 'product':
         # Simple product interaction
+        # Use case: Confirmation patterns where both signals reinforce
+        # Example: breadth × momentum - high breadth AND high momentum = strong signal
         name = f"{feat_a}_x_{feat_b}"
         values = a * b
 
+    elif interaction_type == 'gated':
+        # Gated interaction - feature a is gated by the sign/state of feature b
+        # Use case: Regime conditioning where b determines if a is reliable
+        # Example: momentum × sign(vol_regime) - momentum only works in certain vol regimes
+        # The gate feature (b) is converted to a sign (+1/-1) or normalized indicator
+        name = f"{feat_a}_gated_{feat_b}"
+        # Use sign of b as gate, but preserve magnitude of a
+        # This creates: a × sign(b), which flips a's signal based on b's direction
+        b_sign = np.sign(b)
+        # Handle zeros in sign by using the median split instead
+        b_median = b.median()
+        b_indicator = np.where(b > b_median, 1.0, -1.0)
+        values = a * b_indicator
+
     elif interaction_type == 'threshold':
-        # Binary threshold interaction (both above median)
+        # Binary threshold interaction (both above median = 1, else 0)
+        # Use case: Non-linear regime switching - only fire when both conditions met
+        # Example: squeeze × breakout - only matters when both are "on"
         thresh_a = a.median()
         thresh_b = b.median()
         name = f"{feat_a}_AND_{feat_b}_high"
@@ -315,14 +636,17 @@ def generate_interaction_feature(
 
     elif interaction_type == 'ratio':
         # Ratio interaction (with protection against division by zero)
-        name = f"{feat_a}_div_{feat_b}"
+        # Use case: Scale-invariant comparisons - how big is a relative to b?
+        # Example: momentum / ATR - volatility-adjusted momentum
+        name = f"{feat_a}_ratio_{feat_b}"
         # Add small epsilon to avoid division by zero
         values = a / (b.abs() + 1e-8)
-        # Clip extreme values
+        # Clip extreme values to avoid numerical issues
         values = values.clip(-100, 100)
 
     else:
-        raise ValueError(f"Unknown interaction type: {interaction_type}")
+        raise ValueError(f"Unknown interaction type: {interaction_type}. "
+                         f"Valid types: product, gated, threshold, ratio")
 
     return name, values
 
