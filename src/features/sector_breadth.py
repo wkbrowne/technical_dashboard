@@ -156,6 +156,9 @@ def compute_sector_breadth_daily(
         'sector_breadth_mcclellan_sum': mcclellan_sum.astype('float32'),
     }, index=prices.index)
 
+    # Add breadth motion features (slope, change)
+    result = add_breadth_motion_features(result, is_weekly=False)
+
     logger.info(f"Computed {len(result.columns)} daily sector breadth features "
                 f"for {len(result)} dates")
 
@@ -229,6 +232,9 @@ def compute_sector_breadth_weekly(
         'w_sector_breadth_mcclellan_osc': mcclellan_osc.astype('float32'),
         'w_sector_breadth_mcclellan_sum': mcclellan_sum.astype('float32'),
     }, index=prices.index)
+
+    # Add weekly breadth motion features (slope, change)
+    result = add_breadth_motion_features(result, is_weekly=True)
 
     logger.info(f"Computed {len(result.columns)} weekly sector breadth features "
                 f"for {len(result)} weeks")
@@ -322,6 +328,12 @@ def get_sector_breadth_feature_names(include_weekly: bool = True) -> List[str]:
         'sector_breadth_pct_above_ma200',
         'sector_breadth_mcclellan_osc',
         'sector_breadth_mcclellan_sum',
+        # Breadth motion features
+        'sector_breadth_ad_chg_10d',
+        'sector_breadth_ad_slope_20d',
+        'sector_breadth_mcclellan_chg_5d',
+        'sector_breadth_mcclellan_slope_10d',
+        'sector_breadth_pct_ma50_chg_10d',
     ]
 
     if not include_weekly:
@@ -336,6 +348,137 @@ def get_sector_breadth_feature_names(include_weekly: bool = True) -> List[str]:
         'w_sector_breadth_pct_above_ma40',
         'w_sector_breadth_mcclellan_osc',
         'w_sector_breadth_mcclellan_sum',
+        # Weekly breadth motion features
+        'w_sector_breadth_ad_slope_8w',
+        'w_sector_breadth_mcclellan_chg_2w',
     ]
 
     return daily + weekly
+
+
+def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
+    """
+    Compute rolling linear regression slope of a series.
+
+    Uses least-squares slope: Σ((x-x̄)(y-ȳ)) / Σ(x-x̄)²
+
+    Args:
+        series: Input series
+        window: Rolling window size
+
+    Returns:
+        Series of rolling slopes
+    """
+    def _slope(arr: np.ndarray) -> float:
+        if len(arr) < 2 or np.isnan(arr).all():
+            return np.nan
+        x = np.arange(len(arr))
+        y = arr
+        mask = ~np.isnan(y)
+        if mask.sum() < 2:
+            return np.nan
+        x_clean = x[mask]
+        y_clean = y[mask]
+        x_mean = x_clean.mean()
+        y_mean = y_clean.mean()
+        numerator = ((x_clean - x_mean) * (y_clean - y_mean)).sum()
+        denominator = ((x_clean - x_mean) ** 2).sum()
+        if denominator == 0:
+            return np.nan
+        return numerator / denominator
+
+    return series.rolling(window, min_periods=max(5, window // 2)).apply(
+        _slope, raw=True
+    )
+
+
+def add_breadth_motion_features(
+    breadth_df: pd.DataFrame,
+    is_weekly: bool = False,
+) -> pd.DataFrame:
+    """
+    Add breadth motion features to a breadth DataFrame.
+
+    These features capture momentum and slope of breadth indicators,
+    complementing the static level features.
+
+    Daily features added:
+    - sector_breadth_ad_chg_10d: 10-day change in AD line
+    - sector_breadth_ad_slope_20d: 20-day linear regression slope of AD line
+    - sector_breadth_mcclellan_chg_5d: 5-day change in McClellan oscillator
+    - sector_breadth_mcclellan_slope_10d: 10-day slope of McClellan
+    - sector_breadth_pct_ma50_chg_10d: 10-day change in % above MA50
+
+    Weekly features added:
+    - w_sector_breadth_ad_slope_8w: 8-week slope of AD line
+    - w_sector_breadth_mcclellan_chg_2w: 2-week change in McClellan
+
+    Args:
+        breadth_df: DataFrame with breadth level features
+        is_weekly: If True, compute weekly motion features with w_ prefix
+
+    Returns:
+        DataFrame with added motion features (mutates input)
+    """
+    if is_weekly:
+        # Weekly motion features
+        ad_col = 'w_sector_breadth_ad_line'
+        mcclellan_col = 'w_sector_breadth_mcclellan_osc'
+
+        if ad_col in breadth_df.columns:
+            ad_line = pd.to_numeric(breadth_df[ad_col], errors='coerce')
+            # 8-week slope (roughly equivalent to 40-day)
+            breadth_df['w_sector_breadth_ad_slope_8w'] = _rolling_slope(
+                ad_line, 8
+            ).astype('float32')
+        else:
+            breadth_df['w_sector_breadth_ad_slope_8w'] = np.nan
+
+        if mcclellan_col in breadth_df.columns:
+            mcclellan = pd.to_numeric(breadth_df[mcclellan_col], errors='coerce')
+            # 2-week change
+            breadth_df['w_sector_breadth_mcclellan_chg_2w'] = mcclellan.diff(2).astype('float32')
+        else:
+            breadth_df['w_sector_breadth_mcclellan_chg_2w'] = np.nan
+
+        logger.debug("Added weekly breadth motion features")
+    else:
+        # Daily motion features
+        ad_col = 'sector_breadth_ad_line'
+        mcclellan_col = 'sector_breadth_mcclellan_osc'
+        pct_ma50_col = 'sector_breadth_pct_above_ma50'
+
+        if ad_col in breadth_df.columns:
+            ad_line = pd.to_numeric(breadth_df[ad_col], errors='coerce')
+            # 10-day change in AD line
+            breadth_df['sector_breadth_ad_chg_10d'] = ad_line.diff(10).astype('float32')
+            # 20-day slope of AD line
+            breadth_df['sector_breadth_ad_slope_20d'] = _rolling_slope(
+                ad_line, 20
+            ).astype('float32')
+        else:
+            breadth_df['sector_breadth_ad_chg_10d'] = np.nan
+            breadth_df['sector_breadth_ad_slope_20d'] = np.nan
+
+        if mcclellan_col in breadth_df.columns:
+            mcclellan = pd.to_numeric(breadth_df[mcclellan_col], errors='coerce')
+            # 5-day change in McClellan
+            breadth_df['sector_breadth_mcclellan_chg_5d'] = mcclellan.diff(5).astype('float32')
+            # 10-day slope of McClellan
+            breadth_df['sector_breadth_mcclellan_slope_10d'] = _rolling_slope(
+                mcclellan, 10
+            ).astype('float32')
+        else:
+            breadth_df['sector_breadth_mcclellan_chg_5d'] = np.nan
+            breadth_df['sector_breadth_mcclellan_slope_10d'] = np.nan
+
+        if pct_ma50_col in breadth_df.columns:
+            pct_ma50 = pd.to_numeric(breadth_df[pct_ma50_col], errors='coerce')
+            # 10-day change in % above MA50
+            breadth_df['sector_breadth_pct_ma50_chg_10d'] = pct_ma50.diff(10).astype('float32')
+        else:
+            breadth_df['sector_breadth_pct_ma50_chg_10d'] = np.nan
+
+        logger.debug("Added daily breadth motion features")
+
+    return breadth_df

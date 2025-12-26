@@ -18,7 +18,7 @@ try:
     )
     from .volatility import (
         add_multiscale_vol_regime, add_bollinger_bandwidth_features,
-        add_squeeze_features
+        add_squeeze_features, add_volatility_acceleration_features
     )
     from .distance import add_distance_to_ma_features
     from .range_breakout import add_range_breakout_features
@@ -34,7 +34,7 @@ except ImportError:
     )
     from src.features.volatility import (
         add_multiscale_vol_regime, add_bollinger_bandwidth_features,
-        add_squeeze_features
+        add_squeeze_features, add_volatility_acceleration_features
     )
     from src.features.distance import add_distance_to_ma_features
     from src.features.range_breakout import add_range_breakout_features
@@ -67,14 +67,15 @@ def compute_single_stock_features(
     5. CHOP features (Choppiness Index - trend quality filter)
     6. ADX features (Average Directional Index - trend strength)
     7. Multi-scale volatility regime (single-stock only)
-    8. Bollinger Bandwidth features (volatility compression)
-    9. Squeeze features (BB inside KC - compression/expansion)
-    10. Distance-to-MA features (z-scores)
-    11. Range/breakout features (including ATR14, overnight return, gap features)
-    12. Volume features
-    13. Volume shock features
-    14. Drawdown and recovery features
-    15. Divergence features (RSI-price, MACD-price, trend-momentum)
+    8. Volatility acceleration (delta, accel, impulse - 2nd derivatives)
+    9. Bollinger Bandwidth features (volatility compression)
+    10. Squeeze features (BB inside KC - compression/expansion)
+    11. Distance-to-MA features (z-scores)
+    12. Range/breakout features (including ATR14, overnight return, gap features)
+    13. Volume features
+    14. Volume shock features
+    15. Drawdown and recovery features
+    16. Divergence features (RSI-price, MACD-price, trend-momentum)
 
     Note: Cross-sectional volatility features (vol_regime_cs_median, vol_regime_rel)
     are NOT included here as they require data from multiple stocks. Use
@@ -174,6 +175,10 @@ def compute_single_stock_features(
         slope_win=20,
         cs_ratio_median=None,  # No cross-sectional context in single-stock mode
     )
+
+    # 6b) Volatility acceleration features (depends on rv_10, rv_20, rv_60 from above)
+    logger.debug("Adding volatility acceleration features")
+    out = add_volatility_acceleration_features(out, prefix="rv")
 
     # 7) Bollinger Bandwidth features (volatility compression)
     logger.debug("Adding Bollinger Bandwidth features")

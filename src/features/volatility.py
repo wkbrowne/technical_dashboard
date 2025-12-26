@@ -480,3 +480,144 @@ def _create_nan_squeeze_features(df: pd.DataFrame, length: int) -> None:
     df[f'squeeze_intensity_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
     df[f'squeeze_release_{length}'] = pd.Series(np.nan, index=df.index, dtype='int8')
     df[f'days_in_squeeze_{length}'] = pd.Series(np.nan, index=df.index, dtype='float32')
+
+
+def add_volatility_acceleration_features(
+    df: pd.DataFrame,
+    prefix: str = "rv",
+) -> pd.DataFrame:
+    """
+    Add volatility acceleration features that capture directional change in volatility.
+
+    These features complement existing volatility levels and ratios by capturing:
+    - Volatility delta: signed difference between short and long-term vol
+    - Volatility acceleration: rate of change of volatility (2nd derivative)
+    - Volatility impulse: sudden spikes in volatility change
+
+    Features added:
+    - rv_delta_10_60: rv_10 - rv_60 (signed difference, not ratio)
+    - rv_delta_10_60_z: Z-scored (60d) volatility delta
+    - rv_accel_20: 5-day change in rv_20, z-scored over 60d
+    - rv_accel_60: 10-day change in rv_60, z-scored over 120d
+    - rv_impulse_5d_z: 5-day pct_change of rv_10, z-scored (spike detector)
+
+    Args:
+        df: Input DataFrame with rv_10, rv_20, rv_60 columns
+        prefix: Prefix for volatility columns (default: "rv")
+
+    Returns:
+        DataFrame with added volatility acceleration features (mutates input)
+    """
+    logger.debug("Computing volatility acceleration features")
+
+    # Check for required columns
+    rv_10_col = f"{prefix}_10"
+    rv_20_col = f"{prefix}_20"
+    rv_60_col = f"{prefix}_60"
+
+    has_rv10 = rv_10_col in df.columns
+    has_rv20 = rv_20_col in df.columns
+    has_rv60 = rv_60_col in df.columns
+
+    if not (has_rv10 and has_rv60):
+        logger.warning(
+            f"Missing required columns for vol acceleration "
+            f"(has rv_10={has_rv10}, rv_60={has_rv60})"
+        )
+        # Create NaN columns
+        df["rv_delta_10_60"] = pd.Series(np.nan, index=df.index, dtype="float32")
+        df["rv_delta_10_60_z"] = pd.Series(np.nan, index=df.index, dtype="float32")
+        df["rv_accel_20"] = pd.Series(np.nan, index=df.index, dtype="float32")
+        df["rv_accel_60"] = pd.Series(np.nan, index=df.index, dtype="float32")
+        df["rv_impulse_5d_z"] = pd.Series(np.nan, index=df.index, dtype="float32")
+        return df
+
+    rv_10 = pd.to_numeric(df[rv_10_col], errors="coerce")
+    rv_60 = pd.to_numeric(df[rv_60_col], errors="coerce")
+
+    # 1) Volatility delta: signed difference (not ratio)
+    # Captures whether short-term vol is higher/lower than long-term
+    rv_delta = rv_10 - rv_60
+    df["rv_delta_10_60"] = rv_delta.astype("float32")
+
+    # 2) Z-scored volatility delta for cross-time comparability
+    df["rv_delta_10_60_z"] = _rolling_z(rv_delta, 60).astype("float32")
+
+    # 3) Volatility acceleration: rate of change of rv_20
+    if has_rv20:
+        rv_20 = pd.to_numeric(df[rv_20_col], errors="coerce")
+        rv_20_chg_5d = rv_20.diff(5)
+        df["rv_accel_20"] = _rolling_z(rv_20_chg_5d, 60).astype("float32")
+    else:
+        df["rv_accel_20"] = pd.Series(np.nan, index=df.index, dtype="float32")
+
+    # 4) Longer-term acceleration: rate of change of rv_60
+    rv_60_chg_10d = rv_60.diff(10)
+    df["rv_accel_60"] = _rolling_z(rv_60_chg_10d, 120).astype("float32")
+
+    # 5) Volatility impulse: sudden spikes in short-term vol
+    # Percent change to capture proportional moves
+    rv_10_pct_chg = rv_10.pct_change(5).replace([np.inf, -np.inf], np.nan)
+    df["rv_impulse_5d_z"] = _rolling_z(rv_10_pct_chg, 60).astype("float32")
+
+    logger.debug("Volatility acceleration features completed")
+    return df
+
+
+def add_weekly_volatility_acceleration_features(
+    df: pd.DataFrame,
+    prefix: str = "w_rv",
+) -> pd.DataFrame:
+    """
+    Add weekly volatility acceleration features.
+
+    Features added:
+    - w_rv_delta_10_60_z: Weekly z-scored volatility delta
+    - w_rv_accel_20: Weekly volatility acceleration
+
+    Args:
+        df: Input DataFrame with weekly rv columns (w_rv_10, w_rv_20, w_rv_60)
+        prefix: Prefix for weekly volatility columns (default: "w_rv")
+
+    Returns:
+        DataFrame with added weekly volatility acceleration features (mutates input)
+    """
+    logger.debug("Computing weekly volatility acceleration features")
+
+    # Check for required columns
+    rv_10_col = f"{prefix}_10"
+    rv_20_col = f"{prefix}_20"
+    rv_60_col = f"{prefix}_60"
+
+    has_rv10 = rv_10_col in df.columns
+    has_rv20 = rv_20_col in df.columns
+    has_rv60 = rv_60_col in df.columns
+
+    if not (has_rv10 and has_rv60):
+        logger.debug(
+            f"Missing weekly rv columns for vol acceleration "
+            f"(has {rv_10_col}={has_rv10}, {rv_60_col}={has_rv60})"
+        )
+        df["w_rv_delta_10_60_z"] = pd.Series(np.nan, index=df.index, dtype="float32")
+        df["w_rv_accel_20"] = pd.Series(np.nan, index=df.index, dtype="float32")
+        return df
+
+    rv_10 = pd.to_numeric(df[rv_10_col], errors="coerce")
+    rv_60 = pd.to_numeric(df[rv_60_col], errors="coerce")
+
+    # 1) Weekly z-scored volatility delta
+    rv_delta = rv_10 - rv_60
+    # Use 12-week (~60 day equivalent) z-score window
+    df["w_rv_delta_10_60_z"] = _rolling_z(rv_delta, 12).astype("float32")
+
+    # 2) Weekly volatility acceleration
+    if has_rv20:
+        rv_20 = pd.to_numeric(df[rv_20_col], errors="coerce")
+        # 1-week change, z-scored over 12 weeks
+        rv_20_chg = rv_20.diff(1)
+        df["w_rv_accel_20"] = _rolling_z(rv_20_chg, 12).astype("float32")
+    else:
+        df["w_rv_accel_20"] = pd.Series(np.nan, index=df.index, dtype="float32")
+
+    logger.debug("Weekly volatility acceleration features completed")
+    return df
