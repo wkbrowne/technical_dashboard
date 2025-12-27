@@ -156,8 +156,17 @@ class SubsetEvaluator:
                 col_indices, feature_list, fold_indices
             )
 
-        # Aggregate results
-        primary_values = [r['primary'] for r in fold_results]
+        # Aggregate results (filter out nan from skipped folds)
+        primary_values = [r['primary'] for r in fold_results if not np.isnan(r['primary'])]
+        if not primary_values:
+            return SubsetResult(
+                features=feature_list,
+                metric_main=0.0,
+                metric_std=0.0,
+                fold_metrics=[],
+                n_base_features=len(feature_list),
+                n_interaction_features=0
+            )
         metric_main = np.mean(primary_values)
         metric_std = np.std(primary_values)
 
@@ -301,7 +310,8 @@ class SubsetEvaluator:
             w_train = w_train.loc[train_mask]
 
         if len(X_train) < 50 or len(X_test) < 10:
-            return {'primary': 0.0, 'tail': {}}
+            # Return nan so this fold is excluded from averaging
+            return {'primary': np.nan, 'tail': {}, 'extended': {}}
 
         # Create and train model
         model = GBMWrapper(self.model_config)

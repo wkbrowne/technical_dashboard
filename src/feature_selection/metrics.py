@@ -385,9 +385,13 @@ class MetricComputer:
         """
         aggregated = {}
 
-        # Primary metric
-        primary_values = [r['primary'] for r in fold_results]
-        aggregated['primary'] = (np.mean(primary_values), np.std(primary_values))
+        # Primary metric (filter out nan from skipped folds)
+        primary_values = [r['primary'] for r in fold_results
+                          if not np.isnan(r.get('primary', np.nan))]
+        if primary_values:
+            aggregated['primary'] = (np.mean(primary_values), np.std(primary_values))
+        else:
+            aggregated['primary'] = (0.0, 0.0)
 
         # Secondary metrics
         for metric_type in self._secondary_fns:
