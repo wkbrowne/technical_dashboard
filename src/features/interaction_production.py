@@ -51,12 +51,29 @@ logger = logging.getLogger(__name__)
 # - "_ratio_" for ratio (e.g., feat_a_ratio_feat_b) - scale-invariant
 # - "_AND_..._high" for threshold (e.g., feat_a_AND_feat_b_high) - joint threshold
 #
+# TEMPLATE-BASED INTERACTIONS (new):
+# - ix__{template}__{base}__gated__{gate} - template-based gated
+# - ix__{template}__{feat_a}__x__{feat_b} - template-based product
+#
 # IMPORTANT: Check _x_ first because base features may contain "_ratio_" in their name
 # (e.g., gold_spy_ratio_zscore is a base feature, not an interaction)
 #
 # Pattern matching strategy:
 # - For _x_, _gated_, _AND_: These are very specific and unlikely to appear in base feature names
 # - For _ratio_: Only match if the feature name doesn't contain other interaction markers
+# - Template-based patterns start with "ix__" prefix
+
+# Template-based interaction patterns (new format)
+TEMPLATE_PATTERNS = [
+    # Template gated: ix__{template}__{base}__gated__{gate}
+    (r'^ix__([^_]+(?:_[^_]+)*)__(.+)__gated__(.+)$', 'template_gated'),
+    # Template signed gate: ix__{template}__{base}__signed__{gate}
+    (r'^ix__([^_]+(?:_[^_]+)*)__(.+)__signed__(.+)$', 'template_signed_gate'),
+    # Template product: ix__{template}__{feat_a}__x__{feat_b}
+    (r'^ix__([^_]+(?:_[^_]+)*)__(.+)__x__(.+)$', 'template_product'),
+]
+
+# Legacy interaction patterns
 INTERACTION_PATTERNS = [
     # PRODUCT: feat_a_x_feat_b - check first as it's the most common
     # and other interaction types shouldn't contain _x_
@@ -85,13 +102,49 @@ RATIO_FALSE_POSITIVES = {
 }
 
 
+def parse_template_interaction_name(
+    feature_name: str
+) -> Optional[Tuple[str, str, str, str]]:
+    """Parse a template-based interaction feature name.
+
+    Template interactions follow the format:
+    - ix__{template}__{base_feat}__gated__{gate_feat}
+    - ix__{template}__{base_feat}__signed__{gate_feat}
+    - ix__{template}__{feat_a}__x__{feat_b}
+
+    Args:
+        feature_name: The interaction feature name
+
+    Returns:
+        Tuple of (template_name, feature_a, feature_b, interaction_type) if parseable,
+        None if not a template-based interaction.
+
+    Examples:
+        >>> parse_template_interaction_name('ix__momentum_x_vol_gate__rsi_14__gated__vol_regime_ema10')
+        ('momentum_x_vol_gate', 'rsi_14', 'vol_regime_ema10', 'template_gated')
+    """
+    if not feature_name.startswith('ix__'):
+        return None
+
+    for pattern, interaction_type in TEMPLATE_PATTERNS:
+        match = re.match(pattern, feature_name)
+        if match:
+            template_name = match.group(1)
+            feat_a = match.group(2)
+            feat_b = match.group(3)
+            return (template_name, feat_a, feat_b, interaction_type)
+
+    return None
+
+
 def parse_interaction_name(
     feature_name: str
 ) -> Optional[Tuple[str, str, str]]:
     """Parse an interaction feature name to extract components.
 
     Identifies the two base features and interaction type from the naming
-    convention used by the feature selection system.
+    convention used by the feature selection system. Handles both legacy
+    and template-based interaction patterns.
 
     Args:
         feature_name: The interaction feature name (e.g., 'rsi_14_x_vol_regime_ema10')
@@ -107,6 +160,9 @@ def parse_interaction_name(
         >>> parse_interaction_name('momentum_gated_vol_regime')
         ('momentum', 'vol_regime', 'gated')
 
+        >>> parse_interaction_name('ix__momentum_x_vol_gate__rsi_14__gated__vol_regime_ema10')
+        ('rsi_14', 'vol_regime_ema10', 'gated')
+
         >>> parse_interaction_name('rsi_14')  # Not an interaction
         None
 
@@ -117,6 +173,19 @@ def parse_interaction_name(
     if feature_name in RATIO_FALSE_POSITIVES:
         return None
 
+    # First check template-based patterns (new format with ix__ prefix)
+    template_parsed = parse_template_interaction_name(feature_name)
+    if template_parsed is not None:
+        template_name, feat_a, feat_b, interaction_type = template_parsed
+        # Map template interaction types to base types
+        type_map = {
+            'template_gated': 'gated',
+            'template_signed_gate': 'signed_gate',
+            'template_product': 'product',
+        }
+        return (feat_a, feat_b, type_map.get(interaction_type, 'product'))
+
+    # Legacy patterns
     for pattern, interaction_type in INTERACTION_PATTERNS:
         match = re.match(pattern, feature_name)
         if match:
@@ -175,21 +244,24 @@ def compute_interaction(
     df: pd.DataFrame,
     feat_a: str,
     feat_b: str,
-    interaction_type: str = 'product'
+    interaction_type: str = 'product',
+    invert_gate: bool = False
 ) -> pd.Series:
     """Compute a single interaction feature.
 
-    Supports four interaction types based on economic intuition:
+    Supports five interaction types based on economic intuition:
     - PRODUCT: f1 * f2 - multiplicative amplification
-    - GATED: f1 * sign(f2) or f1 * I(f2 > median) - signal gated by condition
+    - GATED: f1 * I(f2 > median) - signal gated by binary condition
+    - SIGNED_GATE: f1 * sign(f2) - signal gated by direction
     - RATIO: f1 / (|f2| + epsilon) - scale-invariant comparison
     - THRESHOLD: I(f1 > median) * I(f2 > median) - non-linear regime switching
 
     Args:
         df: DataFrame containing the base features.
-        feat_a: First feature name.
-        feat_b: Second feature name.
-        interaction_type: Type of interaction ('product', 'gated', 'ratio', 'threshold').
+        feat_a: First feature name (base signal).
+        feat_b: Second feature name (gate/modifier).
+        interaction_type: Type of interaction.
+        invert_gate: If True, invert the gate logic (for stress indicators).
 
     Returns:
         Series containing the computed interaction values.
@@ -212,12 +284,24 @@ def compute_interaction(
         values = a * b
 
     elif interaction_type == 'gated':
-        # Gated interaction - feature a is gated by the sign/state of feature b
+        # Binary gated interaction - feature a is active only when b > median
         # Use case: Regime conditioning where b determines if a is reliable
-        # The gate feature (b) is converted to a sign or indicator
         b_median = b.median()
-        b_indicator = np.where(b > b_median, 1.0, -1.0)
+        if invert_gate:
+            # Invert: gate is ON when b < median (e.g., low stress = reliable)
+            b_indicator = np.where(b < b_median, 1.0, 0.0)
+        else:
+            # Normal: gate is ON when b > median
+            b_indicator = np.where(b > b_median, 1.0, 0.0)
         values = a * b_indicator
+
+    elif interaction_type == 'signed_gate':
+        # Signed gated interaction - feature a is multiplied by sign of b
+        # Use case: Direction matters (bullish vs bearish regime)
+        if invert_gate:
+            values = a * (-np.sign(b))
+        else:
+            values = a * np.sign(b)
 
     elif interaction_type == 'threshold':
         # Binary threshold interaction (both above median = 1, else 0)
@@ -236,7 +320,7 @@ def compute_interaction(
     else:
         raise ValueError(
             f"Unknown interaction type: {interaction_type}. "
-            f"Valid types: product, gated, threshold, ratio"
+            f"Valid types: product, gated, signed_gate, threshold, ratio"
         )
 
     return values.astype(np.float32)
@@ -542,3 +626,179 @@ def ensure_interactions_for_training(
         )
 
     return X
+
+
+# =============================================================================
+# TEMPLATE-BASED INTERACTION COMPUTATION
+# =============================================================================
+
+def compute_template_interactions(
+    df: pd.DataFrame,
+    template_name: str,
+    template: Dict[str, any],
+    skip_missing: bool = True,
+    inplace: bool = False
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Compute all interaction features for a given template.
+
+    Args:
+        df: DataFrame containing base features.
+        template_name: Name of the template.
+        template: Template definition dict with keys:
+            - type: "gate", "signed_gate", or "product"
+            - base_features: list of base feature names
+            - gate_features: list of gate/modifier feature names
+            - invert_gate: optional bool (default False)
+        skip_missing: If True, skip interactions with missing base features.
+        inplace: If True, modify df in place.
+
+    Returns:
+        Tuple of (DataFrame with interactions added, list of computed feature names)
+    """
+    if not inplace:
+        df = df.copy()
+
+    interaction_type = template["type"]
+    base_features = template["base_features"]
+    gate_features = template["gate_features"]
+    invert_gate = template.get("invert_gate", False)
+
+    # Map template types to compute types
+    type_map = {
+        "gate": "gated",
+        "signed_gate": "signed_gate",
+        "product": "product",
+    }
+    compute_type = type_map.get(interaction_type, "product")
+
+    computed = []
+    skipped = []
+
+    for base_feat in base_features:
+        for gate_feat in gate_features:
+            # Determine feature name based on type
+            if interaction_type in ("gate", "signed_gate"):
+                feat_name = f"ix__{template_name}__{base_feat}__gated__{gate_feat}"
+            else:  # product
+                feat_name = f"ix__{template_name}__{base_feat}__x__{gate_feat}"
+
+            # Skip if already computed
+            if feat_name in df.columns:
+                computed.append(feat_name)
+                continue
+
+            # Check if base features exist
+            if base_feat not in df.columns or gate_feat not in df.columns:
+                if skip_missing:
+                    skipped.append({
+                        'interaction': feat_name,
+                        'missing': [f for f in [base_feat, gate_feat]
+                                   if f not in df.columns]
+                    })
+                    continue
+                else:
+                    raise KeyError(
+                        f"Cannot compute {feat_name}: missing base features "
+                        f"(need {base_feat}, {gate_feat})"
+                    )
+
+            try:
+                values = compute_interaction(
+                    df, base_feat, gate_feat, compute_type, invert_gate
+                )
+                df[feat_name] = values
+                computed.append(feat_name)
+            except Exception as e:
+                logger.warning(f"Failed to compute {feat_name}: {e}")
+
+    if computed:
+        logger.debug(f"Computed {len(computed)} features for template {template_name}")
+    if skipped:
+        logger.debug(f"Skipped {len(skipped)} features (missing base features)")
+
+    return df, computed
+
+
+def compute_all_template_interactions(
+    df: pd.DataFrame,
+    selected_groups: Optional[Set[str]] = None,
+    skip_missing: bool = True,
+    inplace: bool = False
+) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+    """Compute interactions for all eligible templates.
+
+    Args:
+        df: DataFrame containing base features.
+        selected_groups: Optional set of selected group names.
+            If provided, only compute interactions where both parent groups
+            are in the selected set.
+        skip_missing: If True, skip interactions with missing base features.
+        inplace: If True, modify df in place.
+
+    Returns:
+        Tuple of (DataFrame with interactions, dict mapping template -> features)
+    """
+    # Import templates
+    from src.feature_selection.base_features import (
+        INTERACTION_TEMPLATES,
+        get_eligible_templates
+    )
+
+    if not inplace:
+        df = df.copy()
+
+    # Determine eligible templates
+    if selected_groups is not None:
+        eligible = get_eligible_templates(selected_groups)
+    else:
+        eligible = list(INTERACTION_TEMPLATES.keys())
+
+    computed_by_template = {}
+
+    for template_name in eligible:
+        template = INTERACTION_TEMPLATES[template_name]
+        df, computed = compute_template_interactions(
+            df, template_name, template, skip_missing=skip_missing, inplace=True
+        )
+        if computed:
+            computed_by_template[template_name] = computed
+
+    total_computed = sum(len(v) for v in computed_by_template.values())
+    if total_computed > 0:
+        logger.info(
+            f"Computed {total_computed} interaction features "
+            f"from {len(computed_by_template)} templates"
+        )
+
+    return df, computed_by_template
+
+
+def get_template_interaction_info(feature_name: str) -> Optional[Dict[str, any]]:
+    """Get template information for a template-based interaction feature.
+
+    Args:
+        feature_name: The interaction feature name.
+
+    Returns:
+        Dict with template info or None if not a template interaction.
+    """
+    parsed = parse_template_interaction_name(feature_name)
+    if parsed is None:
+        return None
+
+    template_name, feat_a, feat_b, interaction_type = parsed
+
+    # Try to look up the template
+    try:
+        from src.feature_selection.base_features import INTERACTION_TEMPLATES
+        template = INTERACTION_TEMPLATES.get(template_name)
+    except ImportError:
+        template = None
+
+    return {
+        'template_name': template_name,
+        'base_feature': feat_a,
+        'gate_feature': feat_b,
+        'interaction_type': interaction_type,
+        'template': template,
+    }
