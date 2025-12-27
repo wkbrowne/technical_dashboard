@@ -26,11 +26,11 @@ class TestFeatureWorker:
         assert isinstance(result_df, pd.DataFrame)
         assert len(result_df.columns) > len(sample_ohlcv_df.columns)
         
-        # Should have some key features
+        # Should have some key features (from single-stock feature computation)
         expected_features = [
             'trend_score_granular',
-            'vol_regime', 
-            'hurst_ret_64',
+            'vol_regime',
+            'rsi_14',
             'pct_dist_ma_20'
         ]
         for feature in expected_features:
@@ -75,15 +75,24 @@ class TestFeatureWorker:
         assert result_sym == 'TEST'
         assert isinstance(result_df, pd.DataFrame)
     
-    def test_feature_worker_cross_sectional_median(self, sample_ohlcv_df):
-        """Test feature worker with cross-sectional median provided."""
-        cs_median = pd.Series([1.0] * len(sample_ohlcv_df), index=sample_ohlcv_df.index)
-        
-        result_sym, result_df = _feature_worker('TEST', sample_ohlcv_df.copy(), cs_median)
-        
+    def test_feature_worker_raw_price_policy(self, sample_ohlcv_df):
+        """Test that feature worker uses raw close (not adjclose) for features."""
+        # Create data with close != adjclose
+        df = sample_ohlcv_df.copy()
+        df['close'] = df['close'] + 10  # Make close different from adjclose
+
+        result_sym, result_df = _feature_worker('TEST', df)
+
         # Should still work
         assert result_sym == 'TEST'
         assert isinstance(result_df, pd.DataFrame)
+
+        # The close column should NOT be modified (no OHLC adjustment)
+        pd.testing.assert_series_equal(
+            result_df['close'],
+            df['close'],
+            check_names=False
+        )
 
 
 class TestBuildFeatureUniverse:

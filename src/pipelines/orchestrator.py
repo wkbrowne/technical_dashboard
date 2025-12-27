@@ -36,6 +36,7 @@ try:
     from ..features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
     from ..features.target_generation import generate_multi_targets_parallel
     from ..features.lagging import apply_configurable_lags
+    from ..config.model_keys import override_target_configs
     # New unified timeframe handler
     from ..features.timeframe import (
         TimeframeResampler, TimeframeType, TimeframeConfig,
@@ -51,6 +52,15 @@ try:
     from ..feature_selection.base_features import (
         filter_output_columns, get_output_features, get_retired_features,
         get_feature_exclusion_report, drop_retired_columns
+    )
+    # Feature provenance tracking
+    from ..features.provenance import (
+        FEATURE_PROVENANCE_REGISTRY,
+        get_provenance_for_features,
+        get_missing_provenance,
+        validate_provenance,
+        save_provenance_metadata,
+        report_provenance_summary
     )
     # Interaction feature production
     from ..features.interaction_production import (
@@ -69,6 +79,7 @@ except ImportError:
     from src.features.sector_mapping import build_enhanced_sector_mappings, get_required_etfs
     from src.features.target_generation import generate_multi_targets_parallel
     from src.features.lagging import apply_configurable_lags
+    from src.config.model_keys import override_target_configs
     # New unified timeframe handler
     from src.features.timeframe import (
         TimeframeResampler, TimeframeType, TimeframeConfig,
@@ -84,6 +95,15 @@ except ImportError:
     from src.feature_selection.base_features import (
         filter_output_columns, get_output_features, get_retired_features,
         get_feature_exclusion_report, drop_retired_columns
+    )
+    # Feature provenance tracking
+    from src.features.provenance import (
+        FEATURE_PROVENANCE_REGISTRY,
+        get_provenance_for_features,
+        get_missing_provenance,
+        validate_provenance,
+        save_provenance_metadata,
+        report_provenance_summary
     )
     # Interaction feature production
     from src.features.interaction_production import (
@@ -175,9 +195,13 @@ def _feature_worker(sym: str, df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     """
     Core feature computation worker for a single symbol.
 
-    This function runs the complete single-stock feature stack, including:
-    - OHLC adjustment to match adjusted close
-    - All single-stock features (trend, volatility, distance, range, volume, etc.)
+    This function runs the complete single-stock feature stack using RAW OHLC data.
+    No price adjustment is applied - features use observable end-of-day prices.
+
+    POLICY: Raw prices for features, adjusted prices for targets
+    - Features use raw OHLC (what was observable at close of day t)
+    - Splits within rolling windows are acceptable and expected
+    - Adjusted prices are only used for target generation and PnL/backtest
 
     Note: Cross-sectional features (volatility context, relative strength, etc.)
     are added separately after all symbols are processed.
@@ -192,13 +216,15 @@ def _feature_worker(sym: str, df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     try:
         logger.debug(f"Processing features for {sym}")
 
-        # First: Adjust OHLC to match adjusted close for consistent price data
-        out = adjust_ohlc_to_adjclose(df)
+        # NOTE: No OHLC adjustment applied - features use raw prices
+        # OHLC adjustment is only applied for target generation (see target_generation.py)
+        out = df.copy()
 
-        # Compute all single-stock features using the centralized function
+        # Compute all single-stock features using raw close price
+        # Returns (ret column) still use adjclose for economic correctness
         out = compute_single_stock_features(
             out,
-            price_col='adjclose',
+            price_col='close',  # Use raw close for feature computation
             ret_col='ret',
             vol_col='volume',
             ensure_returns=True
@@ -220,6 +246,11 @@ def _feature_worker_batch(symbol_data_list: List[Tuple[str, pd.DataFrame]]) -> L
     which significantly reduces inter-process communication overhead compared to
     processing each symbol as a separate task.
 
+    POLICY: Raw prices for features, adjusted prices for targets
+    - Features use raw OHLC (what was observable at close of day t)
+    - No OHLC adjustment is applied here
+    - OHLC adjustment is only used for target generation
+
     Args:
         symbol_data_list: List of (symbol, dataframe) tuples to process
 
@@ -229,13 +260,13 @@ def _feature_worker_batch(symbol_data_list: List[Tuple[str, pd.DataFrame]]) -> L
     results = []
     for sym, df in symbol_data_list:
         try:
-            # Adjust OHLC to match adjusted close
-            out = adjust_ohlc_to_adjclose(df)
+            # NOTE: No OHLC adjustment - features use raw prices
+            out = df.copy()
 
-            # Compute all single-stock features
+            # Compute all single-stock features using raw close
             out = compute_single_stock_features(
                 out,
-                price_col='adjclose',
+                price_col='close',  # Use raw close for feature computation
                 ret_col='ret',
                 vol_col='volume',
                 ensure_returns=True
@@ -459,7 +490,7 @@ def build_feature_universe(
 
 def _generate_triple_barrier_targets(
     indicators_by_symbol: Dict[str, pd.DataFrame],
-    config: Dict[str, float] = None,
+    target_config_path: Optional[str] = None,
     weight_min_clip: float = 0.01,
     weight_max_clip: float = 10.0,
     parallel_config: Optional[ParallelConfig] = None,
@@ -467,7 +498,16 @@ def _generate_triple_barrier_targets(
     """
     Convert indicators to long format and generate multi-target triple barrier targets.
 
-    Generates 4-model targets with model-specific ATR multiples:
+    POLICY: Adjusted prices for targets (economic correctness)
+    - Entry price uses adjclose (split/dividend adjusted)
+    - Barrier checks use adjusted high/low to match entry price space
+    - This ensures correct barrier triggering across corporate actions
+    - OHLC adjustment is applied here, NOT in feature computation
+
+    Generates 4-model targets with model-specific ATR multiples. Default thresholds
+    can be overridden by providing a path to barrier_calibration.json.
+
+    Default ATR multiples (if no calibration file):
     - LONG_NORMAL: 1.5 ATR up (profit), 1.5 ATR down (stop)
     - LONG_PARABOLIC: 2.5 ATR up (profit), 1.5 ATR down (stop)
     - SHORT_NORMAL: 1.5 ATR up (stop), 2.0 ATR down (profit)
@@ -475,7 +515,8 @@ def _generate_triple_barrier_targets(
 
     Args:
         indicators_by_symbol: Dictionary of symbol DataFrames with features
-        config: Unused (kept for API compatibility)
+        target_config_path: Path to barrier_calibration.json for custom thresholds.
+            If None, uses hardcoded defaults from model_keys.py.
         weight_min_clip: Minimum weight value (prevents zero weights)
         weight_max_clip: Maximum weight value (prevents extreme weights)
         parallel_config: ParallelConfig for parallel processing
@@ -498,7 +539,8 @@ def _generate_triple_barrier_targets(
             continue
 
         # Extract required columns for triple barrier generation
-        required_cols = ['adjclose', 'high', 'low']
+        # Need: adjclose (entry), close (for adjustment factor), high, low
+        required_cols = ['adjclose', 'close', 'high', 'low']
         missing_cols = [col for col in required_cols if col not in df.columns]
 
         if missing_cols:
@@ -510,8 +552,13 @@ def _generate_triple_barrier_targets(
             logger.warning(f"Symbol {symbol} missing ATR for target generation")
             continue
 
-        # Create long format record for this symbol
-        symbol_data = df[['adjclose', 'high', 'low', 'atr14']].copy()
+        # Apply OHLC adjustment for target generation (economic correctness)
+        # This adjusts high/low to match adjclose price space
+        symbol_df = df[['adjclose', 'close', 'high', 'low', 'atr14']].copy()
+        symbol_df = adjust_ohlc_to_adjclose(symbol_df)
+
+        # Create long format record with adjusted prices
+        symbol_data = symbol_df[['adjclose', 'high', 'low', 'atr14']].copy()
         symbol_data = symbol_data.dropna()
 
         if symbol_data.empty:
@@ -540,11 +587,19 @@ def _generate_triple_barrier_targets(
 
     logger.info(f"Prepared long format data: {len(df_long)} rows across {df_long['symbol'].nunique()} symbols")
 
+    # Load target configs (from calibration file or hardcoded defaults)
+    model_configs = override_target_configs(target_config_path)
+    if target_config_path:
+        logger.info(f"Loaded calibrated target configs from {target_config_path}")
+    else:
+        logger.info("Using hardcoded default target configs")
+
     # Use multi-target generation for 4-model system
     logger.info("Using multi-target generation for 4-model system")
     targets_df = generate_multi_targets_parallel(
         df_long,
         model_keys=None,  # All 4 models
+        model_configs=model_configs,  # Pass loaded configs
         weight_min_clip=weight_min_clip,
         weight_max_clip=weight_max_clip,
         parallel_config=parallel_config
@@ -965,6 +1020,8 @@ def run_pipeline_v2(
     full_output: bool = False,
     checkpoint_config: Optional[CheckpointConfig] = None,
     exclude_retired: bool = False,
+    target_config_path: Optional[str] = None,
+    output_dir: Optional[Path] = None,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Simplified pipeline using new config system.
@@ -980,7 +1037,7 @@ def run_pipeline_v2(
         spy_symbol: Market benchmark symbol
         enhanced_mappings: Enhanced sector mappings
         include_targets: Whether to generate triple barrier targets
-        triple_barrier_config: Config for target generation
+        triple_barrier_config: Config for target generation (deprecated, use target_config_path)
         n_jobs: Number of parallel jobs (deprecated, use parallel_config)
         parallel_config: ParallelConfig for unified parallel processing
         sectors: Dict mapping symbol -> sector name (for cross-sectional features)
@@ -990,6 +1047,10 @@ def run_pipeline_v2(
             primary return is filtered to curated feature set defined in base_features.py
         checkpoint_config: CheckpointConfig for enabling staged checkpoints and resumption
         exclude_retired: If True, exclude retired features from output files (saves disk/memory)
+        target_config_path: Path to barrier_calibration.json for custom target thresholds.
+            If None, uses hardcoded defaults from model_keys.py.
+        output_dir: Optional output directory for saving provenance metadata.
+            If provided, saves feature_provenance.json to this directory.
 
     Returns:
         Tuple of (features_df, targets_df, features_complete_df, features_filtered_df) where:
@@ -1239,7 +1300,7 @@ def run_pipeline_v2(
         with profile_stage("Triple Barrier Targets"):
             targets_df = _generate_triple_barrier_targets(
                 indicators_by_symbol,
-                triple_barrier_config,
+                target_config_path=target_config_path,
                 parallel_config=parallel_config
             )
 
@@ -1285,6 +1346,61 @@ def run_pipeline_v2(
     if filtered_count > 0:
         print(f">>> [Output Filtering] Filtered {filtered_count} intermediate columns, keeping {cols_after}", flush=True)
         logger.info(f"Filtered output to curated features: {cols_before} -> {cols_after} columns")
+
+    # Step 6d: Compute and validate feature provenance
+    with profile_stage("Feature Provenance"):
+        # Extract feature columns (exclude metadata)
+        metadata_cols = {'symbol', 'date', '_row_id'}
+        feature_cols = [c for c in daily_df_complete.columns if c not in metadata_cols]
+
+        # Get provenance for computed features
+        provenance = get_provenance_for_features(feature_cols)
+
+        # Log missing features (features not in registry)
+        missing = get_missing_provenance(feature_cols)
+        if missing:
+            logger.warning(f"Features missing from provenance registry: {len(missing)}")
+            # Log first 10 missing features for debugging
+            for feat in missing[:10]:
+                logger.debug(f"  Missing: {feat}")
+
+        # Validate provenance (check for issues)
+        critical_issues, warnings, optimizations = validate_provenance(provenance)
+
+        if critical_issues:
+            logger.error(f"CRITICAL: {len(critical_issues)} provenance violations detected!")
+            for issue in critical_issues:
+                logger.error(f"  {issue}")
+            # Raise exception for hard leakage
+            raise ValueError(f"Feature provenance validation failed: {len(critical_issues)} critical issues")
+
+        if warnings:
+            logger.warning(f"Provenance warnings: {len(warnings)}")
+            for warn in warnings[:5]:
+                logger.warning(f"  {warn}")
+
+        if optimizations:
+            logger.info(f"Provenance optimizations available: {len(optimizations)}")
+            for opt in optimizations[:5]:
+                logger.info(f"  {opt}")
+
+        # Log summary
+        summary = report_provenance_summary(provenance)
+        print(f">>> [Feature Provenance] Tracked {summary['total_features']} features", flush=True)
+        print(f"    Daily: {summary['daily_features']}, Weekly: {summary['weekly_features']}", flush=True)
+        print(f"    Lookback range: {summary['min_lookback_days']}-{summary['max_lookback_days']} days", flush=True)
+        print(f"    With publication lag: {summary['with_publication_lag']}", flush=True)
+        if missing:
+            print(f"    Missing from registry: {len(missing)}", flush=True)
+
+        logger.info(f"Provenance summary: {summary}")
+
+        # Save provenance metadata if output_dir provided
+        if output_dir is not None:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            provenance_path = save_provenance_metadata(provenance, output_dir)
+            print(f"    Saved: {provenance_path}", flush=True)
 
     print(f"\n{'='*60}", flush=True)
     print(f"PIPELINE V2 COMPLETE", flush=True)
