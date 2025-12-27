@@ -147,14 +147,28 @@ from .pipeline import (
 
 # Base features configuration
 from .base_features import (
-    # Core data structures
+    # Group-first data structures (NEW)
+    CORE_GROUPS,
+    HEAD_GROUPS,
+    CANDIDATE_GROUPS,
+    INTERACTION_GROUPS,
+    # Group-first retrieval functions (NEW)
+    get_core_groups,
+    get_head_groups,
+    get_candidate_groups,
+    get_interaction_groups,
+    get_all_groups,
+    get_baseline_groups,
+    get_group_names,
+    validate_group_sizes,
+    # Legacy data structures (backwards compatibility)
     BASE_FEATURES,
     CORE_FEATURES,
     HEAD_FEATURES,
     FEATURE_CATEGORIES,
     EXPANSION_CANDIDATES,
     EXCLUDED_FEATURES,
-    # Model-aware feature retrieval
+    # Model-aware feature retrieval (legacy API)
     get_core_features,
     get_head_features,
     get_featureset,
@@ -188,7 +202,7 @@ from .evaluation import (
     evaluate_subsets_parallel,
 )
 
-# Algorithms
+# Algorithms (singleton-based - legacy)
 from .algorithms import (
     compute_initial_ranking,
     forward_selection,
@@ -199,6 +213,19 @@ from .algorithms import (
     # Enhanced interaction search
     parallel_interaction_forward_selection,
     late_interaction_refinement,
+)
+
+# Group-first selection (NEW)
+from .group_selection import (
+    GroupResult,
+    GroupSelectionResult,
+    GroupSelectionConfig,
+    grouped_forward_selection,
+    grouped_swap_selection,
+    grouped_backward_elimination,
+    interaction_group_selection,
+    run_group_selection,
+    select_groups_for_model,
 )
 
 # Interactions
@@ -296,14 +323,28 @@ __all__ = [
     # Loose-then-tight pipeline
     'LooseTightPipeline',
     'run_loose_tight_selection',
-    # Base features - core data structures
+    # Group-first data structures (NEW)
+    'CORE_GROUPS',
+    'HEAD_GROUPS',
+    'CANDIDATE_GROUPS',
+    'INTERACTION_GROUPS',
+    # Group-first retrieval functions (NEW)
+    'get_core_groups',
+    'get_head_groups',
+    'get_candidate_groups',
+    'get_interaction_groups',
+    'get_all_groups',
+    'get_baseline_groups',
+    'get_group_names',
+    'validate_group_sizes',
+    # Legacy data structures (backwards compatibility)
     'BASE_FEATURES',
     'CORE_FEATURES',
     'HEAD_FEATURES',
     'FEATURE_CATEGORIES',
     'EXPANSION_CANDIDATES',
     'EXCLUDED_FEATURES',
-    # Model-aware feature retrieval
+    # Model-aware feature retrieval (legacy API)
     'get_core_features',
     'get_head_features',
     'get_featureset',
@@ -329,7 +370,7 @@ __all__ = [
     'EvaluationCache',
     'evaluate_subset',
     'evaluate_subsets_parallel',
-    # Algorithms
+    # Algorithms (singleton-based - legacy)
     'compute_initial_ranking',
     'forward_selection',
     'backward_elimination',
@@ -338,6 +379,16 @@ __all__ = [
     'TopKTracker',
     'parallel_interaction_forward_selection',
     'late_interaction_refinement',
+    # Group-first selection (NEW)
+    'GroupResult',
+    'GroupSelectionResult',
+    'GroupSelectionConfig',
+    'grouped_forward_selection',
+    'grouped_swap_selection',
+    'grouped_backward_elimination',
+    'interaction_group_selection',
+    'run_group_selection',
+    'select_groups_for_model',
     # Interactions
     'InteractionDiscoverer',
     'compute_shap_interactions',
