@@ -17,29 +17,42 @@ The system supports four distinct models, each targeting a specific trade type:
 
 ### CORE_FEATURES (Shared Backbone)
 
-All models share a common backbone of curated features selected via the Loose-Tight pipeline. This includes:
+All models share a common backbone of curated features selected via the Loose-Tight pipeline. Groups are organized for **hypothesis purity** (one hypothesis per group):
 
-- **Relative Performance / Alpha**: Cross-sectional momentum, alpha vs benchmarks
-- **Macro / Intermarket**: VIX regime, credit spreads, yield curve, FRED data
-- **Trend Strength**: MA slopes, trend scores, MACD
-- **Price Position**: Distance to MAs, position in range
-- **Volatility / Regime**: ATR, Bollinger width, vol regime
-- **Sector Breadth**: McClellan oscillator, A/D line
-- **Volume / Liquidity**: VWAP distance, volume shock
-- **Momentum / Trend Quality**: RSI, Choppiness, ADX/DI
+- **alpha_momentum**: Cross-sectional momentum, alpha vs SPY/sector benchmarks
+- **macro_credit_labor**: Credit spreads, labor market indicators (FRED)
+- **macro_intermarket**: Cross-asset correlations, intermarket signals
+- **trend_strength**: MA slopes, trend scores, MACD
+- **price_position**: Distance to MAs, position in range
+- **sector_breadth**: McClellan oscillator, A/D line
+- **momentum_quality**: RSI, Choppiness, ADX/DI
+- **range_breakout**: Range position, efficiency, breakouts
+- **volatility_regime**: VIX percentile, VIX zscore, vol regime state
+- **volume_shock**: Volume shock signals, price-volume divergences
+- **microstructure_position**: VWAP distance, overnight ratio
+- **volatility_state**: Bollinger width, squeeze intensity, realized vol zscore
+- **gap_dynamics**: Gap/ATR ratio, overnight return patterns
 
 ### HEAD_FEATURES (Model-Specific)
 
-Each model has additive head features that augment the core:
+Each model has additive head features that augment the core. Groups are split for hypothesis purity:
 
 #### LONG_NORMAL
 Focus: Impulse/transition/gap behavior, squeeze setups
-- Gap features: `overnight_ret`, `overnight_ratio`, `gap_fill_frac`
-- Candlestick: `lower_shadow_ratio`
-- Range: `range_efficiency`
-- Squeeze: `squeeze_release_20`, `squeeze_intensity_20`, `days_in_squeeze_20`
-- Trend quality: `adx_14`, `di_plus_14`
-- Volume: `pv_divergence_5d`
+
+**price_action** (candlestick geometry, VWAP position, divergences):
+- `lower_shadow_ratio`, `upper_shadow_ratio`
+- `vwap_dist_10d_zscore`
+- `w_rsi_price_div_20d`, `rsi_price_div_20d`
+
+**trend_cross_sectional** (trend slope, cross-sectional momentum):
+- `trend_score_slope`, `w_pct_slope_ma_50`
+- `w_xsec_mom_4w_z`, `atr_percent`
+
+**relative_strength** (extended with sector alpha):
+- Includes `w_alpha_mom_sector_60_ema10`
+
+**drawdown_recovery, macro_sector** (unchanged)
 
 #### LONG_PARABOLIC
 Focus: Persistence, continuation, extended momentum

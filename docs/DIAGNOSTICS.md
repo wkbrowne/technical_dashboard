@@ -37,9 +37,24 @@ All stages use consistent severity levels:
 
 | Severity | Meaning | Action |
 |----------|---------|--------|
-| **CRITICAL** / **ERROR** | Must fix before proceeding | Blocks pipeline / trading |
+| **CRITICAL** / **ERROR** / **FAIL** | Must fix before proceeding | Blocks pipeline / trading |
 | **WARN** | Should investigate | May affect quality |
 | **INFO** | Informational | No immediate action required |
+
+### Leakage Assessment Tier System
+
+The Combined Leakage Assessment uses a three-tier classification system:
+
+| Tier | Description | Example Triggers | Action |
+|------|-------------|------------------|--------|
+| **FAIL** | Deterministic violation that must be fixed | Provenance shows negative lookback; Raw price policy violation | Block training until resolved |
+| **WARN** | Requires review, may be acceptable | High shifted AUC with passing provenance; Elevated target autocorr | Review and document decision |
+| **INFO** | Expected behavior given target structure | Modest residual AUC explained by target overlap | No action required |
+
+**Key Principle:** The shift test is a heuristic, not proof. Provenance checks are deterministic. Always interpret shift test results in context of:
+1. Provenance check results (did any feature use future data?)
+2. Target autocorrelation (is regime persistence expected?)
+3. Target window overlap (~16 days for normal, ~12 days for parabolic)
 
 ---
 
@@ -68,7 +83,118 @@ python run_data_quality.py --verbose
 | **EXPANSION_CANDIDATES coverage** | Validates optional feature pool | Check specific modules |
 | **Category NaN rates** | Groups features by type (trend, volatility, macro) | Investigate specific category |
 | **Infinite values** | Detects data corruption | Fix division-by-zero in feature code |
+| **Feature value ranges** | Validates bounded features (RSI, position in range) | Check indicator computation |
+| **Raw price policy** | Validates no adjusted price columns in features | Remove adjusted price leakage |
+| **Feature provenance** | Validates lookback windows for leakage | Fix feature computation timing |
+| **Shift test (leakage)** | Detects statistical data leakage | Review feature computation |
+| **Lag cluster analysis** | Identifies features with excessive lookback | Consider shorter windows |
 | **Targets validation** | Checks target file for anomalies | Re-run target generation |
+
+#### Raw Price Policy Check
+
+Validates that the feature frame only contains raw-price-derived features.
+
+**POLICY**: Raw prices for features, adjusted prices for targets
+- Feature computation uses RAW OHLC (unadjusted close, high, low, open)
+- Adjusted prices are only permitted for target generation and PnL/backtest
+- This ensures point-in-time correctness for features
+
+| Check | Condition | Severity |
+|-------|-----------|----------|
+| Adjusted columns | Column name matches `adj*`, `adjusted*`, `*_adj`, `split_factor`, etc. | CRITICAL |
+| Suspicious names | Column contains `adj`, `split`, `dividend` | INFO |
+
+**Interpretation:**
+
+| Result | Meaning | Action |
+|--------|---------|--------|
+| PASS | No adjusted price columns in feature frame | Features use raw prices correctly |
+| FAIL | Adjusted price columns detected | Remove from feature output or fix computation |
+| INFO (suspicious) | Column names suggest adjustment | Manual review recommended |
+
+**Note on splits in features**: Splits within rolling windows are acceptable and expected when using raw OHLC data. A 14-day RSI computed on raw prices will correctly reflect the price momentum as observed at time t. This is NOT a problem - it's the correct behavior.
+
+#### Feature–Target Temporal Alignment (Provenance)
+
+Provenance validation provides **deterministic** leakage detection by tracking the maximum source date of raw data used to compute each feature. This complements the statistical shift test.
+
+**Source:** `artifacts/feature_provenance.json`
+
+**Trade Timing Semantics:**
+- Feature at row t uses data through end-of-day t
+- Trade entry occurs at t+1
+- Targets are defined relative to entry at t+1
+
+| Check | Condition | Severity |
+|-------|-----------|----------|
+| Hard leakage | `effective_lookback_days < 0` | CRITICAL |
+| Target overlap | `feature_max_source_date >= entry_date (t+1)` | WARNING |
+| Zero lookback | `effective_lookback = 0` and no publication lag | INFO |
+
+**Interpretation:**
+
+| Result | Meaning | Action |
+|--------|---------|--------|
+| All lookbacks positive | Features only use past data | PASS |
+| Negative lookback | Feature uses future data | Fix feature computation |
+| Missing provenance | Features not in registry | Add to `src/features/provenance.py` |
+
+**Example output:**
+```
+========================================
+FEATURE PROVENANCE (Leakage Prevention)
+========================================
+   Features tracked: 312
+   Daily: 180, Weekly: 132
+   Lookback range: 5-376 days
+   With publication lag: 24
+
+   Hard leakage check: PASS (no negative lookbacks)
+   Features not in registry: 15 [INFO]
+```
+
+**Key benefits over shift test:**
+- **Deterministic**: Same inputs always produce same result (no randomness)
+- **Immediate**: Catches issues at pipeline time, not after training
+- **Explanatory**: Identifies exactly which features have issues
+- **Efficient**: No model training required
+
+#### Shift Test for Leakage Detection (Context-Aware)
+
+The shift test is a **heuristic signal**, not proof of leakage. Results must be interpreted relative to:
+- Target autocorrelation (regime persistence)
+- Overlap in label windows (consecutive targets share future price info)
+- Provenance check results (deterministic validation)
+
+**Procedure:**
+1. Train LightGBM with default hyperparameters → record AUC
+2. Shift all features forward by 1 bar within each symbol (features[t] → features[t+1])
+3. Retrain with same settings → record AUC
+4. Combine with provenance and autocorrelation results for final assessment
+
+**Context-Aware Interpretation Rules:**
+
+| Condition | Tier | Interpretation |
+|-----------|------|----------------|
+| Shifted AUC > 0.65 AND provenance violations | **FAIL** | Strong evidence of leakage |
+| AUC drop > 0.10 AND provenance passes | **INFO** | Regime persistence, not leakage |
+| Shifted AUC 0.53-0.60 with high target autocorr | **INFO** | Expected with overlapping targets |
+| Shifted AUC > 0.60 but provenance passes | **WARN** | Review required |
+| AUC drop < 0.02 | **WARN/FAIL** | Unusual, investigate |
+
+**Why modest residual AUC is expected:**
+
+Triple barrier targets have ~15-20 day horizons with ~80% overlap between consecutive days. This means:
+- Features at t and t+1 both predict targets that share most of the same future price window
+- A 1-day shift doesn't break the relationship as strongly as with non-overlapping targets
+- Target autocorrelation of 0.2-0.4 is normal and explains residual predictive power
+
+**Engineering Judgment:**
+
+The shift test now outputs a combined assessment with:
+- Individual check tiers (FAIL/WARN/INFO)
+- Contributing factors (autocorrelation, overlap days, provenance violations)
+- Final recommendation (BLOCK/REVIEW/PROCEED)
 
 ### Output
 
@@ -91,6 +217,65 @@ DATA QUALITY REPORT
 BASE_FEATURES V2 VALIDATION (~49 curated core features)
 ========================================
    Coverage: 49/49 (100.0%) [PASS]
+
+========================================
+FEATURE VALUE RANGE VALIDATION
+========================================
+   Features checked: 15
+   Range violations: 0 [PASS]
+   All bounded features are within expected ranges.
+
+========================================
+SHIFT TEST FOR LEAKAGE
+========================================
+   Target: hit_long_normal
+   Samples: 100,000, Features: 199
+
+   AUC (normal):  0.5834
+   AUC (shifted): 0.5412
+   AUC drop:      +0.0422
+
+   Context-Aware Interpretation [INFO]:
+   ------------------------------------------------------------
+   Shift test shows expected behavior. AUC dropped by 0.042 after
+   shifting, and provenance checks pass. The shifted AUC (0.541)
+   reflects regime persistence, not leakage. Target autocorrelation
+   is 0.28.
+
+   Contributing Factors:
+   - Target autocorrelation: 0.280
+   - Target persistence: 64.2% same as previous
+   - Target window overlap: ~16 days
+
+   Recommended Action: No action required - this is expected behavior
+
+================================================================================
+COMBINED LEAKAGE ASSESSMENT
+================================================================================
+
+   Overall Assessment: INFO - PROCEED
+   ----------------------------------------------------------------------
+
+   Check Results:
+   [i] provenance           [INFO]
+       All features have valid lookback (no future data usage)
+   [i] raw_price_policy     [INFO]
+       Features use raw OHLC only (policy compliant)
+   [i] shift_test           [INFO]
+       Shift test shows expected behavior. AUC dropped by 0.042 after shi
+   [i] target_autocorr      [INFO]
+       Acceptable target persistence: autocorr=0.28
+
+   Evidence Summary:
+   All leakage checks pass or show expected behavior. No evidence of
+   problematic future data usage.
+
+   ======================================================================
+   ENGINEERING JUDGMENT
+   ======================================================================
+   PROCEED: All checks pass or show expected behavior. The feature set
+   appears clean for model training. Standard temporal cross-validation
+   practices are recommended.
 
 ========================================
 FEATURES SUMMARY
@@ -578,6 +763,15 @@ src/diagnostics/sizing/
 | High pruning rate | Search space too aggressive | Adjust hyperopt bounds |
 | Label leakage detected | Feature uses future data | Audit feature computation for lookahead |
 | Low ESS | Overlap weighting too aggressive | Review weight_final computation |
+| Shift test: FAIL tier | Provenance violations + high shifted AUC | Fix provenance violations first, then re-evaluate |
+| Shift test: WARN tier | Elevated shifted AUC, provenance passes | Review context: if autocorr high, may be acceptable |
+| Shift test: INFO tier | Modest residual AUC with high autocorr | Expected behavior, document and proceed |
+| Provenance: Missing file | Pipeline didn't save provenance | Re-run `python -m src.cli.compute` |
+| Provenance: Hard leakage | Negative effective lookback | Fix feature to only use past data |
+| Provenance: Missing features | Features not in registry | Add entries to `src/features/provenance.py` |
+| Combined Assessment: BLOCK | One or more FAIL tier checks | Must fix before training |
+| Combined Assessment: REVIEW | One or more WARN tier checks | Investigate, document decision |
+| Combined Assessment: PROCEED | All checks INFO tier | Safe to proceed with training |
 
 ### When to Re-run Diagnostics
 

@@ -1,6 +1,6 @@
 # Feature Selection Architecture
 
-This document describes the feature selection methodology for the technical dashboard ML pipeline. The system is specifically designed for financial time-series with noisy labels from triple barrier targets.
+This document describes the **group-first feature selection** methodology for the technical dashboard ML pipeline. The system is specifically designed for financial time-series with noisy labels from triple barrier targets.
 
 ---
 
@@ -19,11 +19,27 @@ Financial prediction poses unique challenges for feature selection:
 
 | Principle | Implementation |
 |-----------|----------------|
+| **Group-First Selection** | Entire hypothesis groups are the atomic unit of selection |
 | **Inverse Overlap Weighting** | Down-weight correlated samples via `n_overlapping_trajs` |
 | **Over-Regularization** | Choose slightly sub-optimal but robust feature sets |
-| **Thematic Grouping** | Pairs/triples represent meaningful combinations |
-| **Multi-Stage Filtering** | Loose recall then strict precision |
-| **Best-of-Any-Stage** | Return best subset seen at any pipeline stage |
+| **Deterministic Selection** | No randomness in swaps or selection order |
+| **Baseline Demotion Mode** | Optional removal of baseline groups during backward elimination |
+
+### 1.3 Group-First vs Singleton Selection
+
+**Why Group-First?**
+
+Singleton selection (adding/removing individual features) has several drawbacks:
+- Features within a hypothesis group are often correlated
+- Adding one feature from a group may prevent related features from being selected
+- Results are sensitive to feature ordering
+- Difficult to interpret which "stories" the model relies on
+
+**Group-First Benefits:**
+- Each group represents a coherent hypothesis (e.g., "volatility regime", "momentum quality")
+- Selection is more stable and interpretable
+- Easier to reason about which market dynamics the model captures
+- Natural regularization through group-level decisions
 
 ---
 
@@ -304,110 +320,317 @@ The pipeline tracks multiple metrics for comprehensive evaluation:
 
 ---
 
-## 4. Feature Selection Pipeline
+## 4. Group Structure
 
-### 4.1 Pipeline Overview
+### 4.1 Group Categories
 
-The **Loose-Then-Tight Pipeline** implements "high recall early, high precision later":
+Groups are organized into four categories defined in `src/feature_selection/base_features.py`:
+
+| Category | Description | Example Groups |
+|----------|-------------|----------------|
+| **CORE_GROUPS** | Global baseline groups (always included) | `alpha_momentum`, `volatility_regime`, `volatility_state`, `gap_dynamics` |
+| **HEAD_GROUPS** | Per-model baseline groups (model-specific) | `price_action`, `trend_cross_sectional`, `relative_strength` |
+| **CANDIDATE_GROUPS** | Groups available for forward selection | `atr_breakout`, `volume_liquidity`, `weekly_momentum` |
+| **INTERACTION_TEMPLATES** | Template-based group interactions | `momentum_x_vol_gate`, `gap_x_vol_state` |
+
+### 4.2 Group Design Rules
+
+Each group must follow these design rules:
+- **Size**: 3-12 features per group (validated at startup)
+- **Coherence**: One hypothesis per group (features should tell a coherent story)
+- **Independence**: Minimal overlap between groups
+
+### 4.3 Mandatory Group Splits
+
+Certain feature domains are split into multiple groups:
+
+**Drawdown/Recovery (4 groups):**
+- `drawdown_depth`: How far price has fallen from highs
+- `drawdown_duration`: Time-based drawdown metrics
+- `recovery_momentum`: Recovery strength after drawdowns
+- `bounce_quality`: Quality of bounce from lows
+
+**Volume/Liquidity (3 groups):**
+- `volume_surge`: Abnormal volume patterns
+- `volume_trend`: Volume moving averages and trends
+- `liquidity_stress`: Bid-ask spread, impact measures
+
+**Macro FRED (3 groups):**
+- `macro_credit_labor`: Credit spreads and labor market
+- `macro_intermarket`: Cross-asset correlations
+- `macro_rates_curve`: Yield curve dynamics
+
+---
+
+## 5. Group-First Selection Pipeline
+
+### 5.1 Pipeline Overview
+
+The **Group-First Pipeline** implements selection at the group level:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    LOOSE-THEN-TIGHT PIPELINE                         │
+│                    GROUP-FIRST SELECTION PIPELINE                    │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  STEP 1: Start with BASE_FEATURES (seed, not forced)                │
-│          - 36 curated features from base_features.py                │
+│  STEP 1: Start with Baseline Groups                                 │
+│          - CORE_GROUPS (global) + HEAD_GROUPS[model_key]            │
+│          - Evaluate baseline metric                                  │
 │                                                                      │
-│  STEP 1b: Optional Base Feature Elimination (quick prune)           │
-│           - Remove base features that don't contribute              │
+│  STEP 2: Grouped Forward Selection                                  │
+│          - Add CANDIDATE_GROUPS if improvement > epsilon_add        │
+│          - Entire group is added or rejected (atomic)               │
 │                                                                      │
-│  STEP 2: Loose Forward Selection (HIGH RECALL)                      │
-│          - Add features under lenient criteria                      │
-│          - Goal: capture all potentially useful features            │
+│  STEP 3: Enhanced Local Search (Swaps/Add/Drop)                     │
+│          - Move types: swap, add, drop                              │
+│          - Deterministic hill-climbing with caching                 │
+│          - Optional tabu to avoid cycling                           │
 │                                                                      │
-│  STEP 3: Strict Backward Elimination (HIGH PRECISION)               │
-│          - Remove features aggressively                             │
-│          - Base features NOT protected                              │
+│  STEP 4: Group Backward Elimination                                 │
+│          - Remove groups if loss < epsilon_remove                   │
+│          - Optional: allow_baseline_demotions to remove baseline    │
 │                                                                      │
-│  STEP 4: Light Interaction Pass (targeted)                          │
-│          - Pairs of top importance features                         │
-│          - Stricter threshold than forward selection                │
+│  STEP 5: Template-Based Interaction Selection                       │
+│          - Evaluate INTERACTION_TEMPLATES (group-to-group)          │
+│          - Only eligible if both parent groups selected             │
+│          - Max 3 interaction groups by default                      │
 │                                                                      │
-│  STEP 5: Hill Climbing / Swapping (local optimization)              │
-│          - Swap borderline features with outside candidates         │
-│                                                                      │
-│  STEP 6: Final Cleanup Pass (stability)                             │
-│          - One last backward elimination                            │
-│                                                                      │
-│  STEP 7: Best Subset Selection                                      │
-│          - Return best subset from ANY stage                        │
+│  RESULT: Final selected groups with per-group metrics               │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 Acceptance Criteria
+### 5.2 Variance-Adjusted Acceptance Criteria
 
-**Loose Forward Selection (Step 2):**
-Accept feature if ANY of:
-- Mean CV metric improves by `epsilon_add_loose` (default: 0.0002)
-- Median CV metric improves
-- Feature improves in `min_fold_improvement_ratio` of folds (default: 60%)
+All selection phases use **variance-adjusted acceptance** to reduce false positives from noisy fold-level metrics. A move is accepted if and only if:
 
-**Strict Backward Elimination (Steps 3, 6):**
-Remove feature if:
-- Removal improves the metric, OR
-- Removal doesn't worsen metric beyond `epsilon_remove_strict` (default: 0.0)
+```
+Δ_mean > max(epsilon, c × Δ_std)
+```
 
-**Hill Climbing / Swapping (Step 5):**
-Accept swap if:
-- New metric > old metric + `epsilon_swap` (default: 0.0005)
+Where:
+- **Δ_mean**: Mean improvement across folds = `mean(metric_after[i] - metric_before[i])`
+- **Δ_std**: Standard deviation of fold-level deltas (using sample std, ddof=1)
+- **epsilon**: Base threshold (e.g., `epsilon_add = 0.002`)
+- **c = 0.5**: Fixed noise floor multiplier (not configurable)
 
-### 4.3 Over-Regularization Strategy
+**Why Variance-Adjusted?**
 
-We intentionally choose slightly sub-optimal but robust feature sets:
+Simple threshold checks (`delta >= epsilon`) are susceptible to selection bias:
+- With 5 folds and many candidate groups, random variation can exceed epsilon
+- This leads to optimistically biased CV metrics that don't generalize
+- Variance-adjusted acceptance requires the improvement to exceed the noise floor
+
+**Example:**
+```
+Evaluating group 'momentum_quality':
+  Δ_mean = 0.0035 (improvement)
+  Δ_std  = 0.0080 (high variance across folds)
+  threshold = max(0.002, 0.5 × 0.0080) = 0.004
+
+  Result: REJECTED (0.0035 <= 0.004)
+  Reason: Improvement is not statistically meaningful given fold variance
+```
+
+**Grouped Forward Selection (Step 2):**
+Accept group if:
+- `Δ_mean > max(epsilon_add, 0.5 × Δ_std)` (default epsilon: 0.002)
+- The entire group is added atomically
+
+**Enhanced Local Search (Step 3):**
+Supports three move types in a deterministic hill-climbing loop:
+- **swap**: Remove group g, add group h if `Δ_mean > max(epsilon_swap, 0.5 × Δ_std)`
+- **add**: Add group h if `Δ_mean > max(epsilon_add, 0.5 × Δ_std)`
+- **drop**: Remove group g if `Δ_mean > max(epsilon_drop, 0.5 × Δ_std)`
+
+Features:
+- **Caching**: Evaluation results cached to avoid redundant CV calls
+- **Tabu** (optional): Prevents cycling by forbidding recent moves
+- **Deterministic**: No randomness, reproducible results
+- **Variance-Adjusted**: All moves use fold-level variance for acceptance
+
+**Group Backward Elimination (Step 4):**
+Remove group if:
+- `Δ_mean >= -max(epsilon_remove, 0.5 × Δ_std)` (loss within acceptable variance)
+- If `allow_baseline_demotions=True`, baseline groups can also be removed
+
+**Template-Based Interactions (Step 5):**
+- Templates define group-to-group interactions (not feature×feature)
+- A template is **eligible** only if both parent groups are selected
+- Add up to `max_interaction_groups` (default: 3) interaction groups
+- Uses `epsilon_add_interaction` (default: 0.0015) with variance-adjusted check
+
+### 5.3 Holdout Evaluation
+
+To detect selection bias, the pipeline supports temporal holdout evaluation:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    HOLDOUT EVALUATION                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Full Dataset:  |──────────────────────────────────────────────|    │
+│                                                                      │
+│  Train (95%):   |─────────────────────────────────────────|         │
+│                 ^                                         ^          │
+│                 │  CV folds for feature selection         │          │
+│                                                                      │
+│  Holdout (5%):                                          |────|       │
+│                                                          ^    ^      │
+│                                                          │    │      │
+│                              Unbiased evaluation ────────┘    │      │
+│                                                               │      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**CLI Usage:**
+```bash
+# Default: 5% holdout
+python run_group_selection.py --model long_normal --holdout-pct 0.05
+
+# Disable holdout (not recommended)
+python run_group_selection.py --model long_normal --holdout-pct 0
+```
+
+**Interpreting Results:**
+```
+CV AUC:      0.8850
+Holdout AUC: 0.8500
+Gap:         +0.0350
+```
+
+| CV-Holdout Gap | Interpretation |
+|----------------|----------------|
+| < 0.05 | ✅ OK - Selection appears robust |
+| 0.05 - 0.10 | ⚠️ NOTICE - Some selection bias present |
+| > 0.10 | ❌ WARNING - Significant selection bias, investigate feature choices |
+
+**Why Holdout Matters:**
+- CV metrics are optimistically biased because features were selected to maximize them
+- Holdout data was never seen during selection (neither train nor test folds)
+- The gap between CV and holdout AUC reveals the degree of selection bias
+
+### 5.4 Configuration
+
+```python
+@dataclass
+class GroupSelectionConfig:
+    # Thresholds
+    epsilon_add: float = 0.002               # Min improvement to add
+    epsilon_swap: float = 0.001              # Min improvement for swaps
+    epsilon_remove: float = 0.001            # Max loss to remove
+    epsilon_drop: float = 0.0005             # Min improvement for drop moves
+    epsilon_add_interaction: float = 0.0015  # Min improvement for interactions
+
+    # Group constraints
+    allow_baseline_demotions: bool = False
+    max_groups: int = 20
+    max_interaction_groups: int = 3
+
+    # Enhanced local search
+    enable_add_drop_moves: bool = True       # Enable add/drop moves
+    max_search_iterations: int = 50          # Max iterations
+
+    # Tabu mechanism (optional)
+    enable_tabu: bool = False                # Enable tabu list
+    tabu_tenure: int = 5                     # Iterations to keep moves tabu
+    tabu_aspiration_delta: float = 0.005     # Override tabu threshold
+
+    # Caching
+    enable_caching: bool = True              # Cache evaluation results
+
+    verbose: bool = True
+```
+
+### 5.5 Over-Regularization Strategy
+
+We intentionally choose slightly sub-optimal but robust group sets:
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `epsilon_remove_strict` | 0.0 | Remove if doesn't hurt at all |
-| `epsilon_swap` | 0.0005 | Small improvement required for swap |
-| `max_features_loose` | 80 | Cap on features after loose FS |
-| Model L1/L2 | 0.1/0.1 | Regularization in LightGBM |
+| `epsilon_add` | 0.002 | Substantial improvement needed to add |
+| `epsilon_swap` | 0.001 | Meaningful improvement for swaps |
+| `epsilon_remove` | 0.001 | Only keep groups that clearly help |
+| `max_groups` | 20 | Limit total model complexity |
 
 **Why over-regularize?**
-- Features that barely improve CV may not generalize
-- Financial regimes change - robust features preferred
-- Simpler models are easier to interpret and maintain
+- Groups that barely improve CV may not generalize
+- Financial regimes change - robust groups preferred
+- Fewer groups = more interpretable model
 
 ---
 
-## 5. BASE_FEATURES Starting Point
+## 6. Group Definitions
 
-### 5.1 Curated Feature Set
+### 6.1 CORE_GROUPS (Global Baseline)
 
-The selection starts from `BASE_FEATURES` in `src/feature_selection/base_features.py`:
+CORE_GROUPS are included for all models and represent universally predictive signals:
 
-| Category | Features | Description |
-|----------|----------|-------------|
-| **Trend/Momentum** | `rsi_14`, `w_macd_histogram`, `trend_score_sign`, `trend_score_slope` | Direction and strength |
-| **Trend Slopes** | `pct_slope_ma_20`, `pct_slope_ma_100`, `w_pct_slope_ma_50` | Multi-timeframe trend |
-| **Price Position** | `pct_dist_ma_20_z`, `pct_dist_ma_50_z`, `relative_dist_20_50_z`, `pos_in_20d_range`, `vwap_dist_20d_zscore` | Mean reversion signals |
-| **Volatility** | `atr_percent`, `vol_regime_ema10`, `rv_z_60`, `vix_zscore_60d`, `w_vix_vxn_spread` | Regime detection |
-| **Relative Performance** | `alpha_mom_spy_20_ema10`, `alpha_mom_sector_20_ema10`, `w_alpha_mom_spy_20_ema10`, `rel_strength_sector`, `xsec_mom_20d_z`, `w_xsec_mom_4w_z` | Stock vs market/sector |
-| **Sector Breadth** | `sector_breadth_pct_above_ma200`, `sector_breadth_mcclellan_osc` | Market structure |
-| **Liquidity** | `upper_shadow_ratio`, `w_volshock_ema` | Selling pressure |
-| **Macro** | `copper_gold_zscore`, `gold_spy_ratio_zscore`, `w_equity_bond_corr_60d`, `w_fred_bamlh0a0hym2_z60`, `fred_dgs2_chg20d`, `fred_ccsa_z52w` | Economic regime |
+```python
+CORE_GROUPS = {
+    "alpha_momentum": [...],        # Alpha vs SPY/sector
+    "macro_credit_labor": [...],    # Credit spreads + labor market
+    "macro_intermarket": [...],     # Cross-asset correlations
+    "trend_strength": [...],        # Trend direction signals
+    "price_position": [...],        # Mean reversion signals
+    "sector_breadth": [...],        # Market breadth
+    "momentum_quality": [...],      # Momentum validation
+    "range_breakout": [...],        # Range position
+    # Refactored from market_regime (split for hypothesis purity):
+    "volatility_regime": [...],     # VIX percentile, zscore, vol regime
+    "volume_shock": [...],          # Volume shocks, divergences
+    "microstructure_position": [...], # VWAP distance, overnight ratio
+    # Refactored from volatility_squeeze (split for hypothesis purity):
+    "volatility_state": [...],      # BB width, squeeze intensity, RV zscore
+    "gap_dynamics": [...],          # Gap/ATR ratio, overnight return (LAGGED 1 day)
+}
+```
 
-### 5.2 Expansion Candidates
+**Note on Gap Features:** All gap-related features (`gap_atr_ratio`, `gap_atr_ratio_raw`, `overnight_ret`, `gap_fill_frac`, `overnight_ratio`) are **lagged by 1 day** to prevent data leakage. When predicting day T returns, these features reflect the gap behavior from day T-1, not day T. This prevents using today's open price (which is part of today's trading activity) as a predictor.
 
-`EXPANSION_CANDIDATES` provides ~200 additional features organized by domain for forward selection experiments.
+### 6.2 HEAD_GROUPS (Per-Model Baseline)
 
-### 5.3 Excluded Features
+HEAD_GROUPS are model-specific baseline features:
 
-`EXCLUDED_FEATURES` lists raw/unnormalized values not suitable for ML:
-- Raw OHLCV prices
-- Raw moving averages
-- Raw ATR, VIX levels
-- Raw FRED series values
+```python
+HEAD_GROUPS = {
+    ModelKey.LONG_NORMAL: {
+        "drawdown_recovery": [...],      # Drawdown and recovery
+        "relative_strength": [...],      # Relative performance (extended)
+        "macro_sector": [...],           # Macro + sector signals
+        # Refactored from price_momentum (split for hypothesis purity):
+        "price_action": [...],           # Candlestick patterns, VWAP, RSI divergence
+        "trend_cross_sectional": [...],  # Trend slope, MA slope, cross-sectional momentum
+    },
+    ModelKey.SHORT_NORMAL: {
+        "breakdown_signals": [...],      # Breakdown detection
+        "reversal_risk": [...],          # Reversal indicators
+        ...
+    },
+    # ... other models
+}
+```
+
+### 6.3 CANDIDATE_GROUPS
+
+Groups available for forward selection from EXPANSION_CANDIDATES.
+
+### 6.4 INTERACTION_GROUPS
+
+Curated interaction feature groups (not generated pairwise):
+
+```python
+INTERACTION_GROUPS = {
+    "momentum_vol_gate": [         # Momentum gated by volatility
+        "interact_rsi_vol_regime",
+        "interact_macd_vix_z",
+    ],
+    "breadth_trend_confirm": [     # Breadth confirming trend
+        "interact_breadth_trend",
+    ],
+    ...
+}
+```
 
 ---
 
@@ -513,6 +736,99 @@ PATTERN_INTERACTION_TYPES = {
     ('squeeze', 'momentum'): [InteractionType.THRESHOLD, InteractionType.GATED],
     ('drawdown', 'momentum'): [InteractionType.THRESHOLD, InteractionType.GATED],
 }
+```
+
+### 6.5 Template-Based Interaction System
+
+The template-based interaction system replaces ad-hoc feature×feature interactions with
+**thematic group-to-group templates**. Each template represents a coherent economic
+hypothesis about how two feature groups interact.
+
+#### Template Structure
+
+```python
+INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "momentum_x_vol_gate": {
+        "parents": ("momentum_quality", "volatility_state"),  # volatility_state (was volatility_squeeze)
+        "type": "gate",  # or "signed_gate" or "product"
+        "base_features": ["rsi_14", "adx_14", "chop_14"],
+        "gate_features": ["squeeze_intensity_20", "rv_z_60"],
+        "description": "Momentum indicators gated by volatility state",
+    },
+    "gap_x_vol_state": {
+        "parents": ("gap_dynamics", "volatility_state"),
+        "type": "gate",
+        "base_features": ["gap_atr_ratio", "overnight_ret"],
+        "gate_features": ["squeeze_intensity_20", "bb_width_20_2"],
+        "description": "Gap dynamics gated by volatility state",
+    },
+    # ... more templates
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `parents` | Tuple of (group_A, group_B) from selection groups |
+| `type` | `"gate"`, `"signed_gate"`, or `"product"` |
+| `base_features` | Features from parent_A to use as signals |
+| `gate_features` | Features from parent_B to use as gates/modifiers |
+| `invert_gate` | (Optional) If True, invert gate logic |
+
+#### Interaction Types
+
+| Type | Formula | When to Use |
+|------|---------|-------------|
+| **gate** | `base × I(gate > median)` | Binary regime conditioning |
+| **signed_gate** | `base × sign(gate)` | Direction matters (bullish/bearish) |
+| **product** | `base × gate` | Multiplicative confirmation |
+
+#### Naming Convention
+
+Generated feature names follow a deterministic scheme:
+```
+ix__{template_name}__{base_feat}__gated__{gate_feat}   # for gate/signed_gate
+ix__{template_name}__{feat_a}__x__{feat_b}             # for product
+```
+
+Example: `ix__momentum_x_vol_gate__rsi_14__gated__vol_regime_ema10`
+
+#### Eligibility Rules
+
+A template is **eligible** for selection only when **both parent groups** are
+already in the selected feature set. This ensures:
+1. No orphan interactions (interactions without base signals)
+2. Interactions build on established relationships
+3. Selection remains interpretable
+
+#### Implemented Templates
+
+| Template | Parents | Type | Hypothesis |
+|----------|---------|------|------------|
+| `momentum_x_vol_gate` | momentum_quality × volatility_state | gate | Momentum reliable in specific vol states |
+| `trend_x_vol_gate` | trend_strength × volatility_state | signed_gate | Trends persist when vol is stable |
+| `breadth_x_trend_confirm` | sector_breadth × trend_strength | product | Breadth confirms trend quality |
+| `drawdown_x_breadth` | drawdown_level × breadth_motion | gate | Drawdown signals + breadth direction |
+| `alpha_x_macro_regime` | alpha_momentum × macro_credit_labor | signed_gate | Alpha reliable in stable macro |
+| `price_position_x_regime` | price_position × volatility_regime | gate | Mean reversion works in calm markets |
+| `breakout_x_squeeze` | range_breakout × volatility_state | product | Breakouts amplified by squeeze release |
+| `gap_x_vol_state` | gap_dynamics × volatility_state | gate | Gap behavior gated by volatility state |
+| `microstructure_x_volume` | microstructure_position × volume_shock | product | VWAP/microstructure × volume shocks |
+| `vol_regime_x_momentum` | volatility_regime × momentum_quality | signed_gate | Vol regime conditions momentum signals |
+
+#### Example Output
+
+```python
+# Template: momentum_x_vol_gate
+# Parents: momentum_quality, volatility_state
+# Generated features (6 = 3 base × 2 gates):
+[
+    "ix__momentum_x_vol_gate__rsi_14__gated__squeeze_intensity_20",
+    "ix__momentum_x_vol_gate__rsi_14__gated__rv_z_60",
+    "ix__momentum_x_vol_gate__adx_14__gated__squeeze_intensity_20",
+    "ix__momentum_x_vol_gate__adx_14__gated__rv_z_60",
+    "ix__momentum_x_vol_gate__chop_14__gated__squeeze_intensity_20",
+    "ix__momentum_x_vol_gate__chop_14__gated__rv_z_60",
+]
 ```
 
 ### 6.5 Implementation in Pipeline
@@ -729,113 +1045,116 @@ python run_feature_selection.py --resume
 
 ---
 
-## 11. Running Feature Selection
+## 11. Running Group Selection
 
-### 11.1 Basic Usage
-
-```bash
-# Full pipeline with default settings
-python run_feature_selection.py --n-jobs 8 --n-folds 5
-
-# With base feature pruning
-python run_feature_selection.py --prune-base
-
-# Resume from checkpoint
-python run_feature_selection.py --resume
-```
-
-### 11.2 Stage Execution Modes
-
-The pipeline supports running specific stages independently for faster iteration:
+### 11.1 Basic Usage (Group-First)
 
 ```bash
-# Run only forward selection (steps 1-2)
-python run_feature_selection.py --forward-only
+# Run group selection for a single model
+python run_group_selection.py --model long_normal
 
-# Run only backward elimination (step 3)
-python run_feature_selection.py --backward-only
+# Run for all 4 models
+python run_group_selection.py --model all
 
-# Run only interaction pass (step 4)
-python run_feature_selection.py --interactions-only
+# Allow baseline group demotions during backward elimination
+python run_group_selection.py --model long_normal --allow-demotions
 
-# Run only swapping (step 5)
-python run_feature_selection.py --swapping-only
-
-# Skip interaction pass entirely
-python run_feature_selection.py --no-interactions
-
-# Skip swapping pass
-python run_feature_selection.py --no-swapping
+# Adjust selection thresholds
+python run_group_selection.py --model long_normal --epsilon-add 0.003 --epsilon-swap 0.002
 ```
 
-**Available Stage Modes:**
-
-| Mode | Flag | Description |
-|------|------|-------------|
-| `FULL` | (default) | Run all stages |
-| `FORWARD_ONLY` | `--forward-only` | Only forward selection (steps 1-2) |
-| `BACKWARD_ONLY` | `--backward-only` | Only backward elimination (step 3) |
-| `INTERACTIONS_ONLY` | `--interactions-only` | Only interaction pass (step 4) |
-| `SWAPPING_ONLY` | `--swapping-only` | Only swapping (step 5) |
-| `NO_INTERACTIONS` | `--no-interactions` | Skip interaction pass |
-| `NO_SWAPPING` | `--no-swapping` | Skip swapping pass |
-
-### 11.3 Interaction Configuration
-
-Configure the interaction search parameters:
-
-```bash
-# Control number of interactions to add
-python run_feature_selection.py --max-interactions 12
-
-# Control how many top features to consider for interactions
-python run_feature_selection.py --n-top-interactions 30
-
-# Specify interaction types (comma-separated)
-python run_feature_selection.py --interaction-types product,gated,ratio
-
-# Disable domain-guided filtering (explore all pairs)
-python run_feature_selection.py --no-domain-interactions
-```
-
-**Interaction Parameters:**
+### 11.2 CLI Options
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--max-interactions` | 8 | Maximum interaction features to add |
-| `--n-top-interactions` | 20 | Top N features considered for interaction pairs |
-| `--interaction-types` | `product` | Types: `product`, `gated`, `ratio`, `threshold` |
-| `--no-domain-interactions` | False | Disable domain pattern filtering |
+| `--model` | `long_normal` | Model: `long_normal`, `long_parabolic`, `short_normal`, `short_parabolic`, or `all` |
+| `--epsilon-add` | 0.002 | Minimum improvement to add a group |
+| `--epsilon-swap` | 0.001 | Minimum improvement for swaps |
+| `--allow-demotions` | False | Allow dropping baseline groups |
+| `--max-groups` | 20 | Maximum total groups to select |
+| `--max-symbols` | 5000 | Maximum symbols to use |
+| `--balanced` | False | Use class weights (scale_pos_weight) |
+| `--n-folds` | 5 | Number of CV folds |
+| `--holdout-pct` | 0.05 | Fraction of dates for holdout evaluation (0 to disable) |
+| `--n-jobs` | 4 | Number of parallel jobs for CV |
+| `--model-threads` | 1 | Threads per LightGBM model |
+| `--output-dir` | `artifacts/group_selection` | Output directory |
+| `--quiet` | False | Reduce verbosity |
 
-### 11.4 Programmatic Usage
+**K-of-N Feature Selection:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--disable-k-of-n` | False | Disable K-of-N selection (use all features per group) |
+| `--group-k` | 2 | Default K for K-of-N selection within groups |
+| `--epsilon-add-feature` | 0.0005 | Minimum improvement to add a feature within group |
+
+### 11.3 Programmatic Usage
 
 ```python
-from src.feature_selection.pipeline import LooseTightPipeline, LooseTightConfig, StageMode
-from src.feature_selection.config import ModelConfig, CVConfig
+from src.feature_selection import (
+    run_group_selection,
+    GroupSelectionConfig,
+    ModelConfig, ModelType, TaskType,
+    CVConfig, CVScheme,
+    MetricConfig, MetricType,
+    SearchConfig,
+)
+from src.config.model_keys import ModelKey
 
-# Configure pipeline with stage mode and interactions
-config = LooseTightConfig(
-    n_jobs=8,
-    epsilon_add_loose=0.0002,
-    epsilon_remove_strict=0.0,
-    max_features_loose=80,
-    run_interactions=True,
-    stage_mode=StageMode.FULL,  # or INTERACTIONS_ONLY, etc.
-    max_interactions=8,
-    n_top_features_for_interactions=20,
-    interaction_types=['product', 'gated'],
-    use_domain_interactions=True,
+# Configure model
+model_config = ModelConfig(
+    model_type=ModelType.LIGHTGBM,
+    task_type=TaskType.CLASSIFICATION,
+    params={'learning_rate': 0.03, 'max_depth': 5}
 )
 
-# Create and run pipeline
-pipeline = LooseTightPipeline(pipeline_config=config)
-pipeline.run(X, y, verbose=True)
+# Configure CV
+cv_config = CVConfig(
+    n_splits=5,
+    scheme=CVScheme.EXPANDING,
+    gap=5,
+    purge_window=2,
+)
 
-# Get results
-best_features = pipeline.get_best_features()
-best_metric = pipeline.get_best_metric()  # (mean, std)
-stage_summary = pipeline.get_stage_summary()
+# Configure metrics
+metric_config = MetricConfig(
+    primary_metric=MetricType.AUC,
+    secondary_metrics=[MetricType.LOG_LOSS],
+)
+
+# Configure group selection
+config = GroupSelectionConfig(
+    epsilon_add=0.002,
+    epsilon_swap=0.001,
+    epsilon_remove=0.001,
+    allow_baseline_demotions=False,
+    max_groups=20,
+    max_interaction_groups=3,
+)
+
+# Run selection
+result = run_group_selection(
+    X=X,
+    y=y,
+    model_key=ModelKey.LONG_NORMAL,
+    model_config=model_config,
+    cv_config=cv_config,
+    metric_config=metric_config,
+    search_config=SearchConfig(),
+    config=config,
+)
+
+# Access results
+print(f"Selected groups: {list(result.selected_groups.keys())}")
+print(f"Total features: {len(result.selected_features)}")
+print(f"Baseline AUC: {result.baseline_metric:.4f}")
+print(f"Final AUC: {result.final_metric:.4f}")
 ```
+
+### 11.4 Legacy Singleton Selection
+
+The legacy singleton-based selection (`run_feature_selection.py`) is still available for backwards compatibility but is deprecated in favor of group-first selection.
 
 ### 11.5 Using Sample Weights
 
@@ -926,15 +1245,17 @@ trend_score_sign
 
 | File | Purpose |
 |------|---------|
-| `src/feature_selection/pipeline.py` | Loose-Then-Tight pipeline implementation, `StageMode` enum |
-| `src/feature_selection/base_features.py` | BASE_FEATURES, EXPANSION_CANDIDATES, EXCLUDED_FEATURES |
-| `src/feature_selection/interactions.py` | DOMAIN_PATTERNS, InteractionType, interaction generation |
-| `src/feature_selection/config.py` | Configuration dataclasses |
-| `src/feature_selection/evaluation.py` | SubsetEvaluator for CV evaluation |
-| `src/feature_selection/algorithms.py` | Forward/backward/swap algorithms |
+| `src/feature_selection/base_features.py` | CORE_GROUPS, HEAD_GROUPS, CANDIDATE_GROUPS, INTERACTION_TEMPLATES |
+| `src/feature_selection/group_selection.py` | Group-first selection algorithms, `_variance_adjusted_acceptance()` |
+| `src/feature_selection/config.py` | Configuration dataclasses including GroupSelectionConfig |
+| `src/feature_selection/evaluation.py` | SubsetEvaluator for CV evaluation (returns `fold_metrics`) |
 | `src/feature_selection/cv.py` | Time-series CV with purging |
+| `src/feature_selection/pipeline.py` | Loose-Then-Tight pipeline (legacy) |
+| `src/feature_selection/algorithms.py` | Singleton forward/backward/swap (legacy) |
+| `src/feature_selection/interactions.py` | DOMAIN_PATTERNS, InteractionType |
 | `src/features/target_generation.py` | Triple barrier targets and weighting |
-| `run_feature_selection.py` | Main entry point script |
+| `run_group_selection.py` | Group-first selection entry point with holdout evaluation |
+| `run_feature_selection.py` | Singleton selection entry point (legacy) |
 
 ---
 

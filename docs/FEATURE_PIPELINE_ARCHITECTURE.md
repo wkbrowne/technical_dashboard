@@ -185,15 +185,79 @@ The pipeline automatically filters problematic securities at load time:
 | Min price | < $0.01 | Penny stock artifacts |
 | Price range ratio | max/min > 10,000x | Split adjustment issues |
 
-### 3.2 OHLC Adjustment
+### 3.2 Raw Prices for Features, Adjusted Prices for Targets
 
-Before feature computation, OHLC prices are adjusted to match adjclose:
+**POLICY**: Feature computation uses RAW OHLC, target generation uses ADJUSTED OHLC.
 
+#### Rationale
+
+| Component | Price Data | Rationale |
+|-----------|-----------|-----------|
+| **Features** | Raw OHLC | Point-in-time correctness: features reflect what was observable at market close on day t |
+| **Targets** | Adjusted OHLC | Economic correctness: returns/PnL must account for splits and dividends |
+| **Backtest PnL** | Adjusted prices | Economic correctness: realized returns need adjustment |
+
+**Why raw prices for features?**
+- Technical indicators should use prices as they were observed at the time
+- Retroactive adjustment of historical prices creates look-ahead bias
+- Splits within rolling windows are acceptable and expected behavior in raw data
+- Example: A 14-day RSI computed on raw prices reflects the actual price momentum observed at time t
+
+**Why adjusted prices for targets?**
+- Target generation (triple barrier) uses adjclose as entry price
+- Barrier checks (high/low) must be in the same price space as entry
+- Without adjustment: historical high may be 30%+ higher than adjclose due to splits
+- This causes barriers to trigger incorrectly
+
+#### Implementation
+
+**Feature computation (raw prices):**
 ```python
-df_adjusted = adjust_ohlc_to_adjclose(df)
+# In orchestrator.py - features use raw close
+out = compute_single_stock_features(
+    df,
+    price_col='close',  # Raw close for features
+    ret_col='ret',      # Returns still use adjclose for economic correctness
+)
 ```
 
-This ensures technical indicators use split/dividend-adjusted prices.
+**Target generation (adjusted prices):**
+```python
+# In _generate_triple_barrier_targets - targets use adjusted OHLC
+from src.features.ohlc_adjustment import adjust_ohlc_to_adjclose
+symbol_df = adjust_ohlc_to_adjclose(df[['adjclose', 'close', 'high', 'low', 'atr14']])
+```
+
+#### OHLC Adjustment (for targets only)
+
+The adjustment scales all OHLC prices by `(adjclose / close)` for each row:
+- For recent data: factor ≈ 1.0 (close ≈ adjclose, minimal change)
+- For historical data: factor < 1.0 (scale down to match adjclose)
+
+**Example problem (without adjustment for targets):**
+```
+AGG 2020-12-15:
+  close (unadjusted):  $136.61
+  adjclose:            $101.98
+  high (unadjusted):   $136.61
+
+Entry price = adjclose = $102
+Upper barrier = $102 + 2.43 * ATR = $102.59
+Check: high >= barrier → $136 >= $102.59 → TRUE (incorrectly triggers!)
+```
+
+**After adjustment:**
+```
+adjusted_high = high * (adjclose/close) = $136.61 * 0.746 = $101.9
+Check: adjusted_high >= barrier → $101.9 >= $102.59 → FALSE (correct!)
+```
+
+#### Data Quality Validation
+
+Run `python run_data_quality.py` to validate:
+1. No adjusted price columns in feature frame
+2. Column names don't suggest adjustment usage (adj, adjusted, split_factor, etc.)
+3. Features use only raw-price-derived indicators
 
 ### 3.3 Single-Stock Features
 
@@ -490,7 +554,7 @@ python -m src.cli.compute --list-checkpoints
 | `EXPANSION_CANDIDATES` | Features for selection experiments |
 | `RETIRED_FEATURES` | Tested but consistently not selected |
 | `INTERMEDIATE_FEATURES` | Required to compute kept features |
-| `META_COLUMNS` | Always kept: `symbol`, `date`, `ret` |
+| `META_COLUMNS` | Always kept: `symbol`, `date` |
 
 **Filtering:**
 
@@ -532,9 +596,113 @@ python -m src.cli.compute --timeframes D --max-stocks 50
 
 ---
 
-## 9. Related Documentation
+## 9. Temporal Provenance and Leakage Prevention
+
+### 9.1 Feature Max Source Date
+
+Every feature has provenance metadata tracking the maximum source date of any raw data used to compute it. This enables deterministic leakage detection without statistical tests.
+
+**Module:** `src/features/provenance.py`
+
+**Provenance Metadata:**
+
+| Field | Description |
+|-------|-------------|
+| `lookback_days` | Trading days of historical data used |
+| `publication_lag_days` | Days after data period before availability (FRED) |
+| `effective_lookback_days` | `lookback + publication_lag + (weekly * 5)` |
+| `timeframe` | `D` (daily) or `W` (weekly) |
+
+**Output:** `artifacts/feature_provenance.json`
+
+```json
+{
+  "rsi_14": {
+    "lookback_days": 14,
+    "publication_lag_days": 0,
+    "effective_lookback_days": 14,
+    "timeframe": "D"
+  },
+  "fred_ccsa_z52w": {
+    "lookback_days": 364,
+    "publication_lag_days": 12,
+    "effective_lookback_days": 376,
+    "timeframe": "D"
+  },
+  "w_macd_histogram": {
+    "lookback_days": 35,
+    "publication_lag_days": 0,
+    "effective_lookback_days": 175,
+    "timeframe": "W"
+  }
+}
+```
+
+### 9.2 Trade Timing Assumptions
+
+The pipeline enforces strict temporal semantics:
+
+| Component | Timing |
+|-----------|--------|
+| Feature at row t | Uses data through end-of-day t |
+| Entry | Occurs at t+1 (next trading day) |
+| Targets | Computed from entry forward |
+
+**Valid condition:** `feature_max_source_date <= row_date`
+
+### 9.3 Leakage Types
+
+| Type | Condition | Severity | Action |
+|------|-----------|----------|--------|
+| Hard leakage | `effective_lookback < 0` | CRITICAL | Pipeline fails |
+| Target overlap | `feature_max_source_date >= entry_date` | WARNING | Review feature |
+| Zero lookback | `effective_lookback = 0` | INFO | Verify timing |
+
+### 9.4 Provenance Registry
+
+All features declare their lookback windows in `src/features/provenance.py`:
+
+```python
+from src.features.provenance import FEATURE_PROVENANCE_REGISTRY
+
+# Get provenance for a feature
+prov = FEATURE_PROVENANCE_REGISTRY.get('rsi_14')
+print(f"RSI uses {prov.effective_lookback_days()} days of data")
+
+# Validate no leakage
+from src.features.provenance import validate_provenance, get_provenance_for_features
+provenance = get_provenance_for_features(['rsi_14', 'fred_ccsa_z52w'])
+critical, warnings = validate_provenance(provenance)
+```
+
+### 9.5 Weekly Feature Provenance
+
+Weekly features (computed Friday) merged to daily rows:
+
+**Example: `w_rsi_14` at daily row 2024-01-10 (Wednesday)**
+- Weekly value computed on Friday 2024-01-05
+- That value used 14 weeks of data: [2023-10-13, 2024-01-05]
+- `effective_lookback_days = 14 weeks × 5 days = 70 trading days`
+
+The weekly merge uses `direction='backward'` in `merge_asof`, so Friday's value is assigned to Mon-Fri of the NEXT week (no leakage from current week).
+
+### 9.6 FRED Publication Lag
+
+FRED data has known publication lags that prevent lookahead bias:
+
+| Series | Frequency | Publication Lag | Reason |
+|--------|-----------|-----------------|--------|
+| DGS10, DGS2 | Daily | 1 day | Available next morning |
+| BAMLH0A0HYM2 | Daily | 1 day | ICE BofA 1-day lag |
+| ICSA | Weekly | 5 days | Week ends Sat, released Thu |
+| CCSA | Weekly | 12 days | Extra week lag vs ICSA |
+
+---
+
+## 10. Related Documentation
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md) - High-level ML pipeline
 - [FEATURE_SELECTION.md](FEATURE_SELECTION.md) - Feature selection methodology
 - [TARGETS.md](TARGETS.md) - Triple barrier target details
 - [MODEL_FEATURIZATION.md](MODEL_FEATURIZATION.md) - Model-specific feature sets
+- [DIAGNOSTICS.md](DIAGNOSTICS.md) - Data quality checks and leakage detection
