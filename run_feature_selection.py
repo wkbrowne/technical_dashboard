@@ -135,8 +135,18 @@ def load_and_prepare_data(
     features = features[features['symbol'].isin(valid_symbols)].copy()
     targets = targets[targets['symbol'].isin(valid_symbols)].copy()
 
+    # Detect target column: new multi-target format uses hit_long_normal, old uses hit
+    if 'hit_long_normal' in targets.columns:
+        hit_col = 'hit_long_normal'
+        print(f"  Using multi-target format: {hit_col}")
+    elif 'hit' in targets.columns:
+        hit_col = 'hit'
+        print(f"  Using legacy target format: {hit_col}")
+    else:
+        raise KeyError("No target column found! Expected 'hit_long_normal' or 'hit'")
+
     # Merge - include weight_final only if available
-    target_cols = ['symbol', 'date', 'hit']
+    target_cols = ['symbol', 'date', hit_col]
     if has_weights:
         target_cols.append('weight_final')
 
@@ -151,14 +161,14 @@ def load_and_prepare_data(
     if binary_target:
         # Binary: upper barrier (1) vs lower barrier (0), exclude neutral
         # This gives cleaner signal - definitive outcomes only
-        merged = merged[merged['hit'] != 0].copy()
-        merged['target'] = (merged['hit'] == 1).astype(int)
+        merged = merged[merged[hit_col] != 0].copy()
+        merged['target'] = (merged[hit_col] == 1).astype(int)
         print(f"  Binary target (upper vs lower, excluding neutral): {merged.shape[0]} samples")
         print(f"    Positive (hit upper): {(merged['target'] == 1).sum()}")
         print(f"    Negative (hit lower): {(merged['target'] == 0).sum()}")
     else:
         # Multi-class: -1, 0, 1 -> 0, 1, 2
-        merged['target'] = merged['hit'] + 1
+        merged['target'] = merged[hit_col] + 1
 
     # Sort by date for time-series CV
     merged = merged.sort_values(['date', 'symbol']).reset_index(drop=True)

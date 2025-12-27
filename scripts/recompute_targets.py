@@ -177,6 +177,30 @@ def load_minimal_data(
 
     df, summary = validator.validate_input(df)
 
+    # Validate OHLC consistency - catches unadjusted high/low data
+    # This is critical: if high/low are not adjusted to match adjclose,
+    # triple barrier targets will be computed incorrectly
+    close_above_high = (df['close'] > df['high'] * 1.001).sum()  # 0.1% tolerance
+    close_below_low = (df['close'] < df['low'] * 0.999).sum()
+
+    if close_above_high > 0 or close_below_low > 0:
+        # Sample problematic rows for error message
+        invalid_mask = (df['close'] > df['high'] * 1.001) | (df['close'] < df['low'] * 0.999)
+        sample = df[invalid_mask][['symbol', 'date', 'close', 'high', 'low']].head(5)
+
+        raise ValueError(
+            f"OHLC data is inconsistent: {close_above_high} rows have close > high, "
+            f"{close_below_low} rows have close < low.\n\n"
+            "This typically means the input parquet file has UNADJUSTED high/low values.\n"
+            "The 'close' column (from adjclose) is split/dividend adjusted, but 'high'/'low' are not.\n\n"
+            "To fix this:\n"
+            "  1. Re-run the full feature pipeline: python -m src.cli.compute\n"
+            "     This applies OHLC adjustment before saving features_complete.parquet\n"
+            "  2. Then re-run this script on the new parquet file\n\n"
+            f"Sample invalid rows:\n{sample.to_string()}"
+        )
+
+    logger.info(f"OHLC consistency validated: close is between low and high for all rows")
     logger.info(f"Date range: {df['date'].min()} to {df['date'].max()}")
 
     return df

@@ -377,6 +377,7 @@ def run_feature_pipeline(
     full_output: bool = False,
     checkpoint_config: Optional['CheckpointConfig'] = None,
     exclude_retired: bool = False,
+    target_config_path: Optional[str] = None,
 ):
     """Run the feature computation pipeline.
 
@@ -393,6 +394,8 @@ def run_feature_pipeline(
             filter to curated feature set (~200 features)
         checkpoint_config: CheckpointConfig for staged checkpointing
         exclude_retired: If True, exclude retired features from output files
+        target_config_path: Path to barrier_calibration.json for custom target
+            thresholds. If None, uses hardcoded defaults from model_keys.py.
     """
     from src.config.features import FeatureConfig, Timeframe
     from src.config.parallel import ParallelConfig
@@ -542,6 +545,8 @@ def run_feature_pipeline(
             full_output=full_output,
             checkpoint_config=checkpoint_config,
             exclude_retired=exclude_retired,
+            target_config_path=target_config_path,
+            output_dir=output_dir,  # Save feature_provenance.json
         )
 
         # Save BOTH complete and filtered feature files
@@ -617,6 +622,9 @@ def run_feature_pipeline(
         print(f"  features_filtered.parquet:  {len(features_filtered.columns)} cols (ML-ready)")
         if targets_df is not None and not targets_df.empty:
             print(f"  targets_triple_barrier.parquet")
+        provenance_path = output_dir / "feature_provenance.json"
+        if provenance_path.exists():
+            print(f"  feature_provenance.json:    (provenance metadata)")
         print(f"Output directory:   {output_dir}")
         print(f"Total time:         {elapsed:.1f}s")
         print("=" * 50)
@@ -754,6 +762,15 @@ Examples:
         action="store_true",
         help="List available checkpoints and exit"
     )
+    # Target generation arguments
+    parser.add_argument(
+        "--target-config",
+        type=str,
+        default="auto",
+        help="Path to barrier_calibration.json for target thresholds. "
+             "'auto' (default) uses artifacts/targets/barrier_calibration.json if exists, "
+             "else hardcoded defaults. Use 'none' to force hardcoded defaults."
+    )
 
     args = parser.parse_args()
 
@@ -794,6 +811,23 @@ Examples:
             if args.resume_from:
                 logger.info(f"Resuming from: {args.resume_from}")
 
+    # Resolve target config path
+    target_config_path = None
+    if args.target_config == "auto":
+        default_calibration = Path(args.output) / "targets" / "barrier_calibration.json"
+        if default_calibration.exists():
+            target_config_path = str(default_calibration)
+            logger.info(f"Using calibrated target config: {target_config_path}")
+        else:
+            logger.info("No calibration file found, using hardcoded target defaults")
+    elif args.target_config.lower() != "none":
+        target_config_path = args.target_config
+        if not Path(target_config_path).exists():
+            logger.warning(f"Target config not found: {target_config_path}, using defaults")
+            target_config_path = None
+        else:
+            logger.info(f"Using target config: {target_config_path}")
+
     run_feature_pipeline(
         config_path=args.config,
         output_dir=Path(args.output),
@@ -806,6 +840,7 @@ Examples:
         full_output=args.full_output,
         checkpoint_config=checkpoint_config,
         exclude_retired=args.exclude_retired,
+        target_config_path=target_config_path,
     )
 
 

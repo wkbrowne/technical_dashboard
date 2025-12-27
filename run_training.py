@@ -217,10 +217,7 @@ def load_training_data(
         - sample_weight: Sample weights array (or None if disabled)
         - metadata: DataFrame with symbol, date, entry_px, etc.
     """
-    print("Loading features...")
-    features = pd.read_parquet('artifacts/features_complete.parquet')
-    print(f"  Features shape: {features.shape}")
-
+    # Determine target column first
     print("Loading targets...")
     targets = pd.read_parquet('artifacts/targets_triple_barrier.parquet')
     print(f"  Targets shape: {targets.shape}")
@@ -233,43 +230,59 @@ def load_training_data(
         'entry_px': 'entry_price'
     })
 
-    # Filter symbols with enough samples
-    symbol_counts = targets.groupby('symbol').size()
-    valid_symbols = symbol_counts[symbol_counts >= min_samples_per_symbol].index.tolist()
-
-    features = features[features['symbol'].isin(valid_symbols)].copy()
-    targets = targets[targets['symbol'].isin(valid_symbols)].copy()
-
-    # Determine which columns to merge from targets
-    base_cols = ['symbol', 'date', 'entry_price', 'target_price', 'stop_price']
-    target_cols = base_cols.copy()
-
     # Get the appropriate hit column for this model
     if model_key is not None:
         hit_col = get_model_target_column(model_key)
-        if hit_col in targets.columns:
-            target_cols.append(hit_col)
-            print(f"  Using model-specific target: {hit_col}")
-        else:
-            target_cols.append('hit')
+        if hit_col not in targets.columns:
             hit_col = 'hit'
             print(f"  Warning: {get_model_target_column(model_key)} not found, using 'hit'")
+        else:
+            print(f"  Using model-specific target: {hit_col}")
     else:
-        target_cols.append('hit')
         hit_col = 'hit'
 
+    # Filter symbols with enough samples (on targets - smaller than features)
+    symbol_counts = targets.groupby('symbol').size()
+    valid_symbols = set(symbol_counts[symbol_counts >= min_samples_per_symbol].index)
+    targets = targets[targets['symbol'].isin(valid_symbols)]
+    print(f"  Valid symbols: {len(valid_symbols)}")
+
+    # Determine which columns to load from features
+    # Only load what we need: symbol, date, and selected features
+    feature_cols_needed = ['symbol', 'date'] + list(selected_features)
+
+    print("Loading features (selected columns only)...")
+    # Check which columns actually exist in the parquet
+    import pyarrow.parquet as pq
+    pq_file = pq.ParquetFile('artifacts/features_complete.parquet')
+    available_cols = set(pq_file.schema.names)
+    cols_to_load = [c for c in feature_cols_needed if c in available_cols]
+    missing_features = set(selected_features) - available_cols
+    if missing_features:
+        print(f"  Warning: {len(missing_features)} features not in parquet: {list(missing_features)[:5]}...")
+
+    features = pd.read_parquet('artifacts/features_complete.parquet', columns=cols_to_load)
+    print(f"  Features shape: {features.shape}")
+
+    # Filter features to valid symbols (no .copy() needed - boolean indexing returns new df)
+    features = features[features['symbol'].isin(valid_symbols)]
+
+    # Determine which columns to merge from targets
+    base_cols = ['symbol', 'date', 'entry_price', 'target_price', 'stop_price']
+    target_cols = base_cols + [hit_col]
     if use_sample_weights and 'weight_final' in targets.columns:
         target_cols.append('weight_final')
 
-    # Merge features with targets
+    # Merge features with targets (inner join filters to matching rows)
     merged = features.merge(
         targets[target_cols],
         on=['symbol', 'date'],
         how='inner'
     )
+    del features, targets  # Free memory
 
     # Binary target (exclude neutral hit=0)
-    merged = merged[merged[hit_col] != 0].copy()
+    merged = merged[merged[hit_col] != 0]
 
     # For long models: upper barrier hit (1) = success
     # For short models: lower barrier hit (-1) = success
@@ -283,15 +296,11 @@ def load_training_data(
 
     # Check which selected features are available
     available_features = [f for f in selected_features if f in merged.columns]
-    missing = set(selected_features) - set(available_features)
-    if missing:
-        print(f"  Warning: {len(missing)} selected features not in data: {list(missing)[:5]}...")
-
     print(f"  Using {len(available_features)} features")
 
-    # Prepare output
-    X = merged[available_features].copy()
-    y = merged['target'].copy()
+    # Prepare output (use .values for numpy arrays to avoid DataFrame overhead)
+    X = merged[available_features]
+    y = merged['target']
 
     # Sample weights
     sample_weight = None
@@ -303,7 +312,7 @@ def load_training_data(
 
     # Metadata for later use
     metadata_cols = ['symbol', 'date', 'entry_price', 'target_price', 'stop_price', hit_col]
-    metadata = merged[metadata_cols].copy()
+    metadata = merged[metadata_cols]
     if hit_col != 'hit':
         metadata = metadata.rename(columns={hit_col: 'hit'})
 

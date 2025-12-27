@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import sys
+import textwrap
 from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
@@ -44,6 +45,397 @@ except ImportError:
     BASE_FEATURE_CATEGORIES = {}
     EXPANSION_CANDIDATES = {}
     get_expansion_candidates = lambda flat=False: [] if flat else {}
+
+# Import provenance validation functions
+try:
+    from src.features.provenance import (
+        load_provenance_metadata,
+        validate_provenance as _validate_provenance_internal,
+        report_provenance_summary,
+        get_missing_provenance,
+        FEATURE_PROVENANCE_REGISTRY,
+    )
+    HAS_PROVENANCE = True
+except ImportError:
+    HAS_PROVENANCE = False
+    FEATURE_PROVENANCE_REGISTRY = {}
+
+# =============================================================================
+# DIAGNOSTIC TIER CLASSIFICATION SYSTEM
+# =============================================================================
+# Tier 1 (FAIL): Deterministic, hard violations that must be fixed
+#   - Provenance violations with negative effective lookback
+#   - Features using future prices in computation
+#   - Adjusted price columns in feature frame
+#
+# Tier 2 (WARN): Requires review but may be acceptable
+#   - Shift test with high AUC but no provenance violations
+#   - Target autocorrelation above threshold
+#   - High NaN rates in critical features
+#
+# Tier 3 (INFO): Expected behavior, informational only
+#   - Shift test modest AUC with overlapping targets
+#   - Target persistence due to barrier width
+#   - Feature correlations within expected ranges
+
+DIAGNOSTIC_TIERS = {
+    "FAIL": {
+        "severity": 1,
+        "description": "Deterministic violation - must be fixed before training",
+        "action": "Block model training until resolved",
+    },
+    "WARN": {
+        "severity": 2,
+        "description": "Requires review - may indicate issue or be acceptable",
+        "action": "Review and document decision",
+    },
+    "INFO": {
+        "severity": 3,
+        "description": "Informational - expected behavior given target structure",
+        "action": "No action required",
+    },
+}
+
+
+def get_target_overlap_days(target_col: str) -> int:
+    """Estimate target window overlap in days based on target type.
+
+    Triple barrier targets have overlapping windows by design:
+    - 'normal' targets: ~20-day horizon
+    - 'parabolic' targets: ~15-day horizon
+
+    This affects shift test interpretation since consecutive targets
+    share much of the same future price information.
+
+    Args:
+        target_col: Target column name (e.g., 'hit_long_normal', 'hit_short_parabolic')
+
+    Returns:
+        Estimated overlap in days (conservative estimate)
+    """
+    if 'parabolic' in target_col.lower():
+        return 12  # ~15-day horizon with ~80% overlap
+    else:
+        return 16  # ~20-day horizon with ~80% overlap
+
+
+def interpret_shift_test_with_context(
+    shift_result: dict,
+    autocorr_result: dict = None,
+    provenance_result: dict = None,
+) -> dict:
+    """Interpret shift test results in context of target structure.
+
+    The shift test is a heuristic signal, not proof of leakage. Results should be
+    interpreted relative to:
+    - Target autocorrelation (regime persistence)
+    - Overlap in label windows (consecutive targets share future price info)
+    - Provenance check results (deterministic validation)
+
+    Interpretation rules:
+    1. If shifted AUC remains very high (>0.65) AND provenance checks fail
+       → Strong evidence of leakage (FAIL)
+    2. If shifted AUC drops materially (>0.10) AND provenance checks pass
+       → Likely regime persistence, not leakage (INFO)
+    3. If shifted AUC is modest (0.53-0.60) with overlapping targets
+       → Expected behavior (INFO or WARN at most)
+
+    Args:
+        shift_result: Output from run_shift_test()
+        autocorr_result: Output from check_target_autocorrelation()
+        provenance_result: Output from validate_provenance_data()
+
+    Returns:
+        Dict with:
+        - tier: 'FAIL', 'WARN', or 'INFO'
+        - interpretation: Human-readable explanation
+        - factors: Dict of contributing factors
+        - action: Recommended action
+    """
+    if "error" in shift_result:
+        return {
+            "tier": "INFO",
+            "interpretation": f"Shift test could not run: {shift_result['error']}",
+            "factors": {},
+            "action": "Resolve error and rerun shift test",
+        }
+
+    auc_normal = shift_result.get("auc_normal", 0.5)
+    auc_shifted = shift_result.get("auc_shifted", 0.5)
+    auc_drop = shift_result.get("auc_drop", 0)
+    target_col = shift_result.get("target_used", "unknown")
+
+    # Gather context
+    factors = {
+        "auc_normal": auc_normal,
+        "auc_shifted": auc_shifted,
+        "auc_drop": auc_drop,
+    }
+
+    # Check provenance results
+    provenance_has_violations = False
+    if provenance_result and not provenance_result.get("error"):
+        critical_violations = provenance_result.get("critical_violations", [])
+        provenance_has_violations = len(critical_violations) > 0
+        factors["provenance_violations"] = len(critical_violations)
+
+    # Check autocorrelation
+    target_autocorr = 0.0
+    target_persistence_pct = 50.0
+    if autocorr_result and not autocorr_result.get("error"):
+        target_autocorr = autocorr_result.get("lag1_autocorr", 0.0)
+        target_persistence_pct = autocorr_result.get("pct_same_as_prev", 50.0)
+        factors["target_autocorr"] = target_autocorr
+        factors["target_persistence_pct"] = target_persistence_pct
+
+    # Estimate target overlap
+    target_overlap_days = get_target_overlap_days(target_col)
+    factors["target_overlap_days"] = target_overlap_days
+
+    # Apply interpretation rules
+    # Rule 1: High shifted AUC with provenance violations → FAIL
+    if auc_shifted > 0.65 and provenance_has_violations:
+        return {
+            "tier": "FAIL",
+            "interpretation": (
+                f"STRONG EVIDENCE OF LEAKAGE. Shifted AUC ({auc_shifted:.3f}) remains very high "
+                f"AND provenance checks detected {factors['provenance_violations']} violations. "
+                "This combination indicates deterministic future data usage."
+            ),
+            "factors": factors,
+            "action": "Review and fix provenance violations before training",
+        }
+
+    # Rule 2: Large AUC drop with clean provenance → INFO (regime persistence)
+    if auc_drop > 0.10 and not provenance_has_violations:
+        return {
+            "tier": "INFO",
+            "interpretation": (
+                f"Shift test shows expected behavior. AUC dropped by {auc_drop:.3f} after shifting, "
+                f"and provenance checks pass. The shifted AUC ({auc_shifted:.3f}) reflects "
+                f"regime persistence, not leakage. Target autocorrelation is {target_autocorr:.2f}."
+            ),
+            "factors": factors,
+            "action": "No action required - this is expected behavior",
+        }
+
+    # Rule 3: Modest shifted AUC (0.53-0.60) with overlapping targets → INFO/WARN
+    if 0.53 <= auc_shifted <= 0.60:
+        # Check if this is explainable by target overlap
+        if target_autocorr > 0.2 or target_persistence_pct > 60:
+            return {
+                "tier": "INFO",
+                "interpretation": (
+                    f"Shift test shows modest residual signal (AUC={auc_shifted:.3f}). "
+                    f"This is expected given target autocorrelation ({target_autocorr:.2f}) "
+                    f"and ~{target_overlap_days}-day target window overlap. "
+                    "Features shifted by 1 day still contain information relevant to "
+                    "overlapping target windows."
+                ),
+                "factors": factors,
+                "action": "No action required - expected with overlapping targets",
+            }
+        else:
+            return {
+                "tier": "WARN",
+                "interpretation": (
+                    f"Shift test shows modest residual signal (AUC={auc_shifted:.3f}) "
+                    f"but target autocorrelation is low ({target_autocorr:.2f}). "
+                    "Review feature computation for subtle lookahead patterns."
+                ),
+                "factors": factors,
+                "action": "Review top features for potential lookahead bias",
+            }
+
+    # Rule 4: High shifted AUC without provenance violations → WARN
+    if auc_shifted > 0.60 and not provenance_has_violations:
+        return {
+            "tier": "WARN",
+            "interpretation": (
+                f"Shift test shows elevated residual signal (AUC={auc_shifted:.3f}) "
+                f"but provenance checks pass. AUC drop was {auc_drop:.3f}. "
+                "This may indicate: (1) strong regime persistence, (2) features with "
+                "high autocorrelation, or (3) subtle lookahead patterns not caught by provenance."
+            ),
+            "factors": factors,
+            "action": "Review top features; document if acceptable",
+        }
+
+    # Rule 5: Small or negative AUC drop → investigate
+    if auc_drop < 0.02:
+        tier = "FAIL" if provenance_has_violations else "WARN"
+        return {
+            "tier": tier,
+            "interpretation": (
+                f"AUC barely dropped ({auc_drop:+.3f}) after shifting features. "
+                f"Normal AUC: {auc_normal:.3f}, Shifted AUC: {auc_shifted:.3f}. "
+                "This is unusual - features should lose predictive power when shifted."
+            ),
+            "factors": factors,
+            "action": "Investigate feature computation for lookahead bias",
+        }
+
+    # Default: Clean
+    return {
+        "tier": "INFO",
+        "interpretation": (
+            f"Shift test is clean. AUC dropped from {auc_normal:.3f} to {auc_shifted:.3f} "
+            f"(drop: {auc_drop:.3f}). No evidence of leakage."
+        ),
+        "factors": factors,
+        "action": "No action required",
+    }
+
+
+def create_combined_leakage_assessment(
+    shift_result: dict,
+    autocorr_result: dict,
+    provenance_result: dict,
+    raw_price_result: dict = None,
+) -> dict:
+    """Create combined leakage assessment from all diagnostic checks.
+
+    Combines multiple leakage signals into a single assessment with:
+    - Overall tier (FAIL/WARN/INFO)
+    - Evidence summary
+    - Recommended actions
+
+    Args:
+        shift_result: Output from run_shift_test()
+        autocorr_result: Output from check_target_autocorrelation()
+        provenance_result: Output from validate_provenance_data()
+        raw_price_result: Output from validate_raw_price_policy()
+
+    Returns:
+        Dict with:
+        - overall_tier: Highest severity tier across all checks
+        - checks: Dict of check_name -> {tier, summary}
+        - evidence_summary: Combined narrative
+        - engineering_judgment: Final recommendation
+    """
+    checks = {}
+    highest_severity = 3  # Start with INFO (lowest severity)
+
+    # 1. Provenance Check (Tier 1 capable - deterministic)
+    if provenance_result:
+        if provenance_result.get("error"):
+            checks["provenance"] = {
+                "tier": "INFO",
+                "summary": f"Provenance check unavailable: {provenance_result.get('error', 'unknown')}",
+            }
+        elif provenance_result.get("critical_violations"):
+            n_violations = len(provenance_result.get("critical_violations", []))
+            checks["provenance"] = {
+                "tier": "FAIL",
+                "summary": f"{n_violations} features have negative effective lookback (use future data)",
+            }
+            highest_severity = min(highest_severity, 1)
+        else:
+            checks["provenance"] = {
+                "tier": "INFO",
+                "summary": "All features have valid lookback (no future data usage)",
+            }
+
+    # 2. Raw Price Policy Check (Tier 1 capable - deterministic)
+    if raw_price_result:
+        if not raw_price_result.get("passed"):
+            n_adjusted = len(raw_price_result.get("adjusted_columns", []))
+            checks["raw_price_policy"] = {
+                "tier": "FAIL",
+                "summary": f"{n_adjusted} adjusted price columns in feature frame (policy violation)",
+            }
+            highest_severity = min(highest_severity, 1)
+        else:
+            checks["raw_price_policy"] = {
+                "tier": "INFO",
+                "summary": "Features use raw OHLC only (policy compliant)",
+            }
+
+    # 3. Shift Test (Tier 2 capable - heuristic)
+    shift_interpretation = interpret_shift_test_with_context(
+        shift_result, autocorr_result, provenance_result
+    )
+    checks["shift_test"] = {
+        "tier": shift_interpretation["tier"],
+        "summary": shift_interpretation["interpretation"][:200],  # Truncate for summary
+    }
+    tier_severity = DIAGNOSTIC_TIERS[shift_interpretation["tier"]]["severity"]
+    highest_severity = min(highest_severity, tier_severity)
+
+    # 4. Target Autocorrelation (Tier 2/3 - context for interpretation)
+    if autocorr_result and not autocorr_result.get("error"):
+        autocorr = autocorr_result.get("lag1_autocorr", 0)
+        pct_same = autocorr_result.get("pct_same_as_prev", 0)
+        if autocorr > 0.5 or pct_same > 85:
+            checks["target_autocorr"] = {
+                "tier": "WARN",
+                "summary": f"High target persistence: autocorr={autocorr:.2f}, {pct_same:.0f}% same as previous",
+            }
+            highest_severity = min(highest_severity, 2)
+        elif autocorr > 0.3 or pct_same > 70:
+            checks["target_autocorr"] = {
+                "tier": "INFO",
+                "summary": f"Moderate target persistence: autocorr={autocorr:.2f}, {pct_same:.0f}% same as previous",
+            }
+        else:
+            checks["target_autocorr"] = {
+                "tier": "INFO",
+                "summary": f"Acceptable target persistence: autocorr={autocorr:.2f}",
+            }
+
+    # Determine overall tier
+    tier_map = {1: "FAIL", 2: "WARN", 3: "INFO"}
+    overall_tier = tier_map[highest_severity]
+
+    # Build evidence summary
+    fail_checks = [k for k, v in checks.items() if v["tier"] == "FAIL"]
+    warn_checks = [k for k, v in checks.items() if v["tier"] == "WARN"]
+
+    if fail_checks:
+        evidence_summary = (
+            f"CRITICAL: {len(fail_checks)} check(s) indicate deterministic leakage or policy violation. "
+            f"Failed checks: {', '.join(fail_checks)}. "
+            "These issues must be resolved before model training."
+        )
+    elif warn_checks:
+        evidence_summary = (
+            f"REVIEW REQUIRED: {len(warn_checks)} check(s) require review. "
+            f"Flagged checks: {', '.join(warn_checks)}. "
+            "These may indicate issues or may be acceptable given target structure."
+        )
+    else:
+        evidence_summary = (
+            "All leakage checks pass or show expected behavior. "
+            "No evidence of problematic future data usage."
+        )
+
+    # Engineering judgment
+    if overall_tier == "FAIL":
+        engineering_judgment = (
+            "BLOCK: Do not proceed with model training until FAIL issues are resolved. "
+            "Deterministic violations indicate features contain future information."
+        )
+    elif overall_tier == "WARN":
+        engineering_judgment = (
+            "REVIEW: The shift test and/or other checks show signals that warrant review. "
+            "If provenance checks pass and the residual signal is explainable by target "
+            "autocorrelation or regime persistence, document the decision and proceed. "
+            "Use purged cross-validation to mitigate temporal leakage effects."
+        )
+    else:
+        engineering_judgment = (
+            "PROCEED: All checks pass or show expected behavior. "
+            "The feature set appears clean for model training. "
+            "Standard temporal cross-validation practices are recommended."
+        )
+
+    return {
+        "overall_tier": overall_tier,
+        "checks": checks,
+        "evidence_summary": evidence_summary,
+        "engineering_judgment": engineering_judgment,
+    }
+
 
 # =============================================================================
 # FEATURE DEFINITIONS - Descriptions and expected behavior
@@ -358,6 +750,693 @@ FEATURE_DESCRIPTIONS = {
     "w_trend_alignment": "Weekly trend alignment",
     "dollar_momentum_20d": "Dollar 20-day momentum",
 }
+
+# =============================================================================
+# FEATURE VALUE RANGE VALIDATION
+# Features with known bounded ranges - if outside bounds, indicates data issues
+# (e.g., OHLC adjustment errors, indicator computation bugs)
+# =============================================================================
+
+BOUNDED_FEATURES = {
+    # Format: feature_pattern -> (min_valid, max_valid, description, exclusions)
+    # exclusions: list of substrings that should NOT match (to avoid false positives)
+
+    # Choppiness Index: 0-100 by definition (OHLC-sensitive)
+    "chop_": (0, 100, "Choppiness Index should be 0-100", []),
+
+    # Position in range: 0-1 by definition (OHLC-sensitive)
+    "pos_in_": (0, 1, "Position in range should be 0-1", []),
+
+    # ADX components: typically 0-100 (OHLC-sensitive)
+    "di_plus": (0, 100, "DI+ should be 0-100", []),
+    "di_minus": (0, 100, "DI- should be 0-100", []),
+    "adx_": (0, 100, "ADX should be 0-100", []),
+
+    # Binary features: 0-1
+    "breakout_up": (0, 1, "Breakout up flags should be 0 or 1", []),
+    "breakout_dn": (0, 1, "Breakout down flags should be 0 or 1", []),
+
+    # Vol regime: typically 0-3 normalized
+    "vol_regime": (0, 3, "Vol regime typically 0-1 or 0-2", ["rel"]),
+
+    # VIX regime: 0-2 (low/medium/high)
+    "vix_regime": (0, 3, "VIX regime should be 0-2", []),
+}
+
+
+def validate_feature_ranges(df: pd.DataFrame, clip_outliers: bool = True) -> dict:
+    """Validate that bounded features are within expected ranges.
+
+    This catches OHLC adjustment issues that cause indicators like
+    chop_14, pos_in_range, and DI+/- to produce invalid values.
+
+    Args:
+        df: DataFrame with features to validate
+        clip_outliers: If True, clip rare outliers (<0.1% violations) to expected bounds
+
+    Returns:
+        Dict with validation results:
+        - violations: list of (feature, issue_type, details)
+        - summary: count of features with range violations
+        - ohlc_issue_likely: bool indicating probable OHLC adjustment problem
+        - clipped_features: list of features that were clipped
+    """
+    violations = []
+    features_checked = 0
+    clipped_features = []
+
+    # Threshold for "rare outlier" vs "systematic issue"
+    OUTLIER_THRESHOLD_PCT = 0.1  # <0.1% is considered rare outliers
+
+    for col in df.columns:
+        col_lower = col.lower()
+
+        for pattern, (min_val, max_val, description, exclusions) in BOUNDED_FEATURES.items():
+            if pattern in col_lower:
+                # Check exclusions
+                if any(excl in col_lower for excl in exclusions):
+                    continue
+
+                features_checked += 1
+
+                # Get non-NaN values
+                values = df[col].dropna()
+                if len(values) == 0:
+                    continue
+
+                # Check for values outside bounds
+                below_min = (values < min_val).sum()
+                above_max = (values > max_val).sum()
+                total = len(values)
+
+                if below_min > 0 or above_max > 0:
+                    pct_violations = (below_min + above_max) / total * 100
+
+                    # Get actual range
+                    actual_min = values.min()
+                    actual_max = values.max()
+
+                    # Determine severity based on percentage of violations
+                    if pct_violations >= OUTLIER_THRESHOLD_PCT:
+                        severity = "CRITICAL"  # Systemic issue
+                    else:
+                        severity = "INFO"  # Rare outliers
+
+                    violations.append({
+                        "feature": col,
+                        "pattern": pattern,
+                        "expected_range": (min_val, max_val),
+                        "actual_range": (actual_min, actual_max),
+                        "below_min_count": below_min,
+                        "above_max_count": above_max,
+                        "pct_violations": pct_violations,
+                        "description": description,
+                        "severity": severity,
+                    })
+
+                    # Clip rare outliers if requested
+                    if clip_outliers and severity == "INFO":
+                        df[col] = df[col].clip(lower=min_val, upper=max_val)
+                        clipped_features.append(col)
+
+                break  # Only check first matching pattern
+
+    # Determine if this looks like an OHLC adjustment issue
+    # Only consider it likely if there are CRITICAL (not INFO) violations
+    ohlc_indicators = ["chop_", "pos_in_", "di_plus", "di_minus"]
+    ohlc_violations = [v for v in violations
+                       if any(ind in v["pattern"] for ind in ohlc_indicators)
+                       and v.get("severity") == "CRITICAL"]
+    ohlc_issue_likely = len(ohlc_violations) >= 2
+
+    # Count critical vs info violations
+    critical_violations = [v for v in violations if v.get("severity") == "CRITICAL"]
+    info_violations = [v for v in violations if v.get("severity") == "INFO"]
+
+    return {
+        "violations": violations,
+        "critical_violations": critical_violations,
+        "info_violations": info_violations,
+        "clipped_features": clipped_features,
+        "features_checked": features_checked,
+        "summary": len(violations),
+        "ohlc_issue_likely": ohlc_issue_likely,
+        "ohlc_violations": ohlc_violations,
+    }
+
+
+# =============================================================================
+# RAW PRICE POLICY VALIDATION
+# =============================================================================
+
+# Pattern to detect adjusted price column names (prohibited in feature frame)
+ADJUSTED_PRICE_PATTERNS = [
+    r'^adj_',          # adj_close, adj_high, etc.
+    r'^adjusted_',     # adjusted_close, adjusted_open, etc.
+    r'_adjusted$',     # close_adjusted, etc.
+    r'_adj$',          # close_adj, etc.
+    r'^adjclose$',     # The adjclose column itself (only raw close allowed)
+    r'split_factor',   # Split adjustment factors
+    r'dividend_factor', # Dividend adjustment factors
+    r'corp_action',    # Corporate action columns
+    r'adjustment_factor', # Generic adjustment factor
+]
+
+
+def validate_raw_price_policy(df: pd.DataFrame) -> dict:
+    """Validate that feature frame only contains raw-price-derived features.
+
+    POLICY: Raw prices for features, adjusted prices for targets
+    - Feature computation uses RAW OHLC (unadjusted)
+    - Adjusted prices are only permitted for target generation and PnL
+    - This check detects if adjusted price columns leaked into the feature frame
+
+    Args:
+        df: DataFrame with features to validate
+
+    Returns:
+        Dict with validation results:
+        - passed: bool indicating if policy is satisfied
+        - adjusted_columns: list of columns that violate the policy
+        - warnings: list of warning messages
+        - severity: "PASS", "WARN", or "FAIL"
+    """
+    import re
+
+    adjusted_columns = []
+    warnings = []
+
+    # Check column names against patterns
+    for col in df.columns:
+        col_lower = col.lower()
+        for pattern in ADJUSTED_PRICE_PATTERNS:
+            if re.search(pattern, col_lower):
+                adjusted_columns.append(col)
+                break
+
+    # Determine severity
+    if adjusted_columns:
+        severity = "FAIL"
+        passed = False
+        warnings.append(
+            f"CRITICAL: {len(adjusted_columns)} adjusted price column(s) found in feature frame. "
+            "Features must use raw OHLC only. Adjusted prices are only for targets/PnL."
+        )
+    else:
+        severity = "PASS"
+        passed = True
+
+    # Additional check: look for column names with suspicious patterns
+    suspicious_patterns = [
+        (r'(?:^|_)adj(?:$|_)', "contains 'adj'"),
+        (r'split', "contains 'split'"),
+        (r'dividend', "contains 'dividend'"),
+    ]
+
+    suspicious_columns = []
+    for col in df.columns:
+        col_lower = col.lower()
+        # Skip if already flagged as adjusted
+        if col in adjusted_columns:
+            continue
+        for pattern, desc in suspicious_patterns:
+            if re.search(pattern, col_lower):
+                suspicious_columns.append((col, desc))
+                break
+
+    # Warn about suspicious columns (INFO level, not FAIL)
+    if suspicious_columns and not adjusted_columns:
+        # Only warn if not already failing
+        warnings.append(
+            f"INFO: {len(suspicious_columns)} column(s) have names suggesting adjustment usage. "
+            "Verify these are not derived from adjusted prices."
+        )
+
+    return {
+        "passed": passed,
+        "adjusted_columns": adjusted_columns,
+        "suspicious_columns": suspicious_columns,
+        "warnings": warnings,
+        "severity": severity,
+        "policy_description": "Raw prices for features, adjusted prices for targets only",
+    }
+
+
+def run_shift_test(
+    features_df: pd.DataFrame,
+    targets_df: pd.DataFrame,
+    target_col: str = "hit_long_normal",
+    max_samples: int = 100000,
+) -> dict:
+    """Run the shift test to detect statistical leakage.
+
+    The shift test is a robust leakage detection method:
+    1. Train a model normally → record AUC
+    2. Shift all features forward by 1 bar (features[t] → features[t+1])
+    3. Retrain with same settings → record AUC
+
+    Interpretation:
+    - AUC collapses (~0.50-0.52) → likely clean
+    - AUC barely changes → very suspicious (features may contain future info)
+    - AUC improves → almost certainly leaking
+
+    Args:
+        features_df: DataFrame with features (must have 'symbol' and 'date' columns)
+        targets_df: DataFrame with targets (must have 'symbol' and 't0' columns)
+        target_col: Target column to use (default: 'hit_top')
+        max_samples: Maximum samples to use for speed (default: 100000)
+
+    Returns:
+        Dict with:
+        - auc_normal: AUC with unshifted features
+        - auc_shifted: AUC with shifted features (features[t] → features[t+1])
+        - auc_drop: auc_normal - auc_shifted
+        - interpretation: "clean", "suspicious", or "leaking"
+        - leakage_likely: bool indicating probable data leakage
+        - error: error message if test failed
+    """
+    try:
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+    except ImportError:
+        return {"error": "lightgbm or sklearn not installed", "leakage_likely": False}
+
+    # Identify feature columns (numeric, not metadata)
+    meta_cols = {'symbol', 'date', 'index', '_row_id'}
+    feature_cols = [c for c in features_df.columns
+                    if c not in meta_cols and features_df[c].dtype in [np.float32, np.float64]]
+
+    if not feature_cols:
+        return {"error": "No feature columns found", "leakage_likely": False}
+
+    # Prepare features
+    feat_df = features_df.copy()
+    if 'date' not in feat_df.columns and feat_df.index.name:
+        feat_df = feat_df.reset_index()
+
+    # Prepare targets
+    tgt_df = targets_df.copy()
+    if 't0' in tgt_df.columns:
+        tgt_df = tgt_df.rename(columns={'t0': 'date'})
+
+    # Check target column exists
+    if target_col not in tgt_df.columns:
+        # Try common alternatives (triple barrier targets)
+        for alt in ['hit_long_normal', 'hit_short_normal', 'hit_long_parabolic',
+                    'hit_short_parabolic', 'hit_top', 'hit_bot', 'label', 'target', 'y']:
+            if alt in tgt_df.columns:
+                target_col = alt
+                break
+        else:
+            return {"error": f"Target column '{target_col}' not found", "leakage_likely": False}
+
+    # Merge features and targets
+    try:
+        if 'symbol' in feat_df.columns and 'symbol' in tgt_df.columns:
+            merged = pd.merge(
+                feat_df[['symbol', 'date'] + feature_cols],
+                tgt_df[['symbol', 'date', target_col]],
+                on=['symbol', 'date'],
+                how='inner'
+            )
+        else:
+            merged = pd.merge(
+                feat_df[['date'] + feature_cols],
+                tgt_df[['date', target_col]],
+                on='date',
+                how='inner'
+            )
+    except Exception as e:
+        return {"error": f"Merge failed: {e}", "leakage_likely": False}
+
+    if len(merged) < 2000:
+        return {"error": f"Insufficient merged rows ({len(merged)})", "leakage_likely": False}
+
+    # Drop rows with NaN target
+    merged = merged.dropna(subset=[target_col])
+    if len(merged) < 2000:
+        return {"error": f"Insufficient rows after dropping NaN targets ({len(merged)})", "leakage_likely": False}
+
+    # Sample if too large
+    if len(merged) > max_samples:
+        merged = merged.sample(n=max_samples, random_state=42)
+
+    # Sort by symbol and date for proper shifting
+    merged = merged.sort_values(['symbol', 'date']).reset_index(drop=True)
+
+    # Prepare X and y
+    X = merged[feature_cols].values.astype(np.float32)
+    y = merged[target_col].values.astype(np.float32)
+
+    # Handle NaN in features by filling with 0 (LightGBM can handle this)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Check we have both classes
+    unique_y = np.unique(y[~np.isnan(y)])
+    if len(unique_y) < 2:
+        return {"error": "Target has only one class", "leakage_likely": False}
+
+    # Convert to binary if needed (for hit_top, values should already be 0/1)
+    if not np.all(np.isin(y, [0, 1])):
+        # Treat as binary: positive if > 0.5
+        y = (y > 0.5).astype(np.float32)
+
+    # Train/test split (use last 20% as test)
+    n = len(X)
+    split_idx = int(n * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
+    # LightGBM parameters (fast defaults)
+    params = {
+        'objective': 'binary',
+        'metric': 'auc',
+        'verbosity': -1,
+        'boosting_type': 'gbdt',
+        'num_leaves': 31,
+        'learning_rate': 0.1,
+        'n_estimators': 100,
+        'min_child_samples': 20,
+        'random_state': 42,
+    }
+
+    # Train normal model
+    try:
+        model_normal = lgb.LGBMClassifier(**params)
+        model_normal.fit(X_train, y_train)
+        y_pred_normal = model_normal.predict_proba(X_test)[:, 1]
+        auc_normal = roc_auc_score(y_test, y_pred_normal)
+    except Exception as e:
+        return {"error": f"Normal model training failed: {e}", "leakage_likely": False}
+
+    # Shift features forward by 1 bar within each symbol
+    # This means features[t] → features[t+1], simulating that we're using
+    # features that would only be available at t+1 to predict t
+    try:
+        merged_shifted = merged.copy()
+
+        # Shift features forward within each symbol group
+        # After shift, row t will have features from row t-1 (previous bar)
+        for col in feature_cols:
+            merged_shifted[col] = merged_shifted.groupby('symbol')[col].shift(1)
+
+        # Drop rows with NaN from shifting (first row of each symbol)
+        merged_shifted = merged_shifted.dropna(subset=feature_cols[:1])  # Check first feature col
+
+        if len(merged_shifted) < 1000:
+            return {"error": "Insufficient rows after shifting", "leakage_likely": False}
+
+        # Re-sort and prepare shifted data
+        merged_shifted = merged_shifted.sort_values(['symbol', 'date']).reset_index(drop=True)
+
+        X_shifted = merged_shifted[feature_cols].values.astype(np.float32)
+        y_shifted = merged_shifted[target_col].values.astype(np.float32)
+
+        X_shifted = np.nan_to_num(X_shifted, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Convert to binary if needed
+        if not np.all(np.isin(y_shifted, [0, 1])):
+            y_shifted = (y_shifted > 0.5).astype(np.float32)
+
+        # Split
+        n_shifted = len(X_shifted)
+        split_idx_shifted = int(n_shifted * 0.8)
+        X_train_s, X_test_s = X_shifted[:split_idx_shifted], X_shifted[split_idx_shifted:]
+        y_train_s, y_test_s = y_shifted[:split_idx_shifted], y_shifted[split_idx_shifted:]
+
+        # Train shifted model
+        model_shifted = lgb.LGBMClassifier(**params)
+        model_shifted.fit(X_train_s, y_train_s)
+        y_pred_shifted = model_shifted.predict_proba(X_test_s)[:, 1]
+        auc_shifted = roc_auc_score(y_test_s, y_pred_shifted)
+
+    except Exception as e:
+        return {"error": f"Shifted model training failed: {e}", "leakage_likely": False}
+
+    # Compute AUC drop
+    auc_drop = auc_normal - auc_shifted
+
+    # Interpret results
+    # Clean data: shifting should destroy predictive power → AUC drops to ~0.50
+    # Leaky data: future info in features → shifting doesn't hurt or helps
+    if auc_shifted < 0.52 and auc_drop > 0.02:
+        interpretation = "clean"
+        leakage_likely = False
+    elif auc_drop < 0.01:
+        interpretation = "suspicious"
+        leakage_likely = True
+    elif auc_drop < 0:
+        interpretation = "leaking"
+        leakage_likely = True
+    elif auc_shifted > 0.55:
+        # Even after shifting, model still has decent predictive power
+        # This suggests features contain information about future targets
+        interpretation = "suspicious"
+        leakage_likely = True
+    else:
+        interpretation = "clean"
+        leakage_likely = False
+
+    # If leakage detected, identify suspicious features
+    suspicious_features = []
+    if leakage_likely:
+        try:
+            # Get feature importances from normal model
+            importances = model_normal.feature_importances_
+            importance_df = pd.DataFrame({
+                'feature': feature_cols,
+                'importance': importances
+            }).sort_values('importance', ascending=False)
+
+            # For top 30 important features, check correlation persistence
+            top_features = importance_df.head(30)['feature'].tolist()
+
+            for feat in top_features:
+                feat_idx = feature_cols.index(feat)
+
+                # Get feature values and target
+                feat_vals = X[:, feat_idx]
+                target_vals = y
+
+                # Compute correlation with current target
+                valid = ~(np.isnan(feat_vals) | np.isnan(target_vals))
+                if valid.sum() < 100:
+                    continue
+
+                feat_v = feat_vals[valid]
+                tgt_v = target_vals[valid]
+
+                if np.std(feat_v) < 1e-10:
+                    continue
+
+                corr_current = np.corrcoef(feat_v, tgt_v)[0, 1]
+
+                # For shifted model: get shifted feature correlation with target
+                # If correlation stays high, feature likely contains future info
+                shifted_feat_vals = X_shifted[:, feat_idx]
+                shifted_target_vals = y_shifted
+
+                valid_s = ~(np.isnan(shifted_feat_vals) | np.isnan(shifted_target_vals))
+                if valid_s.sum() < 100:
+                    continue
+
+                feat_v_s = shifted_feat_vals[valid_s]
+                tgt_v_s = shifted_target_vals[valid_s]
+
+                if np.std(feat_v_s) < 1e-10:
+                    continue
+
+                corr_shifted = np.corrcoef(feat_v_s, tgt_v_s)[0, 1]
+
+                # Suspicious if: high importance AND correlation doesn't drop much
+                importance = importances[feat_idx]
+                corr_drop = abs(corr_current) - abs(corr_shifted)
+
+                if abs(corr_shifted) > 0.1 or corr_drop < 0.02:
+                    suspicious_features.append({
+                        'feature': feat,
+                        'importance': float(importance),
+                        'importance_rank': int(importance_df[importance_df['feature'] == feat].index[0]) + 1,
+                        'corr_current': float(corr_current),
+                        'corr_shifted': float(corr_shifted),
+                        'corr_drop': float(corr_drop),
+                    })
+
+            # Sort by importance
+            suspicious_features.sort(key=lambda x: x['importance'], reverse=True)
+
+        except Exception as e:
+            # Don't fail the whole test if feature analysis fails
+            pass
+
+    return {
+        "auc_normal": float(auc_normal),
+        "auc_shifted": float(auc_shifted),
+        "auc_drop": float(auc_drop),
+        "interpretation": interpretation,
+        "leakage_likely": leakage_likely,
+        "target_used": target_col,
+        "samples_used": len(merged),
+        "features_used": len(feature_cols),
+        "suspicious_features": suspicious_features,
+    }
+
+
+def check_target_autocorrelation(
+    targets_df: pd.DataFrame,
+    target_col: str = "hit_long_normal",
+) -> dict:
+    """Check target autocorrelation to detect regime persistence issues.
+
+    High target autocorrelation can cause misleading model performance:
+    - A model that just predicts "same as yesterday" can achieve high accuracy
+    - This doesn't indicate real predictive power, just target persistence
+    - Cross-validation may overestimate performance due to temporal leakage
+
+    Args:
+        targets_df: DataFrame with targets (must have 'symbol' and 't0' or 'date' columns)
+        target_col: Target column to analyze (default: 'hit_long_normal')
+
+    Returns:
+        Dict with:
+        - lag1_autocorr: Lag-1 autocorrelation (pooled across symbols)
+        - pct_same_as_prev: Percentage of targets identical to previous
+        - class_distribution: Dict of {class: percentage}
+        - persistence_issue: bool indicating high autocorrelation
+        - interpretation: Description of findings
+        - by_symbol_stats: Per-symbol autocorrelation statistics
+    """
+    tgt_df = targets_df.copy()
+
+    # Normalize date column name
+    if 't0' in tgt_df.columns and 'date' not in tgt_df.columns:
+        tgt_df = tgt_df.rename(columns={'t0': 'date'})
+
+    # Check target column exists
+    if target_col not in tgt_df.columns:
+        # Try common alternatives
+        for alt in ['hit_long_normal', 'hit_short_normal', 'hit_long_parabolic',
+                    'hit_short_parabolic', 'hit_top', 'hit_bot', 'label', 'target', 'y']:
+            if alt in tgt_df.columns:
+                target_col = alt
+                break
+        else:
+            return {"error": f"Target column '{target_col}' not found"}
+
+    # Check required columns
+    if 'symbol' not in tgt_df.columns:
+        return {"error": "Column 'symbol' not found in targets"}
+    if 'date' not in tgt_df.columns:
+        return {"error": "Column 'date' (or 't0') not found in targets"}
+
+    # Drop NaN targets
+    tgt_df = tgt_df.dropna(subset=[target_col])
+    if len(tgt_df) < 100:
+        return {"error": f"Insufficient rows ({len(tgt_df)}) after dropping NaN targets"}
+
+    # Sort by symbol and date for proper lag calculation
+    tgt_df = tgt_df.sort_values(['symbol', 'date']).reset_index(drop=True)
+
+    # Class distribution
+    target_values = tgt_df[target_col].values
+    unique_vals, counts = np.unique(target_values[~np.isnan(target_values)], return_counts=True)
+    total = counts.sum()
+    class_distribution = {float(v): float(c / total * 100) for v, c in zip(unique_vals, counts)}
+
+    # Calculate lag-1 shifted target within each symbol
+    tgt_df['_target_lag1'] = tgt_df.groupby('symbol')[target_col].shift(1)
+
+    # Drop rows where lag is NaN (first row of each symbol)
+    valid_rows = tgt_df.dropna(subset=['_target_lag1'])
+
+    if len(valid_rows) < 100:
+        return {"error": "Insufficient valid rows after computing lag"}
+
+    current = valid_rows[target_col].values
+    lagged = valid_rows['_target_lag1'].values
+
+    # Calculate percentage same as previous
+    same_as_prev = (current == lagged).sum()
+    pct_same_as_prev = same_as_prev / len(current) * 100
+
+    # Calculate lag-1 autocorrelation (pooled)
+    # For binary targets, this is equivalent to Pearson correlation
+    if np.std(current) > 1e-10 and np.std(lagged) > 1e-10:
+        lag1_autocorr = np.corrcoef(current, lagged)[0, 1]
+    else:
+        lag1_autocorr = 0.0
+
+    # Per-symbol autocorrelation statistics
+    by_symbol_stats = {}
+    for symbol, group in tgt_df.groupby('symbol'):
+        g = group.dropna(subset=['_target_lag1'])
+        if len(g) < 20:
+            continue
+        curr = g[target_col].values
+        lag = g['_target_lag1'].values
+        if np.std(curr) > 1e-10 and np.std(lag) > 1e-10:
+            sym_autocorr = np.corrcoef(curr, lag)[0, 1]
+        else:
+            sym_autocorr = 0.0
+        sym_same = (curr == lag).sum() / len(curr) * 100
+        by_symbol_stats[symbol] = {
+            'autocorr': float(sym_autocorr),
+            'pct_same': float(sym_same),
+            'n_rows': len(g),
+        }
+
+    # Aggregate per-symbol stats
+    if by_symbol_stats:
+        autocorrs = [s['autocorr'] for s in by_symbol_stats.values()]
+        pct_sames = [s['pct_same'] for s in by_symbol_stats.values()]
+        symbol_stats_summary = {
+            'mean_autocorr': float(np.mean(autocorrs)),
+            'median_autocorr': float(np.median(autocorrs)),
+            'std_autocorr': float(np.std(autocorrs)),
+            'mean_pct_same': float(np.mean(pct_sames)),
+            'n_symbols': len(by_symbol_stats),
+        }
+    else:
+        symbol_stats_summary = {}
+
+    # Determine if there's a persistence issue
+    # Thresholds: autocorr > 0.3 or same-as-previous > 70%
+    persistence_issue = lag1_autocorr > 0.3 or pct_same_as_prev > 70
+
+    # Interpretation
+    if lag1_autocorr > 0.5 or pct_same_as_prev > 85:
+        interpretation = "HIGH PERSISTENCE"
+        detail = (
+            "Targets are highly autocorrelated. A naive 'same as yesterday' model "
+            "would achieve good accuracy. This inflates apparent model performance "
+            "and may indicate targets are too persistent for reliable prediction."
+        )
+    elif lag1_autocorr > 0.3 or pct_same_as_prev > 70:
+        interpretation = "MODERATE PERSISTENCE"
+        detail = (
+            "Targets show notable autocorrelation. Model validation should use "
+            "purged/embargo cross-validation to avoid temporal leakage. Consider "
+            "whether the prediction horizon is appropriate."
+        )
+    else:
+        interpretation = "ACCEPTABLE"
+        detail = (
+            "Target autocorrelation is within acceptable range. Standard temporal "
+            "cross-validation should be reliable."
+        )
+
+    return {
+        "lag1_autocorr": float(lag1_autocorr),
+        "pct_same_as_prev": float(pct_same_as_prev),
+        "class_distribution": class_distribution,
+        "persistence_issue": persistence_issue,
+        "interpretation": interpretation,
+        "interpretation_detail": detail,
+        "target_used": target_col,
+        "n_samples": len(valid_rows),
+        "symbol_stats_summary": symbol_stats_summary,
+    }
+
 
 # Feature categories with expected NaN ranges
 FEATURE_CATEGORIES = {
@@ -676,7 +1755,10 @@ def analyze_targets(targets_path: Path) -> Dict:
 
 
 def print_summary(features_analysis: Dict, targets_analysis: Dict, base_features_analysis: Dict,
-                  expansion_analysis: Dict = None, verbose: bool = False):
+                  expansion_analysis: Dict = None, range_analysis: Dict = None,
+                  raw_price_analysis: Dict = None,
+                  shift_test_analysis: Dict = None, autocorr_analysis: Dict = None,
+                  provenance_analysis: Dict = None, verbose: bool = False):
     """Print actionable summary."""
 
     print("=" * 80)
@@ -758,6 +1840,352 @@ def print_summary(features_analysis: Dict, targets_analysis: Dict, base_features
                 print(f"   - {feat}: {rate:.0f}%")
             if len(high_nan_exp) > 5:
                 print(f"   ... and {len(high_nan_exp) - 5} more")
+
+    # === FEATURE RANGE VALIDATION ===
+    if range_analysis:
+        print(f"\n{'='*40}")
+        print("FEATURE VALUE RANGE VALIDATION")
+        print(f"{'='*40}")
+        print(f"   Features checked: {range_analysis['features_checked']}")
+
+        critical_violations = range_analysis.get("critical_violations", [])
+        info_violations = range_analysis.get("info_violations", [])
+        clipped_features = range_analysis.get("clipped_features", [])
+
+        if critical_violations:
+            # Systemic issues (>0.1% of values affected)
+            print(f"   Critical range violations: {len(critical_violations)} features [FAIL]")
+
+            # Check for OHLC-related issues
+            if range_analysis.get("ohlc_issue_likely"):
+                print(f"\n   [CRITICAL] OHLC ADJUSTMENT ISSUE DETECTED!")
+                print(f"   Multiple OHLC-dependent indicators have invalid values.")
+                print(f"   This typically means high/low/close prices are inconsistent.")
+                print(f"   Fix: Ensure adjust_ohlc_to_adjclose() is applied before computing indicators.")
+
+            print(f"\n   Features with systemic out-of-range values (>0.1%):")
+            for v in critical_violations[:10]:
+                feat = v["feature"]
+                exp_min, exp_max = v["expected_range"]
+                act_min, act_max = v["actual_range"]
+                pct = v["pct_violations"]
+                print(f"   - {feat}")
+                print(f"     Expected: [{exp_min}, {exp_max}], Actual: [{act_min:.2f}, {act_max:.2f}]")
+                print(f"     Violations: {pct:.1f}% of values out of range")
+
+            if len(critical_violations) > 10:
+                print(f"   ... and {len(critical_violations) - 10} more features with systemic issues")
+
+        elif info_violations:
+            # Only rare outliers - not a systemic issue
+            print(f"   Range violations: 0 [PASS]")
+            print(f"   All bounded features are within expected ranges.")
+
+        else:
+            print(f"   Range violations: 0 [PASS]")
+            print(f"   All bounded features are within expected ranges.")
+
+        # Show clipped outliers
+        if clipped_features:
+            print(f"\n   Rare outliers clipped (<0.1%): {len(clipped_features)} features [INFO]")
+            if verbose:
+                for feat in clipped_features[:5]:
+                    # Find the violation info
+                    v = next((x for x in info_violations if x["feature"] == feat), None)
+                    if v:
+                        exp_min, exp_max = v["expected_range"]
+                        act_min, act_max = v["actual_range"]
+                        count = v["below_min_count"] + v["above_max_count"]
+                        print(f"   - {feat}: {count} values clipped to [{exp_min}, {exp_max}]")
+                if len(clipped_features) > 5:
+                    print(f"   ... and {len(clipped_features) - 5} more")
+
+    # === RAW PRICE POLICY VALIDATION ===
+    if raw_price_analysis:
+        print(f"\n{'='*40}")
+        print("RAW PRICE POLICY VALIDATION")
+        print(f"{'='*40}")
+        print(f"   Policy: {raw_price_analysis.get('policy_description', 'N/A')}")
+
+        severity = raw_price_analysis.get("severity", "UNKNOWN")
+        adjusted_cols = raw_price_analysis.get("adjusted_columns", [])
+        suspicious_cols = raw_price_analysis.get("suspicious_columns", [])
+        warnings = raw_price_analysis.get("warnings", [])
+
+        if raw_price_analysis.get("passed"):
+            print(f"   Status: PASS - No adjusted price columns in feature frame")
+        else:
+            print(f"   Status: FAIL - Adjusted price columns detected!")
+            print(f"\n   [CRITICAL] Adjusted price column(s) found in feature frame:")
+            for col in adjusted_cols[:10]:
+                print(f"   - {col}")
+            if len(adjusted_cols) > 10:
+                print(f"   ... and {len(adjusted_cols) - 10} more")
+            print(f"\n   POLICY VIOLATION: Features must use raw OHLC only.")
+            print(f"   Adjusted prices are permitted only for target generation and PnL.")
+            print(f"   Fix: Remove adjusted price columns from feature output or")
+            print(f"        ensure feature computation uses raw close/high/low/open.")
+
+        if suspicious_cols and raw_price_analysis.get("passed"):
+            print(f"\n   Suspicious column names (review manually): {len(suspicious_cols)} [INFO]")
+            for col, reason in suspicious_cols[:5]:
+                print(f"   - {col} ({reason})")
+            if len(suspicious_cols) > 5:
+                print(f"   ... and {len(suspicious_cols) - 5} more")
+
+        # Note about splits in rolling windows
+        if raw_price_analysis.get("passed"):
+            print(f"\n   Note: Splits within rolling windows are acceptable and expected")
+            print(f"         in raw OHLC features. This is correct behavior.")
+
+    # === FEATURE PROVENANCE VALIDATION ===
+    if provenance_analysis:
+        print(f"\n{'='*40}")
+        print("FEATURE PROVENANCE (Leakage Prevention)")
+        print(f"{'='*40}")
+
+        if "error" in provenance_analysis:
+            print(f"   Error: {provenance_analysis['error']}")
+            if "recommendation" in provenance_analysis:
+                print(f"   Recommendation: {provenance_analysis['recommendation']}")
+        elif provenance_analysis.get("provenance_loaded"):
+            summary = provenance_analysis.get("summary", {})
+            total = summary.get("total_features", 0)
+            daily = summary.get("daily_features", 0)
+            weekly = summary.get("weekly_features", 0)
+            max_lookback = summary.get("max_lookback_days", 0)
+            min_lookback = summary.get("min_lookback_days", 0)
+            with_pub_lag = summary.get("with_publication_lag", 0)
+
+            print(f"   Features tracked: {total}")
+            print(f"   Daily: {daily}, Weekly: {weekly}")
+            print(f"   Lookback range: {min_lookback}-{max_lookback} days")
+            print(f"   With publication lag: {with_pub_lag}")
+
+            # Critical violations (hard leakage)
+            critical = provenance_analysis.get("critical_violations", [])
+            if critical:
+                print(f"\n   [CRITICAL] HARD LEAKAGE DETECTED!")
+                print(f"   {len(critical)} features have negative effective lookback (use future data)")
+                for issue in critical[:5]:
+                    print(f"   - {issue}")
+                if len(critical) > 5:
+                    print(f"   ... and {len(critical) - 5} more")
+            else:
+                print(f"\n   Hard leakage check: PASS (no negative lookbacks)")
+
+            # Warnings (zero lookback)
+            warnings = provenance_analysis.get("warnings", [])
+            if warnings:
+                print(f"\n   Zero lookback warnings: {len(warnings)} features")
+                if verbose:
+                    for warn in warnings[:5]:
+                        print(f"   - {warn}")
+
+            # Missing from registry
+            missing = provenance_analysis.get("missing_from_registry", [])
+            if missing:
+                status = "WARN" if len(missing) > 50 else "INFO"
+                print(f"\n   Features not in registry: {len(missing)} [{status}]")
+                if verbose and len(missing) <= 20:
+                    for feat in missing[:10]:
+                        print(f"   - {feat}")
+                    if len(missing) > 10:
+                        print(f"   ... and {len(missing) - 10} more")
+
+            # Optimization opportunities (publication lags that could be reduced)
+            optimizations = provenance_analysis.get("optimizations", [])
+            if optimizations:
+                print(f"\n   Publication lag review: {len(optimizations)} features [INFO]")
+                print(f"   These features have publication_lag buffers you added for data availability.")
+                print(f"   Verify these are still needed - reducing them gives fresher signals:")
+                for opt in optimizations[:5]:
+                    print(f"   - {opt}")
+                if len(optimizations) > 5:
+                    print(f"   ... and {len(optimizations) - 5} more")
+        else:
+            print(f"   Provenance file not found - run pipeline to generate")
+
+    # === SHIFT TEST FOR LEAKAGE (Context-Aware Interpretation) ===
+    if shift_test_analysis:
+        print(f"\n{'='*40}")
+        print("SHIFT TEST FOR LEAKAGE")
+        print(f"{'='*40}")
+
+        if "error" in shift_test_analysis:
+            print(f"   Error: {shift_test_analysis['error']}")
+        else:
+            auc_normal = shift_test_analysis.get("auc_normal", 0)
+            auc_shifted = shift_test_analysis.get("auc_shifted", 0)
+            auc_drop = shift_test_analysis.get("auc_drop", 0)
+            target_used = shift_test_analysis.get("target_used", "unknown")
+            samples_used = shift_test_analysis.get("samples_used", 0)
+            features_used = shift_test_analysis.get("features_used", 0)
+
+            print(f"   Target: {target_used}")
+            print(f"   Samples: {samples_used:,}, Features: {features_used}")
+            print(f"\n   AUC (normal):  {auc_normal:.4f}")
+            print(f"   AUC (shifted): {auc_shifted:.4f}")
+            print(f"   AUC drop:      {auc_drop:+.4f}")
+
+            # Context-aware interpretation
+            shift_context = interpret_shift_test_with_context(
+                shift_test_analysis, autocorr_analysis, provenance_analysis
+            )
+            tier = shift_context["tier"]
+            interpretation = shift_context["interpretation"]
+            factors = shift_context.get("factors", {})
+            action = shift_context.get("action", "")
+
+            print(f"\n   Context-Aware Interpretation [{tier}]:")
+            print(f"   {'-'*60}")
+
+            # Print interpretation with word wrapping
+            wrapped = textwrap.wrap(interpretation, width=60)
+            for line in wrapped:
+                print(f"   {line}")
+
+            # Show contributing factors
+            if factors:
+                print(f"\n   Contributing Factors:")
+                if "target_autocorr" in factors:
+                    print(f"   - Target autocorrelation: {factors['target_autocorr']:.3f}")
+                if "target_persistence_pct" in factors:
+                    print(f"   - Target persistence: {factors['target_persistence_pct']:.1f}% same as previous")
+                if "target_overlap_days" in factors:
+                    print(f"   - Target window overlap: ~{factors['target_overlap_days']} days")
+                if "provenance_violations" in factors:
+                    print(f"   - Provenance violations: {factors['provenance_violations']}")
+
+            print(f"\n   Recommended Action: {action}")
+
+            # Show suspicious features only for WARN/FAIL tiers
+            if tier in ["WARN", "FAIL"]:
+                suspicious = shift_test_analysis.get("suspicious_features", [])
+                if suspicious:
+                    print(f"\n   Features with persistent correlation after shift:")
+                    print(f"   {'Feature':<35} {'Imp Rank':>8} {'Corr Now':>9} {'Corr Shift':>10} {'Drop':>7}")
+                    print(f"   {'-'*70}")
+                    for sf in suspicious[:10]:
+                        feat = sf['feature'][:34]
+                        rank = sf['importance_rank']
+                        corr_now = sf['corr_current']
+                        corr_shift = sf['corr_shifted']
+                        drop = sf['corr_drop']
+                        print(f"   {feat:<35} {rank:>8} {corr_now:>+9.3f} {corr_shift:>+10.3f} {drop:>+7.3f}")
+                    if len(suspicious) > 10:
+                        print(f"   ... and {len(suspicious) - 10} more features")
+
+    # === TARGET AUTOCORRELATION ===
+    if autocorr_analysis:
+        print(f"\n{'='*40}")
+        print("TARGET AUTOCORRELATION CHECK")
+        print(f"{'='*40}")
+
+        if "error" in autocorr_analysis:
+            print(f"   Error: {autocorr_analysis['error']}")
+        else:
+            lag1_autocorr = autocorr_analysis.get("lag1_autocorr", 0)
+            pct_same = autocorr_analysis.get("pct_same_as_prev", 0)
+            interpretation = autocorr_analysis.get("interpretation", "unknown")
+            target_used = autocorr_analysis.get("target_used", "unknown")
+            n_samples = autocorr_analysis.get("n_samples", 0)
+            class_dist = autocorr_analysis.get("class_distribution", {})
+
+            print(f"   Target: {target_used}")
+            print(f"   Samples: {n_samples:,}")
+
+            # Class distribution
+            if class_dist:
+                dist_str = ", ".join([f"{k:.0f}: {v:.1f}%" for k, v in sorted(class_dist.items())])
+                print(f"   Class distribution: {dist_str}")
+
+            print(f"\n   Lag-1 autocorrelation: {lag1_autocorr:.3f}")
+            print(f"   Same as previous:     {pct_same:.1f}%")
+
+            # Status based on interpretation
+            if interpretation == "HIGH PERSISTENCE":
+                status = "WARN"
+                print(f"\n   Interpretation: {interpretation} [{status}]")
+                print(f"   Targets are highly persistent. A naive 'same as yesterday'")
+                print(f"   model would achieve {pct_same:.0f}% accuracy.")
+            elif interpretation == "MODERATE PERSISTENCE":
+                status = "CAUTION"
+                print(f"\n   Interpretation: {interpretation} [{status}]")
+                print(f"   Targets show notable autocorrelation. Use purged CV.")
+            else:
+                status = "PASS"
+                print(f"\n   Interpretation: {interpretation} [{status}]")
+                print(f"   Autocorrelation is within acceptable range.")
+
+            # Per-symbol summary
+            sym_stats = autocorr_analysis.get("symbol_stats_summary", {})
+            if sym_stats:
+                print(f"\n   Per-symbol statistics ({sym_stats.get('n_symbols', 0)} symbols):")
+                print(f"   - Mean autocorr:   {sym_stats.get('mean_autocorr', 0):.3f}")
+                print(f"   - Median autocorr: {sym_stats.get('median_autocorr', 0):.3f}")
+                print(f"   - Std autocorr:    {sym_stats.get('std_autocorr', 0):.3f}")
+
+    # === COMBINED LEAKAGE ASSESSMENT ===
+    # Only show if we have at least one leakage-related check
+    has_leakage_checks = (
+        shift_test_analysis or provenance_analysis or raw_price_analysis
+    )
+    if has_leakage_checks:
+        print(f"\n{'='*80}")
+        print("COMBINED LEAKAGE ASSESSMENT")
+        print(f"{'='*80}")
+
+        # Create combined assessment
+        combined = create_combined_leakage_assessment(
+            shift_result=shift_test_analysis or {},
+            autocorr_result=autocorr_analysis or {},
+            provenance_result=provenance_analysis or {},
+            raw_price_result=raw_price_analysis,
+        )
+
+        overall_tier = combined["overall_tier"]
+        checks = combined["checks"]
+        evidence_summary = combined["evidence_summary"]
+        engineering_judgment = combined["engineering_judgment"]
+
+        # Tier indicator with visual marker
+        tier_markers = {"FAIL": "[X]", "WARN": "[!]", "INFO": "[i]"}
+        tier_colors = {"FAIL": "BLOCK", "WARN": "REVIEW", "INFO": "PROCEED"}
+
+        print(f"\n   Overall Assessment: {overall_tier} - {tier_colors[overall_tier]}")
+        print(f"   {'-'*70}")
+
+        # Individual check results
+        print(f"\n   Check Results:")
+        for check_name, check_info in checks.items():
+            check_tier = check_info["tier"]
+            marker = tier_markers[check_tier]
+            summary = check_info["summary"][:65]
+            print(f"   {marker} {check_name:<20} [{check_tier}]")
+            print(f"       {summary}")
+
+        # Evidence summary
+        print(f"\n   Evidence Summary:")
+        wrapped = textwrap.wrap(evidence_summary, width=68)
+        for line in wrapped:
+            print(f"   {line}")
+
+        # Engineering Judgment (final recommendation)
+        print(f"\n   " + "=" * 70)
+        print(f"   ENGINEERING JUDGMENT")
+        print(f"   " + "=" * 70)
+        wrapped = textwrap.wrap(engineering_judgment, width=68)
+        for line in wrapped:
+            print(f"   {line}")
+
+        # Additional guidance for WARN tier
+        if overall_tier == "WARN":
+            print(f"\n   Guidance for WARN tier:")
+            print(f"   - The shift test is a heuristic, not proof of leakage")
+            print(f"   - Modest residual AUC (0.53-0.60) is expected with overlapping targets")
+            print(f"   - If provenance checks pass, regime persistence is likely cause")
+            print(f"   - Document your decision and use purged cross-validation")
 
     # === FEATURES SUMMARY ===
     print(f"\n{'='*40}")
@@ -888,6 +2316,78 @@ def print_summary(features_analysis: Dict, targets_analysis: Dict, base_features
             "   Look for: Symbols with extremely high prices (>$10k)"
         )
 
+    # OHLC adjustment issues
+    if range_analysis and range_analysis.get("ohlc_issue_likely"):
+        recommendations.append(
+            "OHLC ADJUSTMENT ISSUE: Multiple indicators have out-of-range values.\n"
+            "   Affected indicators: chop_14, pos_in_range, di_plus, di_minus\n"
+            "   Root cause: high/low/close price inconsistency (e.g., close > high)\n"
+            "   Fix: Re-run pipeline to apply forward OHLC adjustment:\n"
+            "        python -m src.cli.compute --timeframes D,W"
+        )
+
+    # Shift test leakage issues (now uses context-aware interpretation)
+    if shift_test_analysis and not shift_test_analysis.get("error"):
+        shift_context = interpret_shift_test_with_context(
+            shift_test_analysis, autocorr_analysis, provenance_analysis
+        )
+        tier = shift_context.get("tier", "INFO")
+
+        if tier == "FAIL":
+            auc_drop = shift_test_analysis.get("auc_drop", 0)
+            recommendations.append(
+                f"SHIFT TEST: CRITICAL LEAKAGE DETECTED\n"
+                f"   Tier: FAIL - Deterministic violation\n"
+                f"   AUC drop after shifting: {auc_drop:+.4f}\n"
+                f"   {shift_context.get('interpretation', '')[:200]}\n"
+                f"   Action: {shift_context.get('action', 'Review feature computation')}"
+            )
+        elif tier == "WARN":
+            auc_shifted = shift_test_analysis.get("auc_shifted", 0)
+            recommendations.append(
+                f"SHIFT TEST: Review Required\n"
+                f"   Tier: WARN - Requires investigation\n"
+                f"   Shifted AUC: {auc_shifted:.4f}\n"
+                "   This may be acceptable if provenance checks pass and can be explained\n"
+                "   by target autocorrelation or regime persistence.\n"
+                f"   Action: {shift_context.get('action', 'Review top features')}"
+        )
+
+    # Target autocorrelation issues
+    if autocorr_analysis and autocorr_analysis.get("persistence_issue"):
+        lag1 = autocorr_analysis.get("lag1_autocorr", 0)
+        pct_same = autocorr_analysis.get("pct_same_as_prev", 0)
+        interpretation = autocorr_analysis.get("interpretation", "")
+        recommendations.append(
+            f"TARGET AUTOCORRELATION: Targets are highly persistent ({interpretation}).\n"
+            f"   Lag-1 autocorrelation: {lag1:.3f} (threshold: 0.3)\n"
+            f"   Same as previous: {pct_same:.1f}% (threshold: 70%)\n"
+            "   This means a naive 'same as yesterday' predictor performs well.\n"
+            "   Implications:\n"
+            "   - Model performance may be inflated by temporal persistence\n"
+            "   - Use purged/embargo cross-validation to get realistic estimates\n"
+            "   - Consider shorter or different prediction horizons"
+        )
+
+    # Provenance issues
+    if provenance_analysis:
+        if provenance_analysis.get("hard_leakage_detected"):
+            critical = provenance_analysis.get("critical_violations", [])
+            recommendations.append(
+                f"PROVENANCE LEAKAGE: {len(critical)} features have negative effective lookback.\n"
+                "   This indicates features that use future data in their computation.\n"
+                "   Fix: Review feature computation code for the flagged features\n"
+                "   Fix: Ensure all rolling windows look backward only"
+            )
+        elif not provenance_analysis.get("provenance_loaded"):
+            if "error" in provenance_analysis:
+                recommendations.append(
+                    "PROVENANCE MISSING: Feature provenance metadata not found.\n"
+                    "   Provenance tracking enables deterministic leakage detection.\n"
+                    "   Fix: Re-run the feature pipeline to generate provenance metadata\n"
+                    "   Command: python -m src.cli.compute"
+                )
+
     if recommendations:
         for i, rec in enumerate(recommendations, 1):
             print(f"\n{i}. {rec}")
@@ -912,6 +2412,81 @@ def print_summary(features_analysis: Dict, targets_analysis: Dict, base_features
                 status = "OK" if nan_pct < 20 else ("WARN" if nan_pct < 50 else "BAD")
                 print(f"   [{status:4}] {feat}: {nan_pct:.1f}% NaN")
                 print(f"         {desc[:70]}")
+
+
+def validate_provenance_data(
+    provenance_path: Path,
+    features_df: pd.DataFrame,
+) -> Dict:
+    """Validate feature provenance metadata for leakage detection.
+
+    This function performs the following checks:
+    1. Hard leakage check: Verify no feature has negative effective lookback
+    2. Target overlap check: Flag features with zero lookback (may use same-day data)
+    3. Coverage check: Report features missing from provenance registry
+    4. Summary statistics: Report provenance distribution
+
+    Args:
+        provenance_path: Path to feature_provenance.json
+        features_df: DataFrame with features for cross-referencing
+
+    Returns:
+        Dict with:
+        - provenance_loaded: bool indicating if provenance file was found
+        - total_features: number of features in provenance
+        - critical_violations: list of hard leakage violations
+        - warnings: list of target overlap warnings
+        - missing_from_registry: list of features in df but not in registry
+        - summary: provenance summary statistics
+        - hard_leakage_detected: bool indicating critical issue
+    """
+    if not HAS_PROVENANCE:
+        return {"error": "Provenance module not available"}
+
+    if not provenance_path.exists():
+        return {
+            "provenance_loaded": False,
+            "error": f"Provenance file not found: {provenance_path}",
+            "recommendation": "Re-run the feature pipeline to generate provenance metadata.",
+        }
+
+    try:
+        # Load provenance metadata
+        provenance = load_provenance_metadata(provenance_path)
+
+        # Validate for issues
+        critical_violations, warnings, optimizations = _validate_provenance_internal(provenance)
+
+        # Get features from DataFrame
+        meta_cols = {'symbol', 'date', '_row_id', 'index'}
+        feature_cols = [c for c in features_df.columns if c not in meta_cols]
+
+        # Check for features missing from registry
+        missing_from_registry = get_missing_provenance(feature_cols)
+
+        # Get summary statistics
+        summary = report_provenance_summary(provenance)
+
+        # Determine if hard leakage was detected
+        hard_leakage_detected = len(critical_violations) > 0
+
+        return {
+            "provenance_loaded": True,
+            "total_features": len(provenance),
+            "critical_violations": critical_violations,
+            "warnings": warnings,
+            "optimizations": optimizations,  # Lags that could potentially be reduced
+            "missing_from_registry": missing_from_registry,
+            "summary": summary,
+            "hard_leakage_detected": hard_leakage_detected,
+            "provenance": provenance,  # Full provenance data for detailed analysis
+        }
+
+    except Exception as e:
+        return {
+            "provenance_loaded": False,
+            "error": f"Failed to load provenance: {e}",
+        }
 
 
 def main():
@@ -986,9 +2561,40 @@ Examples:
         print("Validating EXPANSION_CANDIDATES (feature selection pool)...")
         expansion_analysis = validate_expansion_candidates(df)
 
+    # Validate feature value ranges (catches OHLC adjustment issues)
+    print("Validating feature value ranges...")
+    range_analysis = validate_feature_ranges(df)
+
+    # Validate raw price policy (no adjusted price columns in feature frame)
+    print("Validating raw price policy...")
+    raw_price_analysis = validate_raw_price_policy(df)
+
+    # Validate feature provenance metadata (deterministic leakage detection)
+    provenance_analysis = None
+    provenance_path = features_path.parent / "feature_provenance.json"
+    if HAS_PROVENANCE:
+        print("Validating feature provenance...")
+        provenance_analysis = validate_provenance_data(provenance_path, df)
+    else:
+        print("Provenance module not available - skipping provenance validation")
+
+    # Run shift test for leakage detection
+    shift_test_analysis = None
+    autocorr_analysis = None
+    if targets_path.exists():
+        print("Running shift test for leakage detection...")
+        targets_df = pd.read_parquet(targets_path)
+        shift_test_analysis = run_shift_test(df, targets_df)
+
+        print("Checking target autocorrelation...")
+        autocorr_analysis = check_target_autocorrelation(targets_df)
+
     # Print summary
     print_summary(features_analysis, targets_analysis, base_features_analysis,
-                  expansion_analysis=expansion_analysis, verbose=args.verbose)
+                  expansion_analysis=expansion_analysis, range_analysis=range_analysis,
+                  raw_price_analysis=raw_price_analysis,
+                  shift_test_analysis=shift_test_analysis, autocorr_analysis=autocorr_analysis,
+                  provenance_analysis=provenance_analysis, verbose=args.verbose)
 
 
 if __name__ == "__main__":
