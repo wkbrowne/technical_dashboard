@@ -152,15 +152,15 @@ def _compute_rolling_corr(
 
 def add_cross_asset_features(
     indicators_by_symbol: Dict[str, pd.DataFrame],
-    lag_days: int = 1
+    lag_days: int = 0
 ) -> None:
     """
     Add cross-asset signal features to all symbols.
 
-    IMPORTANT: All features are lagged by `lag_days` (default 1) to prevent
-    look-ahead bias since ETF prices are available at market close.
+    All ETF-based features use prices available at EOD t (same close time as stocks).
+    No lag is needed since ETF prices are known at the same time as stock prices.
 
-    Features added (all lagged by lag_days):
+    Features added:
 
     Risk Regime:
     - gold_spy_ratio: GLD/SPY ratio (fear vs greed)
@@ -189,7 +189,7 @@ def add_cross_asset_features(
 
     Args:
         indicators_by_symbol: Dictionary of symbol DataFrames (modified in place)
-        lag_days: Number of days to lag features (default 1 to avoid look-ahead bias)
+        lag_days: Number of days to lag features (default 0, ETF prices available at EOD)
     """
     logger.info(f"Computing cross-asset features (lag={lag_days} days)")
 

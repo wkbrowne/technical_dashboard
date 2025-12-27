@@ -84,14 +84,10 @@ def assemble_indicators_from_wide(
             if col not in df.columns:
                 df[col] = np.nan
 
-        # Adjust OHLC prices using adjustment factor
-        if (adjust_ohlc_with_factor and 
-            ("close" in df.columns) and 
-            ("adjclose" in df.columns)):
-            with np.errstate(divide='ignore', invalid='ignore'):
-                factor = df["adjclose"] / df["close"]
-            for c in ["open", "high", "low"]:
-                df[c] = df[c] * factor
+        # NOTE: OHLC adjustment is now handled by adjust_ohlc_to_adjclose() in ohlc_adjustment.py
+        # which uses forward adjustment (recent prices = actual trading prices).
+        # Do NOT adjust here to avoid double-adjustment issues.
+        # The adjust_ohlc_with_factor parameter is kept for backward compatibility but ignored.
 
         # Calculate log returns
         with np.errstate(divide='ignore', invalid='ignore'):

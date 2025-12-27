@@ -81,10 +81,12 @@ def add_liquidity_features(
 
     # Gap vs continuation ratio
     # High ratio = price moves mostly happen at open (overnight), not intraday
+    # Uses open[t], close[t], close[t-1] - all known at EOD t
     overnight_move = (o - c.shift(1)).abs()
     intraday_move = (c - o).abs()
     total_move = overnight_move + intraday_move + 1e-8
-    df['overnight_ratio'] = (overnight_move / total_move).astype('float32')
+    overnight_ratio = (overnight_move / total_move)
+    df['overnight_ratio'] = overnight_ratio.astype('float32')
 
     # Intraday range efficiency
     # How much of the high-low range was captured in open-close move

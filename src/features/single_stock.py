@@ -3,6 +3,20 @@ Single-stock feature computation without cross-sectional dependencies.
 
 This module provides a standalone function for computing all features that can be
 calculated for a single stock without requiring data from other stocks.
+
+POLICY: Raw prices for features, adjusted prices for targets
+------------------------------------------------------------------------
+- Feature computation uses RAW OHLC (unadjusted close, high, low, open)
+- This ensures point-in-time correctness: features reflect what was observable
+  at the close of day t, which is when the signal is generated
+- Splits within rolling windows are acceptable and expected in raw OHLC features
+- Adjusted prices (adjclose) are only permitted for:
+  1. Target generation (economic correctness for returns/PnL)
+  2. Backtest return calculations
+- Returns (ret column) still use adjclose for economic correctness
+
+This policy prevents retroactive rescaling of historical prices for indicators,
+which would create look-ahead bias in features computed from price levels.
 """
 import logging
 import numpy as np
@@ -48,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 def compute_single_stock_features(
     df: pd.DataFrame,
-    price_col: str = 'adjclose',
+    price_col: str = 'close',
     ret_col: str = 'ret',
     vol_col: str = 'volume',
     ensure_returns: bool = True
@@ -56,11 +70,17 @@ def compute_single_stock_features(
     """
     Compute all single-stock features that don't require cross-sectional data.
 
-    This function applies the complete single-stock feature stack without OHLC adjustment.
-    It assumes the input DataFrame already has properly adjusted price data.
+    This function applies the complete single-stock feature stack using RAW OHLC data.
+    No price adjustment is applied - features use observable end-of-day prices.
+
+    POLICY: Raw prices for features, adjusted prices for targets
+    - price_col defaults to 'close' (raw unadjusted close price)
+    - Features are computed from raw OHLC for point-in-time correctness
+    - Returns (ret_col) still use 'adjclose' for economic correctness
+    - Splits within rolling windows are acceptable and expected
 
     Features computed:
-    1. Returns (if not present and ensure_returns=True)
+    1. Returns (if not present and ensure_returns=True, uses adjclose)
     2. Trend features (MA slopes, agreement, etc.)
     3. RSI features (momentum oscillator)
     4. MACD features (histogram and derivative)
@@ -83,10 +103,10 @@ def compute_single_stock_features(
 
     Args:
         df: Input DataFrame with OHLCV data (must have index as DatetimeIndex)
-        price_col: Column name for price data (default: 'adjclose')
+        price_col: Column name for price data (default: 'close' for raw prices)
         ret_col: Column name for returns (default: 'ret')
         vol_col: Column name for volume data (default: 'volume')
-        ensure_returns: If True, calculate returns from price_col if not present
+        ensure_returns: If True, calculate returns from adjclose if not present
 
     Returns:
         DataFrame with all single-stock features added
@@ -98,7 +118,7 @@ def compute_single_stock_features(
         >>> import pandas as pd
         >>> # Load your stock data
         >>> stock_df = pd.read_parquet('AAPL.parquet')
-        >>> # Compute features
+        >>> # Compute features using raw close (default)
         >>> features_df = compute_single_stock_features(stock_df)
         >>> # Inspect what was added
         >>> new_cols = set(features_df.columns) - set(stock_df.columns)
@@ -112,13 +132,17 @@ def compute_single_stock_features(
     out = df.copy()
 
     # Ensure returns exist if requested
+    # NOTE: Returns always use adjclose for economic correctness (splits/dividends)
+    # even when price_col is 'close' for feature computation
     if ensure_returns and ret_col not in out.columns:
-        if price_col not in out.columns:
-            raise ValueError(f"Price column '{price_col}' not found in DataFrame")
+        # Prefer adjclose for returns, fall back to price_col
+        ret_source = 'adjclose' if 'adjclose' in out.columns else price_col
+        if ret_source not in out.columns:
+            raise ValueError(f"Return source column '{ret_source}' not found in DataFrame")
 
-        logger.debug(f"Calculating returns from {price_col}")
+        logger.debug(f"Calculating returns from {ret_source} (economic correctness)")
         with np.errstate(divide='ignore', invalid='ignore'):
-            out[ret_col] = np.log(pd.to_numeric(out[price_col], errors="coerce")).diff()
+            out[ret_col] = np.log(pd.to_numeric(out[ret_source], errors="coerce")).diff()
 
     # Validate required columns exist
     if price_col not in out.columns:

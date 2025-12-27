@@ -172,16 +172,18 @@ def compute_global_spread_features(
 
 def add_spread_features(
     indicators_by_symbol: Dict[str, pd.DataFrame],
-    lag_days: int = 1,
+    lag_days: int = 0,
 ) -> None:
     """Add daily spread features to all symbols.
 
     Computes global spread features and broadcasts to all symbols.
-    Features are lagged by lag_days to prevent look-ahead bias.
+
+    NOTE: Spread features use ETF prices (SPY, QQQ, IWM, etc.) which close
+    at 4:00pm ET with stocks, so no lag is required by default.
 
     Args:
         indicators_by_symbol: Dict of symbol -> DataFrame (modified in place)
-        lag_days: Number of days to lag features (default 1)
+        lag_days: Number of days to lag features (default 0)
     """
     logger.info(f"Computing daily spread features (lag={lag_days})")
 

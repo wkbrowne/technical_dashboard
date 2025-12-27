@@ -12,7 +12,7 @@ Supports multi-target generation for the 4-model system:
 - SHORT_PARABOLIC: 1.5 ATR up (stop), 2.5 ATR down (profit)
 """
 import logging
-from typing import Dict, Optional, List, Union
+from typing import Any, Dict, Optional, List, Union
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -123,11 +123,28 @@ def generate_triple_barrier_targets(df: pd.DataFrame, config: Dict,
     total_dropped = initial_rows - len(df_clean)
     if total_dropped > 0:
         logger.info(f"Cleaned data: dropped {total_dropped} rows with invalid data, {len(df_clean)} rows remaining")
-    
+
     if df_clean.empty:
         logger.warning("No valid data remaining after cleaning")
         return pd.DataFrame()
-    
+
+    # Validate OHLC consistency - close must be between low and high
+    # This catches unadjusted OHLC data (e.g., adjclose used as close but high/low not adjusted)
+    close_above_high = (df_clean['close'] > df_clean['high'] * 1.001).sum()  # 0.1% tolerance
+    close_below_low = (df_clean['close'] < df_clean['low'] * 0.999).sum()
+
+    if close_above_high > 0 or close_below_low > 0:
+        # Sample problematic rows for error message
+        invalid_mask = (df_clean['close'] > df_clean['high'] * 1.001) | (df_clean['close'] < df_clean['low'] * 0.999)
+        sample = df_clean[invalid_mask][['symbol', 'date', 'close', 'high', 'low']].head(5)
+        raise ValueError(
+            f"OHLC data is inconsistent: {close_above_high} rows have close > high, "
+            f"{close_below_low} rows have close < low. "
+            f"This typically indicates high/low are not split/dividend adjusted to match close. "
+            f"Ensure OHLC adjustment is applied before target generation.\n"
+            f"Sample invalid rows:\n{sample.to_string()}"
+        )
+
     # Process each symbol independently
     results = []
     symbols = df_clean['symbol'].unique()
@@ -969,24 +986,32 @@ def _compute_multi_targets_for_symbol(
 def generate_multi_targets_parallel(
     df: pd.DataFrame,
     model_keys: Optional[List[ModelKey]] = None,
+    model_configs: Optional[Dict[ModelKey, Dict[str, Any]]] = None,
     n_jobs: int = -1,
     weight_min_clip: float = 0.01,
     weight_max_clip: float = 10.0,
     parallel_config: Optional[ParallelConfig] = None
 ) -> pd.DataFrame:
     """
-    Generate multi-target labels in parallel for the 4-model system.
+    Generate multi-target labels for the 4-model system.
 
     This is the recommended entry point for multi-target generation.
-    Each symbol is processed independently with vectorized operations.
+    Each symbol is processed independently with vectorized numpy operations.
+
+    NOTE: Despite the name, this function now runs sequentially. Per-symbol work
+    is fast (vectorized numpy), so parallelism overhead exceeded compute time.
+    Function name kept for backward compatibility.
 
     Args:
         df: Long-format DataFrame with columns: symbol, date, close, high, low, atr
         model_keys: List of ModelKey to generate targets for (default: all 4)
-        n_jobs: Number of parallel workers (-1 = all cores)
+        model_configs: Optional dict mapping ModelKey -> config dict with up_mult,
+            dn_mult, max_horizon, start_every. If None, uses hardcoded defaults.
+            Can be loaded from barrier_calibration.json via override_target_configs().
+        n_jobs: Ignored (kept for API compatibility)
         weight_min_clip: Minimum weight value
         weight_max_clip: Maximum weight value
-        parallel_config: ParallelConfig for parallel processing
+        parallel_config: Ignored (kept for API compatibility)
 
     Returns:
         DataFrame with multi-target columns:
@@ -997,17 +1022,13 @@ def generate_multi_targets_parallel(
     if model_keys is None:
         model_keys = ModelKey.all_keys()
 
-    # Build model configs dict
-    model_configs = {k.value: get_target_config(k) for k in model_keys}
-
-    # Use ParallelConfig if provided
-    if parallel_config is not None:
-        n_jobs = parallel_config.n_jobs
-        backend = parallel_config.backend
-        verbose = parallel_config.verbose
+    # Build model configs dict (from provided configs or hardcoded defaults)
+    if model_configs is not None:
+        # Use provided configs, convert ModelKey keys to string values
+        configs_dict = {k.value: model_configs[k] for k in model_keys if k in model_configs}
     else:
-        backend = 'loky'
-        verbose = 0
+        # Fall back to hardcoded defaults
+        configs_dict = {k.value: get_target_config(k) for k in model_keys}
 
     if df.empty:
         logger.warning("Empty DataFrame provided to generate_multi_targets_parallel")
@@ -1021,7 +1042,7 @@ def generate_multi_targets_parallel(
 
     logger.info(f"Generating multi-targets for {len(model_keys)} models: {[k.value for k in model_keys]}")
     for k in model_keys:
-        cfg = model_configs[k.value]
+        cfg = configs_dict[k.value]
         logger.info(f"  {k.value}: up_mult={cfg['up_mult']}, dn_mult={cfg['dn_mult']}")
 
     # Get unique symbols
@@ -1043,73 +1064,69 @@ def generate_multi_targets_parallel(
         logger.warning("No symbols with sufficient data")
         return pd.DataFrame()
 
-    logger.info(f"Processing {len(symbol_dfs)} symbols with sufficient data")
+    logger.info(f"Processing {len(symbol_dfs)} symbols sequentially (vectorized per-symbol)")
 
-    # Process in parallel
-    try:
-        results = Parallel(n_jobs=n_jobs, backend=backend, verbose=verbose)(
-            delayed(_compute_multi_targets_for_symbol)(sym_df, model_configs)
-            for sym_df in symbol_dfs
-        )
+    # Process sequentially - per-symbol work is fast (vectorized numpy)
+    # Parallelism overhead exceeded compute time with ~500 small tasks
+    results = [
+        _compute_multi_targets_for_symbol(sym_df, configs_dict)
+        for sym_df in symbol_dfs
+    ]
 
-        # Filter and combine
-        valid_results = [r for r in results if not r.empty]
+    # Filter and combine
+    valid_results = [r for r in results if not r.empty]
 
-        if not valid_results:
-            logger.warning("No valid multi-targets generated")
-            return pd.DataFrame()
+    if not valid_results:
+        logger.warning("No valid multi-targets generated")
+        return pd.DataFrame()
 
-        combined = pd.concat(valid_results, ignore_index=True)
-        logger.info(f"Generated {len(combined)} trajectories with {len(model_keys)} target columns each")
+    combined = pd.concat(valid_results, ignore_index=True)
+    logger.info(f"Generated {len(combined)} trajectories with {len(model_keys)} target columns each")
 
-        # Add overlap weights based on primary model (long_normal)
-        primary_h_used_col = f'h_used_{ModelKey.LONG_NORMAL.value}'
-        if primary_h_used_col in combined.columns:
-            # Create a temporary DataFrame for overlap calculation
-            temp_df = combined[['symbol', 't0']].copy()
-            temp_df['h_used'] = combined[primary_h_used_col]
+    # Add overlap weights based on primary model (long_normal)
+    primary_h_used_col = f'h_used_{ModelKey.LONG_NORMAL.value}'
+    if primary_h_used_col in combined.columns:
+        # Create a temporary DataFrame for overlap calculation
+        temp_df = combined[['symbol', 't0']].copy()
+        temp_df['h_used'] = combined[primary_h_used_col]
 
-            # Use existing overlap counting logic
-            temp_df = _add_overlap_counts(temp_df, {})
-            combined['n_overlapping_trajs'] = temp_df['n_overlapping_trajs']
+        # Use existing overlap counting logic
+        temp_df = _add_overlap_counts(temp_df, {})
+        combined['n_overlapping_trajs'] = temp_df['n_overlapping_trajs']
 
-            # Calculate overlap weights
-            combined['weight_overlap'] = 1.0 / (combined['n_overlapping_trajs'] + 0.5)
+        # Calculate overlap weights
+        combined['weight_overlap'] = 1.0 / (combined['n_overlapping_trajs'] + 0.5)
 
-            # Class balance weights based on primary model's hit column
-            primary_hit_col = f'hit_{ModelKey.LONG_NORMAL.value}'
-            if primary_hit_col in combined.columns:
-                class_counts = combined[primary_hit_col].value_counts()
-                total_samples = len(combined)
-                n_classes = len(class_counts)
+        # Class balance weights based on primary model's hit column
+        primary_hit_col = f'hit_{ModelKey.LONG_NORMAL.value}'
+        if primary_hit_col in combined.columns:
+            class_counts = combined[primary_hit_col].value_counts()
+            total_samples = len(combined)
+            n_classes = len(class_counts)
 
-                class_weights = {}
-                for class_val, count in class_counts.items():
-                    class_weights[class_val] = total_samples / (n_classes * count)
+            class_weights = {}
+            for class_val, count in class_counts.items():
+                class_weights[class_val] = total_samples / (n_classes * count)
 
-                combined['weight_class_balance'] = combined[primary_hit_col].map(class_weights)
-                combined['weight_final'] = combined['weight_overlap'] * combined['weight_class_balance']
+            combined['weight_class_balance'] = combined[primary_hit_col].map(class_weights)
+            combined['weight_final'] = combined['weight_overlap'] * combined['weight_class_balance']
 
-                # Clip and normalize
+            # Clip and normalize
+            combined['weight_final'] = np.clip(combined['weight_final'], weight_min_clip, weight_max_clip)
+            weight_sum = combined['weight_final'].sum()
+            if weight_sum > 0:
+                combined['weight_final'] = combined['weight_final'] * len(combined) / weight_sum
                 combined['weight_final'] = np.clip(combined['weight_final'], weight_min_clip, weight_max_clip)
-                weight_sum = combined['weight_final'].sum()
-                if weight_sum > 0:
-                    combined['weight_final'] = combined['weight_final'] * len(combined) / weight_sum
-                    combined['weight_final'] = np.clip(combined['weight_final'], weight_min_clip, weight_max_clip)
 
-        # Log class distributions for each model
-        logger.info("Target class distributions:")
-        for model_key in model_keys:
-            hit_col = f'hit_{model_key.value}'
-            if hit_col in combined.columns:
-                counts = combined[hit_col].value_counts().sort_index()
-                logger.info(f"  {model_key.value}: +1={counts.get(1, 0)}, 0={counts.get(0, 0)}, -1={counts.get(-1, 0)}")
+    # Log class distributions for each model
+    logger.info("Target class distributions:")
+    for model_key in model_keys:
+        hit_col = f'hit_{model_key.value}'
+        if hit_col in combined.columns:
+            counts = combined[hit_col].value_counts().sort_index()
+            logger.info(f"  {model_key.value}: +1={counts.get(1, 0)}, 0={counts.get(0, 0)}, -1={counts.get(-1, 0)}")
 
-        return combined
-
-    except Exception as e:
-        logger.error(f"Error in parallel multi-target generation: {e}")
-        raise
+    return combined
 
 
 def validate_and_filter_extreme_targets(

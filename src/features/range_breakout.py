@@ -83,9 +83,14 @@ def add_range_breakout_features(
     # --- Gaps ---
     # gap = (close / prev_close - 1) but safe
     df["gap_pct"] = _safe_div(close, prev_close) - 1.0
-    df["gap_atr_ratio"] = _safe_div(df["gap_pct"], df["atr_percent"])  # NaN if ATR% ~ 0
+    # gap_atr_ratio: daily return normalized by ATR%
+    # At row t: (close[t]/close[t-1] - 1) / atr%[t] - known at EOD t
+    gap_atr_ratio = _safe_div(df["gap_pct"], df["atr_percent"])
+    df["gap_atr_ratio"] = gap_atr_ratio.astype("float32")
 
     # --- Overnight/Gap Features (not in pandas-ta, implemented manually) ---
+    # All gap features use data known by EOD t (open, high, low, close, prev_close)
+    # No shift needed: entry is at t+1, all day-t data is available at EOD t
     # Overnight return = open / prev_close - 1
     open_price = pd.to_numeric(df["open"], errors="coerce") if "open" in df.columns else close
     overnight_ret = _safe_div(open_price, prev_close) - 1.0
@@ -118,6 +123,7 @@ def add_range_breakout_features(
     gap_dn_mask = is_gap_dn & (gap_dn_fill_den.abs() > EPS)
     gap_fill_frac.loc[gap_dn_mask] = (gap_dn_fill_num[gap_dn_mask] / gap_dn_fill_den[gap_dn_mask]).clip(0, 1)
 
+    # All inputs (open, high, low) known at EOD t
     df["gap_fill_frac"] = gap_fill_frac.astype("float32")
 
     # --- ATR% change feature ---

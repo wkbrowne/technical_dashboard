@@ -237,7 +237,7 @@ def add_volatility_term_structure(
     indicators_by_symbol: Dict[str, pd.DataFrame],
     vxx_symbol: str = "VXX",
     vixy_symbol: str = "VIXY",
-    lag_days: int = 1
+    lag_days: int = 0
 ) -> None:
     """
     Add volatility term structure features using VXX/VIXY ETPs.
@@ -245,10 +245,10 @@ def add_volatility_term_structure(
     These ETPs track VIX futures, and their behavior relative to spot VIX
     provides insights into the volatility term structure (contango/backwardation).
 
-    IMPORTANT: All features are lagged by `lag_days` (default 1) to prevent
-    look-ahead bias.
+    NOTE: VXX/VIXY are ETPs that close at 4:00pm ET with stocks, so no lag
+    is required by default. (This differs from VIX index which closes at 4:15pm.)
 
-    Features added (all lagged by lag_days):
+    Features added:
     - vxx_ret_5d: 5-day VXX return (volatility trend proxy)
     - vxx_ret_20d: 20-day VXX return
     - vxx_rsi_14: RSI of VXX (fear mean reversion)
@@ -257,7 +257,7 @@ def add_volatility_term_structure(
         indicators_by_symbol: Dictionary of symbol DataFrames (modified in place)
         vxx_symbol: Symbol for VXX
         vixy_symbol: Symbol for VIXY (alternative)
-        lag_days: Number of days to lag features (default 1 to avoid look-ahead bias)
+        lag_days: Number of days to lag features (default 0, ETPs close with stocks)
     """
     # Try VXX first, then VIXY
     vol_sym = None
