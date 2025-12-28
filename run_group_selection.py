@@ -236,6 +236,7 @@ def load_and_prepare_data(
     model_key: ModelKey,
     max_symbols: int = 5000,
     min_samples_per_symbol: int = 100,
+    use_weights: bool = False,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """Load and prepare data for group selection.
 
@@ -243,6 +244,8 @@ def load_and_prepare_data(
         model_key: The model key to load target for (determines which hit_* column to use)
         max_symbols: Maximum number of symbols to include
         min_samples_per_symbol: Minimum samples per symbol (unused currently)
+        use_weights: If True, load sample weights from overlap inverse weighting.
+                     If False (default), sample_weight will be None.
 
     Returns:
         Tuple of (X, y, sample_weight)
@@ -307,10 +310,15 @@ def load_and_prepare_data(
     else:
         y = (merged[target_col] == 1).astype(int)
 
-    # Sample weights
+    # Sample weights (only load if use_weights=True)
     sample_weight = None
-    if 'weight_final' in merged.columns:
+    if use_weights and 'weight_final' in merged.columns:
         sample_weight = merged['weight_final'].copy()
+        print(f"  Sample weights: ENABLED (overlap inverse weighting)")
+    elif use_weights:
+        print(f"  Sample weights: weight_final column not found, using uniform weights")
+    else:
+        print(f"  Sample weights: DISABLED (uniform weights)")
 
     # Set date as index
     X.index = merged['date']
@@ -508,6 +516,8 @@ def main():
                         help='Maximum number of symbols')
     parser.add_argument('--balanced', action='store_true',
                         help='Use class weights (scale_pos_weight)')
+    parser.add_argument('--use-weights', action='store_true',
+                        help='Use sample weights from overlap inverse weighting (default: disabled)')
     parser.add_argument('--n-folds', type=int, default=5,
                         help='Number of CV folds')
     parser.add_argument('--holdout-pct', type=float, default=0.05,
@@ -571,6 +581,7 @@ def main():
         X_full, y_full, sample_weight_full = load_and_prepare_data(
             model_key=model_key,
             max_symbols=args.max_symbols,
+            use_weights=args.use_weights,
         )
 
         # Split into train/holdout if holdout enabled
