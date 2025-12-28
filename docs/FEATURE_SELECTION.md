@@ -127,7 +127,7 @@ Uses sklearn-style inverse frequency weighting:
 weight_class_balance[c] = n_samples / (n_classes * N_c)
 ```
 
-**Note**: Class balance weighting is available but NOT applied by default. The pipeline uses overlap weighting only unless explicitly configured.
+**Note**: Sample weighting (both overlap inverse and class balance) is available but NOT applied by default. Use `--use-weights` flag to enable overlap inverse weighting.
 
 ### 2.5 Combined Sample Weight
 
@@ -250,7 +250,7 @@ def compute_regime_metrics(y_true, y_pred, regime, metric_fn):
     return regime_metrics
 ```
 
-**Future Enhancement**: Pass sector labels as regime to get sector-stratified AUC. See Section 15.
+**Future Enhancement**: Pass sector labels as regime to get sector-stratified AUC. See Section 16.
 
 ### 3.3 Probability Calibration Strategy
 
@@ -400,65 +400,92 @@ The **Group-First Pipeline** implements selection at the group level:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 Variance-Adjusted Acceptance Criteria
+### 5.2 Signal-to-Noise Acceptance Criteria
 
-All selection phases use **variance-adjusted acceptance** to reduce false positives from noisy fold-level metrics. A move is accepted if and only if:
+All selection phases use a **two-gate SNR acceptance rule** to reduce false positives from noisy fold-level metrics. A move is accepted if and only if BOTH gates pass:
 
 ```
-Δ_mean > max(epsilon, c × Δ_std)
+Gate 1 (Practical Minimum):  Δ_mean > epsilon
+Gate 2 (Signal-to-Noise):    t_stat > t_threshold
 ```
 
 Where:
 - **Δ_mean**: Mean improvement across folds = `mean(metric_after[i] - metric_before[i])`
-- **Δ_std**: Standard deviation of fold-level deltas (using sample std, ddof=1)
-- **epsilon**: Base threshold (e.g., `epsilon_add = 0.002`)
-- **c = 0.5**: Fixed noise floor multiplier (not configurable)
+- **Δ_std**: Standard deviation of per-fold improvement deltas (using sample std, ddof=1)
+- **SE**: Standard error of the mean = `Δ_std / sqrt(n_folds)`
+- **t_stat**: Signal-to-noise ratio = `Δ_mean / (SE + 1e-12)`
+- **epsilon**: Minimum practical improvement (move-type-specific)
+- **t_threshold**: Minimum t-statistic for reliability (move-type-specific)
 
-**Why Variance-Adjusted?**
+**Why Per-Fold Improvement Deltas?**
+
+The key insight is measuring improvement RELATIVE TO THE BASELINE per fold:
+- d_i = metric_after_fold_i - metric_before_fold_i
+
+This measures the IMPROVEMENT signal, not absolute metric variability. A feature that improves every fold by 0.001 has low improvement noise, even if absolute AUC varies significantly across folds (0.58, 0.62, 0.60...).
+
+**Why Two Gates?**
 
 Simple threshold checks (`delta >= epsilon`) are susceptible to selection bias:
 - With 5 folds and many candidate groups, random variation can exceed epsilon
 - This leads to optimistically biased CV metrics that don't generalize
-- Variance-adjusted acceptance requires the improvement to exceed the noise floor
 
-**Example:**
+The two-gate approach ensures:
+1. **Epsilon Gate**: The improvement has practical significance (not just statistical)
+2. **t-stat Gate**: The improvement is reliable, not noise (high signal-to-noise ratio)
+
+**Move-Type-Specific Thresholds:**
+
+| Move Type | epsilon | t_threshold | Rationale |
+|-----------|---------|-------------|-----------|
+| `add` | 0.0001 | 0.5 | Lenient: want exploration |
+| `swap` | 0.0005 | 1.0 | Moderate: meaningful swap |
+| `drop` | 0.0005 | 1.0 | Moderate: meaningful drop |
+| `add_interaction` | 0.0015 | 0.5 | Higher epsilon for interactions |
+
+**Example (5 folds):**
 ```
-Evaluating group 'momentum_quality':
-  Δ_mean = 0.0035 (improvement)
-  Δ_std  = 0.0080 (high variance across folds)
-  threshold = max(0.002, 0.5 × 0.0080) = 0.004
+Evaluating group 'momentum_quality' (add move):
+  Δ_mean = 0.00035 (improvement)
+  Δ_std  = 0.0080 (variance in improvement across folds)
+  SE     = 0.0080 / sqrt(5) = 0.00358
+  t_stat = 0.00035 / 0.00358 = 0.098
 
-  Result: REJECTED (0.0035 <= 0.004)
-  Reason: Improvement is not statistically meaningful given fold variance
+  Gate 1: Δ_mean (0.00035) > epsilon (0.0001) → PASS
+  Gate 2: t_stat (0.098) > t_threshold (0.5) → FAIL
+
+  Result: REJECTED
+  Reason: t_stat too low - improvement not reliable enough
 ```
 
 **Grouped Forward Selection (Step 2):**
 Accept group if:
-- `Δ_mean > max(epsilon_add, 0.5 × Δ_std)` (default epsilon: 0.002)
+- `Δ_mean > epsilon_add` (default: 0.0001) AND `t_stat > t_add` (default: 0.5)
 - The entire group is added atomically
 
 **Enhanced Local Search (Step 3):**
 Supports three move types in a deterministic hill-climbing loop:
-- **swap**: Remove group g, add group h if `Δ_mean > max(epsilon_swap, 0.5 × Δ_std)`
-- **add**: Add group h if `Δ_mean > max(epsilon_add, 0.5 × Δ_std)`
-- **drop**: Remove group g if `Δ_mean > max(epsilon_drop, 0.5 × Δ_std)`
+- **swap**: `Δ_mean > epsilon_swap` (0.0005) AND `t_stat > t_swap` (1.0)
+- **add**: `Δ_mean > epsilon_add` (0.0001) AND `t_stat > t_add` (0.5)
+- **drop**: `Δ_mean > epsilon_drop` (0.0005) AND `t_stat > t_drop` (1.0)
 
 Features:
 - **Caching**: Evaluation results cached to avoid redundant CV calls
 - **Tabu** (optional): Prevents cycling by forbidding recent moves
 - **Deterministic**: No randomness, reproducible results
-- **Variance-Adjusted**: All moves use fold-level variance for acceptance
+- **SNR-Adjusted**: All moves use per-fold delta statistics for acceptance
 
 **Group Backward Elimination (Step 4):**
 Remove group if:
-- `Δ_mean >= -max(epsilon_remove, 0.5 × Δ_std)` (loss within acceptable variance)
+- `Δ_mean >= -epsilon_remove` (loss within acceptable tolerance)
 - If `allow_baseline_demotions=True`, baseline groups can also be removed
+- Note: Backward elimination uses loss tolerance, not t-stat gate
 
 **Template-Based Interactions (Step 5):**
 - Templates define group-to-group interactions (not feature×feature)
 - A template is **eligible** only if both parent groups are selected
 - Add up to `max_interaction_groups` (default: 3) interaction groups
-- Uses `epsilon_add_interaction` (default: 0.0015) with variance-adjusted check
+- Uses `epsilon_add_interaction` (0.0015) and `t_add_interaction` (0.5)
 
 ### 5.3 Holdout Evaluation
 
@@ -515,12 +542,21 @@ Gap:         +0.0350
 ```python
 @dataclass
 class GroupSelectionConfig:
-    # Thresholds
-    epsilon_add: float = 0.002               # Min improvement to add
-    epsilon_swap: float = 0.001              # Min improvement for swaps
+    # Epsilon thresholds (minimum improvement in metric units)
+    epsilon_add: float = 0.0001              # Min improvement to add
+    epsilon_swap: float = 0.0005             # Min improvement for swaps
     epsilon_remove: float = 0.001            # Max loss to remove
     epsilon_drop: float = 0.0005             # Min improvement for drop moves
     epsilon_add_interaction: float = 0.0015  # Min improvement for interactions
+
+    # Signal-to-noise thresholds (t = Δ_mean / SE)
+    t_add: float = 0.5                       # t-threshold for adds (lenient)
+    t_swap: float = 1.0                      # t-threshold for swaps (moderate)
+    t_drop: float = 1.0                      # t-threshold for drops (moderate)
+    t_add_interaction: float = 0.5           # t-threshold for interaction adds
+
+    # Debug flag for acceptance diagnostics
+    debug_acceptance: bool = False           # Print per-move acceptance details
 
     # Group constraints
     allow_baseline_demotions: bool = False
@@ -548,8 +584,10 @@ We intentionally choose slightly sub-optimal but robust group sets:
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `epsilon_add` | 0.002 | Substantial improvement needed to add |
-| `epsilon_swap` | 0.001 | Meaningful improvement for swaps |
+| `epsilon_add` | 0.0001 | Minimum practical improvement for adds |
+| `epsilon_swap` | 0.0005 | Meaningful improvement for swaps |
+| `t_add` | 0.5 | Lenient t-threshold for exploration |
+| `t_swap` | 1.0 | Moderate t-threshold for reliability |
 | `epsilon_remove` | 0.001 | Only keep groups that clearly help |
 | `max_groups` | 20 | Limit total model complexity |
 
@@ -634,13 +672,13 @@ INTERACTION_GROUPS = {
 
 ---
 
-## 6. Thematic Pair and Triple Selection
+## 7. Thematic Pair and Triple Selection
 
-### 6.1 Design Philosophy
+### 7.1 Design Philosophy
 
 Pairs and triples should represent **meaningful thematic combinations**, not arbitrary interactions. Each combination should tell a coherent story about market state.
 
-### 6.2 Example Thematic Combinations
+### 7.2 Example Thematic Combinations
 
 **Momentum + Regime + Higher Timeframe:**
 ```python
@@ -660,7 +698,7 @@ Pairs and triples should represent **meaningful thematic combinations**, not arb
 ("alpha_mom_spy_20_ema10", "rv_z_60", "w_fred_bamlh0a0hym2_z60")
 ```
 
-### 6.3 Domain-Aware Interaction Patterns
+### 7.3 Domain-Aware Interaction Patterns
 
 The pipeline uses comprehensive domain knowledge from quantitative trading research to filter and prioritize interaction candidates. Pattern matching is substring-based.
 
@@ -702,7 +740,7 @@ The pipeline uses comprehensive domain knowledge from quantitative trading resea
 
 See `src/feature_selection/interactions.py` for the complete `DOMAIN_PATTERNS` list with detailed rationale for each pattern category.
 
-### 6.4 Interaction Types
+### 7.4 Interaction Types
 
 The pipeline supports four interaction types based on the economic relationship between features:
 
@@ -738,7 +776,7 @@ PATTERN_INTERACTION_TYPES = {
 }
 ```
 
-### 6.5 Template-Based Interaction System
+### 7.5 Template-Based Interaction System
 
 The template-based interaction system replaces ad-hoc feature×feature interactions with
 **thematic group-to-group templates**. Each template represents a coherent economic
@@ -831,31 +869,11 @@ already in the selected feature set. This ensures:
 ]
 ```
 
-### 6.5 Implementation in Pipeline
-
-**Step 4 (Light Interaction Pass):**
-```python
-# Generate interaction candidates from top importance features
-interaction_candidates = []
-for i, f1 in enumerate(top_features):
-    for f2 in top_features[i+1:]:
-        # Check domain pattern for recommended interaction types
-        recommended_types = get_recommended_interaction_types(f1, f2)
-
-        for interaction_type in config.interaction_types:
-            # Generate the interaction feature
-            name, values = generate_interaction_feature(X, f1, f2, interaction_type)
-
-            # Accept if improvement >= epsilon_add_interaction
-            if improvement >= config.epsilon_add_interaction:
-                current_set.add(name)
-```
-
 ---
 
-## 7. Parallelization Strategy
+## 8. Parallelization Strategy
 
-### 7.1 Core Principle: Optimize CPU Utilization
+### 8.1 Core Principle: Optimize CPU Utilization
 
 The parallelization strategy adapts based on dataset size:
 
@@ -877,7 +895,7 @@ The parallelization strategy adapts based on dataset size:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 Configuration Parameters
+### 8.2 Configuration Parameters
 
 ```python
 @dataclass
@@ -891,7 +909,7 @@ class SearchConfig:
     interaction_num_threads_model: int = 1 # Threads per model
 ```
 
-### 7.3 Dataset Size Heuristics
+### 8.3 Dataset Size Heuristics
 
 | Dataset Rows | Single Model Utilization | Recommended Strategy |
 |--------------|--------------------------|----------------------|
@@ -900,7 +918,7 @@ class SearchConfig:
 | 50,000 - 200,000 | High | `n_jobs=2, num_threads=4` |
 | > 200,000 | Full | `n_jobs=1, num_threads=-1` |
 
-### 7.4 Joblib Parallelization Pattern
+### 8.4 Joblib Parallelization Pattern
 
 All parallel evaluation uses joblib with the loky backend:
 
@@ -922,11 +940,53 @@ results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
 - **No shared state**: Workers are independent (avoids GIL issues)
 - **Loky backend**: Process-based parallelism for true multi-core usage
 
+### 8.5 Group Selection Parallelism
+
+Group selection (`grouped_swap_selection`) evaluates candidate moves in parallel.
+The key configuration options in `GroupSelectionConfig`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `parallelize_moves` | `True` | Enable parallel move evaluation |
+| `n_move_workers` | `-1` | Workers for move eval (-1 = use n_jobs) |
+| `use_loky_for_moves` | `True` | Use loky (processes) instead of threading |
+| `debug_parallelism` | `False` | Print PID from worker processes for verification |
+
+**Why Loky (Processes) Instead of Threading?**
+
+LightGBM training is CPU-bound. Python's Global Interpreter Lock (GIL) prevents
+threads from running Python code in parallel. With threading backend, only one
+worker effectively runs at a time, serializing all move evaluations.
+
+Loky (process-based) parallelism spawns separate processes that each have their
+own Python interpreter and bypass the GIL, enabling true parallel execution.
+
+**Trade-offs:**
+- **Pro**: True parallelism for CPU-bound work
+- **Con**: Objects must be picklable (evaluator is pickled to workers)
+- **Con**: In-memory cache cannot be shared (disabled in loky mode)
+- **Con**: Slightly slower startup (process spawn vs thread)
+
+**Debugging Parallelism:**
+
+To verify that multiple processes are actually running in parallel:
+
+```python
+config = GroupSelectionConfig(
+    n_jobs=4,
+    use_loky_for_moves=True,
+    debug_parallelism=True,  # Enable PID logging
+)
+```
+
+This prints `[PID 12345] Evaluating move: swap:group_a->group_b` from each
+worker, showing different PIDs confirms parallel execution.
+
 ---
 
-## 8. Cross-Validation with Purging
+## 9. Cross-Validation with Purging
 
-### 8.1 Time-Series CV Configuration
+### 9.1 Time-Series CV Configuration
 
 ```python
 @dataclass
@@ -938,7 +998,7 @@ class CVConfig:
     min_train_samples: int = 1000
 ```
 
-### 8.2 Purging and Embargo
+### 9.2 Purging and Embargo
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -961,9 +1021,9 @@ class CVConfig:
 
 ---
 
-## 9. Model Configuration
+## 10. Model Configuration
 
-### 9.1 LightGBM Settings
+### 10.1 LightGBM Settings
 
 ```python
 @dataclass
@@ -986,7 +1046,7 @@ class ModelConfig:
     num_boost_round: int = 500
 ```
 
-### 9.2 Regularization for Robustness
+### 10.2 Regularization for Robustness
 
 The model intentionally uses moderate regularization:
 - `reg_alpha = 0.1`: L1 penalty shrinks weak features to zero
@@ -996,9 +1056,9 @@ The model intentionally uses moderate regularization:
 
 ---
 
-## 10. Checkpointing and Resumption
+## 11. Checkpointing and Resumption
 
-### 10.1 Checkpoint Structure
+### 11.1 Checkpoint Structure
 
 The pipeline saves state after each stage to `artifacts/feature_selection/checkpoint.pkl`:
 
@@ -1021,7 +1081,7 @@ checkpoint = {
 }
 ```
 
-### 10.2 Resumption
+### 11.2 Resumption
 
 ```bash
 # Check checkpoint status
@@ -1031,7 +1091,7 @@ python run_feature_selection.py --checkpoint-info
 python run_feature_selection.py --resume
 ```
 
-### 10.3 Stage Identifiers
+### 11.3 Stage Identifiers
 
 ```
 1_base_features        # Initial base features evaluation
@@ -1045,9 +1105,9 @@ python run_feature_selection.py --resume
 
 ---
 
-## 11. Running Group Selection
+## 12. Running Group Selection
 
-### 11.1 Basic Usage (Group-First)
+### 12.1 Basic Usage (Group-First)
 
 ```bash
 # Run group selection for a single model
@@ -1063,17 +1123,18 @@ python run_group_selection.py --model long_normal --allow-demotions
 python run_group_selection.py --model long_normal --epsilon-add 0.003 --epsilon-swap 0.002
 ```
 
-### 11.2 CLI Options
+### 12.2 CLI Options
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--model` | `long_normal` | Model: `long_normal`, `long_parabolic`, `short_normal`, `short_parabolic`, or `all` |
-| `--epsilon-add` | 0.002 | Minimum improvement to add a group |
-| `--epsilon-swap` | 0.001 | Minimum improvement for swaps |
+| `--epsilon-add` | 0.0001 | Minimum improvement to add a group |
+| `--epsilon-swap` | 0.0005 | Minimum improvement for swaps |
 | `--allow-demotions` | False | Allow dropping baseline groups |
 | `--max-groups` | 20 | Maximum total groups to select |
 | `--max-symbols` | 5000 | Maximum symbols to use |
 | `--balanced` | False | Use class weights (scale_pos_weight) |
+| `--use-weights` | False | Use sample weights from overlap inverse weighting |
 | `--n-folds` | 5 | Number of CV folds |
 | `--holdout-pct` | 0.05 | Fraction of dates for holdout evaluation (0 to disable) |
 | `--n-jobs` | 4 | Number of parallel jobs for CV |
@@ -1089,7 +1150,7 @@ python run_group_selection.py --model long_normal --epsilon-add 0.003 --epsilon-
 | `--group-k` | 2 | Default K for K-of-N selection within groups |
 | `--epsilon-add-feature` | 0.0005 | Minimum improvement to add a feature within group |
 
-### 11.3 Programmatic Usage
+### 12.3 Programmatic Usage
 
 ```python
 from src.feature_selection import (
@@ -1123,14 +1184,28 @@ metric_config = MetricConfig(
     secondary_metrics=[MetricType.LOG_LOSS],
 )
 
-# Configure group selection
+# Configure group selection (with SNR acceptance thresholds)
 config = GroupSelectionConfig(
-    epsilon_add=0.002,
-    epsilon_swap=0.001,
-    epsilon_remove=0.001,
+    # Epsilon thresholds (minimum improvement in metric units)
+    epsilon_add=0.0001,           # Min improvement to add a group
+    epsilon_swap=0.0005,          # Min improvement for swaps
+    epsilon_remove=0.001,         # Max loss allowed when removing
+    epsilon_drop=0.0005,          # Min improvement for drop moves
+    epsilon_add_interaction=0.0015,  # Min improvement for interactions
+
+    # Signal-to-noise thresholds (t = delta_mean / SE)
+    t_add=0.5,                    # t-threshold for adds (lenient)
+    t_swap=1.0,                   # t-threshold for swaps (moderate)
+    t_drop=1.0,                   # t-threshold for drops (moderate)
+    t_add_interaction=0.5,        # t-threshold for interaction adds
+
+    # Group constraints
     allow_baseline_demotions=False,
     max_groups=20,
     max_interaction_groups=3,
+
+    # Debug
+    debug_acceptance=False,       # Print per-move acceptance details
 )
 
 # Run selection
@@ -1152,13 +1227,20 @@ print(f"Baseline AUC: {result.baseline_metric:.4f}")
 print(f"Final AUC: {result.final_metric:.4f}")
 ```
 
-### 11.4 Legacy Singleton Selection
+### 12.4 Legacy Singleton Selection
 
 The legacy singleton-based selection (`run_feature_selection.py`) is still available for backwards compatibility but is deprecated in favor of group-first selection.
 
-### 11.5 Using Sample Weights
+### 12.5 Using Sample Weights
 
-Sample weights from triple barrier targets (overlap inverse) are automatically loaded and passed through the pipeline when using `run_feature_selection.py`:
+Sample weights from triple barrier targets (overlap inverse) are **opt-in** and disabled by default. To enable them, use the `--use-weights` flag:
+
+```bash
+# Enable sample weights
+python run_group_selection.py --model long_normal --use-weights
+```
+
+When enabled, weights are loaded from `targets_triple_barrier.parquet` and passed through the pipeline:
 
 ```python
 # Sample weights are loaded from targets_triple_barrier.parquet
@@ -1190,9 +1272,9 @@ train_data = lgb.Dataset(
 
 ---
 
-## 12. Output Files
+## 13. Output Files
 
-### 12.1 Feature Selection Artifacts
+### 13.1 Feature Selection Artifacts
 
 ```
 artifacts/feature_selection/
@@ -1203,7 +1285,7 @@ artifacts/feature_selection/
 └── feature_importance.csv   # Feature importance scores (if computed)
 ```
 
-### 12.2 Results Format
+### 13.2 Results Format
 
 ```python
 # selected_features.txt
@@ -1241,12 +1323,12 @@ trend_score_sign
 
 ---
 
-## 13. Key Files Reference
+## 14. Key Files Reference
 
 | File | Purpose |
 |------|---------|
 | `src/feature_selection/base_features.py` | CORE_GROUPS, HEAD_GROUPS, CANDIDATE_GROUPS, INTERACTION_TEMPLATES |
-| `src/feature_selection/group_selection.py` | Group-first selection algorithms, `_variance_adjusted_acceptance()` |
+| `src/feature_selection/group_selection.py` | Group-first selection algorithms, `_snr_acceptance()` |
 | `src/feature_selection/config.py` | Configuration dataclasses including GroupSelectionConfig |
 | `src/feature_selection/evaluation.py` | SubsetEvaluator for CV evaluation (returns `fold_metrics`) |
 | `src/feature_selection/cv.py` | Time-series CV with purging |
@@ -1259,23 +1341,23 @@ trend_score_sign
 
 ---
 
-## 14. Best Practices
+## 15. Best Practices
 
-### 14.1 Feature Design
+### 15.1 Feature Design
 
 1. **Normalize features**: Use z-scores, percentiles, or ratios (not raw prices)
 2. **Include multi-timeframe**: Daily + weekly versions capture different signals
 3. **Domain knowledge**: Group features by economic meaning
 4. **Avoid redundancy**: Check correlation between candidate features
 
-### 14.2 Selection Process
+### 15.2 Selection Process
 
 1. **Start with BASE_FEATURES**: Proven feature set as starting point
 2. **Use sample weights**: Always weight by overlap inverse
 3. **Validate on holdout**: Final validation on unseen time period
 4. **Monitor stability**: Features should be consistent across CV folds
 
-### 14.3 Parallelization
+### 15.3 Parallelization
 
 1. **Match to dataset size**: Adjust n_jobs based on data volume
 2. **Avoid over-parallelization**: n_jobs * num_threads ~ CPU_count
@@ -1284,9 +1366,9 @@ trend_score_sign
 
 ---
 
-## 15. Future Enhancements
+## 16. Future Enhancements
 
-### 15.1 Planned Features
+### 16.1 Planned Features
 
 **1. Sector-Stratified Evaluation** (Infrastructure exists, needs exposure)
 
@@ -1459,9 +1541,9 @@ def joint_feature_hyperparam_search(
 
 ---
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
-### 16.1 Common Issues
+### 17.1 Common Issues
 
 **Pipeline stuck on one stage:**
 - Check for infinite loop in backward elimination
@@ -1483,7 +1565,7 @@ def joint_feature_hyperparam_search(
 - Check that sector-relative alpha features are included
 - Verify sector distribution in training data
 
-### 16.2 Debugging
+### 17.2 Debugging
 
 ```python
 # Check checkpoint status
@@ -1499,9 +1581,9 @@ for snapshot in pipeline.snapshots:
 
 ---
 
-## 17. Multi-Model Feature Selection
+## 18. Multi-Model Feature Selection
 
-### 17.1 Overview
+### 18.1 Overview
 
 The multi-model feature selection system runs the Loose-Tight pipeline independently for each of the 4 model targets while ensuring:
 
@@ -1518,7 +1600,7 @@ The multi-model feature selection system runs the Loose-Tight pipeline independe
 | `SHORT_NORMAL` | Lower barrier hit | Breakdown / fragility setups |
 | `SHORT_PARABOLIC` | Extended lower | Panic / regime shift |
 
-### 17.2 Running Multi-Model Selection
+### 18.2 Running Multi-Model Selection
 
 **CLI Usage:**
 
@@ -1566,7 +1648,7 @@ print(f"AUC: {result.cv_auc_mean:.4f} ± {result.cv_auc_std:.4f}")
 print(f"Features: {result.selected_features}")
 ```
 
-### 17.3 Output Artifacts
+### 18.3 Output Artifacts
 
 **Per-Model Artifacts:**
 
@@ -1659,7 +1741,7 @@ artifacts/feature_selection/
 }
 ```
 
-### 17.4 CORE and HEAD Features
+### 18.4 CORE and HEAD Features
 
 **CORE_FEATURES**: Features selected by ALL 4 models (intersection). These represent the most universally predictive signals.
 
@@ -1693,7 +1775,7 @@ for model_key, head_feats in summary['head_features'].items():
         print(f"  - {feat}")
 ```
 
-### 17.5 Overlap Analysis
+### 18.5 Overlap Analysis
 
 **Jaccard Similarity**: Measures pairwise overlap between model feature sets:
 
@@ -1713,7 +1795,7 @@ Jaccard(A, B) = |A ∩ B| / |A ∪ B|
 | 0.3 - 0.5 | Low overlap, models capture different patterns |
 | < 0.3 | Very different, models may target distinct regimes |
 
-### 17.6 Run Signature for Reproducibility
+### 18.6 Run Signature for Reproducibility
 
 Each selection run generates a unique signature combining:
 
@@ -1741,7 +1823,7 @@ This signature enables:
 - Detecting when results need to be regenerated (data/config changed)
 - Reproducibility auditing
 
-### 17.7 Label Column Structure
+### 18.7 Label Column Structure
 
 Each model uses its own target column from triple barrier labeling with different ATR multiples:
 
@@ -1762,7 +1844,7 @@ The `get_model_labels()` function automatically:
 2. Filters out timeout samples (hit=0) for binary classification
 3. Converts to binary labels (1=success, 0=failure)
 
-### 17.8 Best Practices
+### 18.8 Best Practices
 
 1. **Run all 4 models together**: Ensures identical CV splits and feature universe
 2. **Use caching for iteration**: `--use-cache` speeds up re-runs during tuning
@@ -1770,7 +1852,7 @@ The `get_model_labels()` function automatically:
 4. **Monitor CORE size**: A small CORE indicates models target very different signals
 5. **Validate against registry**: Ensure selected features exist in `base_features.py`
 
-### 17.9 Auto-Updating Feature Registry
+### 18.9 Auto-Updating Feature Registry
 
 After multi-model selection, you can automatically update `base_features.py` with the new CORE/HEAD features:
 
@@ -1825,7 +1907,7 @@ result = update_base_features_file(
 )
 ```
 
-### 17.10 Integration with Training Pipeline
+### 18.10 Integration with Training Pipeline
 
 After multi-model selection, the results feed into model training:
 
