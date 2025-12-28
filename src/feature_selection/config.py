@@ -162,9 +162,9 @@ class SearchConfig:
         use_domain_filter_interactions: Whether to apply domain-aware filtering.
     """
     # Thresholds for selection decisions
-    epsilon_add: float = 0.002  # Minimum improvement to add (ignored if lenient_add=True)
+    epsilon_add: float = 0.0001  # Minimum improvement to add (ignored if lenient_add=True)
     epsilon_remove: float = 0.001  # Tolerance for removal
-    epsilon_swap: float = 0.001  # Minimum improvement for swap
+    epsilon_swap: float = 0.0005  # Minimum improvement for swap
 
     # Lenient forward selection: add unless clearly harmful
     # When True, adds feature UNLESS it causes significant degradation

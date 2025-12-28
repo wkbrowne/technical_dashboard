@@ -3,13 +3,21 @@
 This module provides the evaluate_subset function, which is the fundamental
 building block for all feature selection algorithms. It handles training,
 cross-validation, and metric computation in a memory-efficient manner.
+
+Parallelization Strategy:
+- Uses threading backend (not loky/processes) to avoid resource_tracker issues
+- Thread-safe caching with locks
+- LightGBM uses internal threading for training
 """
 
 import gc
+import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import pandas as pd
+
+from .parallel_config import get_joblib_kwargs
 
 from .config import (
     CVConfig, MetricConfig, MetricType, ModelConfig, SearchConfig,
@@ -244,7 +252,11 @@ class SubsetEvaluator:
         fold_indices: List[Tuple[np.ndarray, np.ndarray]],
         n_jobs: int
     ) -> List[Dict[str, Any]]:
-        """Evaluate folds in parallel using joblib.
+        """Evaluate folds in parallel using joblib with threading backend.
+
+        Note: When candidates are evaluated in parallel threads, this should
+        be called with n_jobs=1 to avoid nested parallelism issues. The
+        threading backend is used here for safety even when n_jobs > 1.
 
         Args:
             col_indices: Column indices for the feature subset.
@@ -257,7 +269,9 @@ class SubsetEvaluator:
         """
         from joblib import Parallel, delayed
 
-        results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
+        # Use threading backend to avoid loky/memmapping issues
+        joblib_kwargs = get_joblib_kwargs(n_jobs)
+        results = Parallel(**joblib_kwargs)(
             delayed(self._evaluate_single_fold)(
                 col_indices, feature_names, train_idx, test_idx
             )
@@ -495,7 +509,10 @@ def evaluate_subsets_parallel(
     evaluator: SubsetEvaluator,
     n_jobs: int = 4
 ) -> List[SubsetResult]:
-    """Evaluate multiple feature subsets in parallel using joblib.
+    """Evaluate multiple feature subsets in parallel using joblib threading.
+
+    Uses threading backend to avoid loky/memmapping resource_tracker issues.
+    Each thread shares the evaluator and data (no copying needed).
 
     Args:
         feature_sets: List of feature lists to evaluate.
@@ -507,18 +524,17 @@ def evaluate_subsets_parallel(
     """
     from joblib import Parallel, delayed
 
-    # Extract data and configs for passing to worker processes
-    X = evaluator._X
-    y = evaluator._y
-    model_config = evaluator.model_config
-    cv_config = evaluator.cv_config
-    metric_config = evaluator.metric_config
+    def _evaluate_subset_thread(features: List[str], idx: int) -> Tuple[int, SubsetResult]:
+        """Thread-safe subset evaluation wrapper."""
+        # Use evaluator directly (shared, thread-safe for reads)
+        # Call evaluate with n_jobs=1 to avoid nested parallelism
+        result = evaluator.evaluate(features, n_jobs=1)
+        return idx, result
 
-    # Run parallel evaluations with joblib (loky backend for true parallelism)
-    results_with_idx = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
-        delayed(_evaluate_subset_joblib)(
-            X, y, features, model_config, cv_config, metric_config, idx
-        )
+    # Use threading backend - shared memory, no memmapping
+    joblib_kwargs = get_joblib_kwargs(n_jobs)
+    results_with_idx = Parallel(**joblib_kwargs)(
+        delayed(_evaluate_subset_thread)(features, idx)
         for idx, features in enumerate(feature_sets)
     )
 
@@ -530,24 +546,28 @@ def evaluate_subsets_parallel(
 
 
 class EvaluationCache:
-    """Cache for subset evaluation results.
+    """Thread-safe cache for subset evaluation results.
 
     Stores results keyed by frozen feature sets to avoid
-    re-evaluating the same subset multiple times.
+    re-evaluating the same subset multiple times. Uses a lock
+    for thread-safety when candidates are evaluated in parallel.
 
     Attributes:
         max_size: Maximum number of cached results.
+        thread_safe: Whether to use locking (default True).
     """
 
-    def __init__(self, max_size: int = 10000):
+    def __init__(self, max_size: int = 10000, thread_safe: bool = True):
         """Initialize the cache.
 
         Args:
             max_size: Maximum entries to cache.
+            thread_safe: Whether to use locking for thread safety.
         """
         self.max_size = max_size
         self._cache: Dict[frozenset, SubsetResult] = {}
         self._access_order: List[frozenset] = []
+        self._lock = threading.Lock() if thread_safe else None
 
     def get(self, features: Union[List[str], Set[str]]) -> Optional[SubsetResult]:
         """Get cached result for a feature set.
@@ -559,6 +579,9 @@ class EvaluationCache:
             Cached SubsetResult or None if not cached.
         """
         key = frozenset(features)
+        if self._lock:
+            with self._lock:
+                return self._cache.get(key)
         return self._cache.get(key)
 
     def put(self, features: Union[List[str], Set[str]], result: SubsetResult):
@@ -570,6 +593,14 @@ class EvaluationCache:
         """
         key = frozenset(features)
 
+        if self._lock:
+            with self._lock:
+                self._put_unlocked(key, result)
+        else:
+            self._put_unlocked(key, result)
+
+    def _put_unlocked(self, key: frozenset, result: SubsetResult):
+        """Internal put without locking (caller must hold lock if needed)."""
         if key in self._cache:
             return
 
@@ -582,9 +613,17 @@ class EvaluationCache:
         self._access_order.append(key)
 
     def __len__(self) -> int:
+        if self._lock:
+            with self._lock:
+                return len(self._cache)
         return len(self._cache)
 
     def clear(self):
         """Clear the cache."""
-        self._cache.clear()
-        self._access_order.clear()
+        if self._lock:
+            with self._lock:
+                self._cache.clear()
+                self._access_order.clear()
+        else:
+            self._cache.clear()
+            self._access_order.clear()
