@@ -58,8 +58,8 @@ cv_config = CVConfig(
 
 # Configure search
 search_config = SearchConfig(
-    epsilon_add=0.002,
-    epsilon_swap=0.001,
+    epsilon_add=0.0001,
+    epsilon_swap=0.0005,
     max_features=30,
     max_interaction_features=5,
     n_jobs=-1  # Use all cores
@@ -136,13 +136,6 @@ from .config import (
 from .search import (
     FeatureSubsetSearch,
     create_default_search,
-)
-
-# Loose-then-tight pipeline
-from .pipeline import (
-    LooseTightPipeline,
-    LooseTightConfig,
-    run_loose_tight_selection,
 )
 
 # Base features configuration
@@ -226,6 +219,16 @@ from .group_selection import (
     interaction_group_selection,
     run_group_selection,
     select_groups_for_model,
+    # Outer CV for robustness estimation
+    OuterFoldResult,
+    OuterCVResult,
+    generate_outer_splits,
+    run_outer_cv,
+    # Stability aggregation and finalization
+    CandidateSetResult,
+    StabilityAggregationResult,
+    run_stability_aggregation,
+    run_outer_cv_with_finalization,
 )
 
 # Interactions
@@ -281,11 +284,32 @@ from .utils import (
     cleanup_memory,
 )
 
+# Parallel configuration (threading and process-based)
+from .parallel_config import (
+    ParallelConfig,
+    get_parallel_config,
+    print_parallel_config,
+    get_joblib_kwargs,
+    get_loky_kwargs,
+    configure_model_for_threading,
+    JOBLIB_BACKEND,
+    JOBLIB_PREFER,
+    LOKY_BACKEND,
+    LOKY_PREFER,
+)
+
+# Reusable process executor (avoids loky resource leaks)
+from .executor import (
+    parallel_map,
+    shutdown_executor,
+    get_worker_stats,
+    reset_worker_stats,
+)
+
 # Multi-model selection support
 from .multimodel import (
     FeatureSelectionResult,
     MultiModelSelectionSummary,
-    run_single_model_selection,
     compute_overlap_analysis,
     compute_run_signature,
     compute_cv_config_hash,
@@ -313,16 +337,12 @@ __all__ = [
     'SearchConfig',
     'MetricConfig',
     'ProgressConfig',
-    'LooseTightConfig',
     # Results
     'SubsetResult',
     'FeatureRanking',
     # Main class
     'FeatureSubsetSearch',
     'create_default_search',
-    # Loose-then-tight pipeline
-    'LooseTightPipeline',
-    'run_loose_tight_selection',
     # Group-first data structures (NEW)
     'CORE_GROUPS',
     'HEAD_GROUPS',
@@ -389,6 +409,16 @@ __all__ = [
     'interaction_group_selection',
     'run_group_selection',
     'select_groups_for_model',
+    # Outer CV for robustness estimation
+    'OuterFoldResult',
+    'OuterCVResult',
+    'generate_outer_splits',
+    'run_outer_cv',
+    # Stability aggregation and finalization
+    'CandidateSetResult',
+    'StabilityAggregationResult',
+    'run_stability_aggregation',
+    'run_outer_cv_with_finalization',
     # Interactions
     'InteractionDiscoverer',
     'compute_shap_interactions',
@@ -426,10 +456,25 @@ __all__ = [
     'print_feature_summary',
     'estimate_compute_time',
     'cleanup_memory',
+    # Parallel configuration
+    'ParallelConfig',
+    'get_parallel_config',
+    'print_parallel_config',
+    'get_joblib_kwargs',
+    'get_loky_kwargs',
+    'configure_model_for_threading',
+    'JOBLIB_BACKEND',
+    'JOBLIB_PREFER',
+    'LOKY_BACKEND',
+    'LOKY_PREFER',
+    # Reusable executor
+    'parallel_map',
+    'shutdown_executor',
+    'get_worker_stats',
+    'reset_worker_stats',
     # Multi-model selection
     'FeatureSelectionResult',
     'MultiModelSelectionSummary',
-    'run_single_model_selection',
     'compute_overlap_analysis',
     'compute_run_signature',
     'compute_cv_config_hash',

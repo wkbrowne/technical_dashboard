@@ -7,6 +7,12 @@ This module implements the core feature selection algorithms:
 - Pairwise swapping local search
 - Parallel interaction forward selection (enhanced)
 - Late interaction refinement
+
+Parallelization Strategy:
+- Uses threading backend (not loky/processes) to avoid resource_tracker issues
+- Candidates are evaluated in parallel threads sharing the evaluator
+- Each candidate evaluation uses n_jobs=1 for fold-level (no nested parallelism)
+- LightGBM uses internal threading for training
 """
 
 import gc
@@ -20,6 +26,7 @@ from .config import (
 )
 from .evaluation import EvaluationCache, SubsetEvaluator
 from .progress import ProgressTracker
+from .parallel_config import get_joblib_kwargs
 from .interactions import (
     InteractionCandidate,
     PairwiseInteractionSearch,
@@ -386,23 +393,25 @@ def forward_selection(
         iteration_start = time.time()
 
         if parallel and n_jobs > 1 and len(candidates) > 1:
-            # Parallel evaluation using joblib with loky backend (process-based)
+            # Parallel evaluation using threading backend (shared memory)
             from joblib import Parallel, delayed
 
-            # Get data and configs from evaluator for worker processes
-            X = evaluator._X
-            y = evaluator._y
-            model_config = evaluator.model_config
-            cv_config = evaluator.cv_config
-            metric_config = evaluator.metric_config
             current_features_list = list(current_set)
 
-            # Run parallel evaluations
-            results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
-                delayed(_evaluate_candidate_joblib)(
-                    X, y, current_features_list, cand,
-                    model_config, cv_config, metric_config, search_config
-                )
+            def _eval_candidate_thread(cand: str) -> Tuple[str, Optional[SubsetResult]]:
+                """Thread-safe candidate evaluation wrapper."""
+                try:
+                    features = current_features_list + [cand]
+                    # Use n_jobs=1 for fold-level to avoid nested parallelism
+                    result = evaluator.evaluate(features, n_jobs=1)
+                    return cand, result
+                except Exception:
+                    return cand, None
+
+            # Run parallel evaluations with threading backend
+            joblib_kwargs = get_joblib_kwargs(n_jobs)
+            results = Parallel(**joblib_kwargs)(
+                delayed(_eval_candidate_thread)(cand)
                 for cand in candidates
             )
 
@@ -736,13 +745,6 @@ def pairwise_swapping(
     completed_evals = 0
     total_swaps = 0
 
-    # Extract data and configs for joblib workers
-    X = evaluator._X
-    y = evaluator._y
-    model_config = evaluator.model_config
-    cv_config = evaluator.cv_config
-    metric_config = evaluator.metric_config
-
     while total_swaps < max_swaps:
         # Generate all swap candidates for this iteration
         swap_candidates = []
@@ -760,12 +762,20 @@ def pairwise_swapping(
         start_time = time.time()
         current_features_list = list(current_set)
 
-        # Evaluate all swap candidates in parallel
-        results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
-            delayed(_evaluate_swap_joblib)(
-                X, y, current_features_list, f_in, f_out,
-                model_config, cv_config, metric_config, search_config
-            )
+        def _eval_swap_thread(f_in: str, f_out: str) -> Tuple[str, str, Optional[SubsetResult]]:
+            """Thread-safe swap evaluation wrapper."""
+            try:
+                features = [f for f in current_features_list if f != f_in] + [f_out]
+                # Use n_jobs=1 for fold-level to avoid nested parallelism
+                result = evaluator.evaluate(features, n_jobs=1)
+                return f_in, f_out, result
+            except Exception:
+                return f_in, f_out, None
+
+        # Evaluate all swap candidates in parallel using threading backend
+        joblib_kwargs = get_joblib_kwargs(n_jobs)
+        results = Parallel(**joblib_kwargs)(
+            delayed(_eval_swap_thread)(f_in, f_out)
             for f_in, f_out in swap_candidates
         )
 
@@ -1237,23 +1247,48 @@ def parallel_interaction_forward_selection(
         batch_results = []
 
         if search_config.parallel_over_interactions and n_jobs > 1:
-            # Use joblib with loky backend for true process-based parallelism
+            # Use joblib with threading backend (shared memory)
             from joblib import Parallel, delayed
 
-            # Get configs from evaluator for worker processes
-            cv_config = evaluator.cv_config
-            metric_config = evaluator.metric_config
-            search_cfg = evaluator.search_config
-            regime = evaluator._regime
             base_features_list = list(current_features)
 
-            # Run parallel evaluations
-            results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
-                delayed(_evaluate_interaction_joblib)(
-                    X, y, base_features_list, cand,
-                    model_config, cv_config, metric_config, search_cfg,
-                    regime, best_score
-                )
+            def _eval_interaction_thread(cand: InteractionCandidate) -> Optional[Tuple]:
+                """Thread-safe interaction evaluation wrapper."""
+                try:
+                    # Compute the interaction feature lazily
+                    interaction_col = compute_interaction_lazily(X, cand)
+                    if interaction_col is None:
+                        return None
+
+                    # Build feature set with interaction
+                    interaction_name = cand.get_column_name()
+                    features_with_interaction = base_features_list + [interaction_name]
+
+                    # Add to X temporarily for this evaluation
+                    X_temp = X.copy()
+                    X_temp[interaction_name] = interaction_col
+
+                    # Create temporary evaluator for this subset
+                    from .evaluation import SubsetEvaluator
+                    temp_evaluator = SubsetEvaluator(
+                        X_temp, evaluator._y, evaluator.model_config,
+                        evaluator.cv_config, evaluator.metric_config,
+                        evaluator.search_config,
+                        sample_weight=evaluator._sample_weight,
+                        regime=evaluator._regime
+                    )
+
+                    # Use n_jobs=1 for fold-level to avoid nested parallelism
+                    result = temp_evaluator.evaluate(features_with_interaction, n_jobs=1)
+                    delta = result.metric_main - best_score
+                    return (cand, result, delta, interaction_name)
+                except Exception:
+                    return None
+
+            # Run parallel evaluations with threading backend
+            joblib_kwargs = get_joblib_kwargs(n_jobs)
+            results = Parallel(**joblib_kwargs)(
+                delayed(_eval_interaction_thread)(cand)
                 for cand in batch
             )
 

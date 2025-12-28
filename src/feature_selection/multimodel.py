@@ -1,15 +1,17 @@
 """
 Multi-model feature selection support.
 
-This module provides utilities for running feature selection across multiple
-model targets (LONG_NORMAL, LONG_PARABOLIC, SHORT_NORMAL, SHORT_PARABOLIC)
-in a single run, with shared CV splits and feature universe.
+This module provides utilities for analyzing and managing feature selection
+results across multiple model targets (LONG_NORMAL, LONG_PARABOLIC, etc.).
 
 Key components:
 - FeatureSelectionResult: Dataclass holding per-model selection results
-- run_single_model_selection: Reusable function for single-model selection
 - compute_overlap_analysis: Jaccard/intersection analysis across models
 - compute_run_signature: Stable hash for reproducibility tracking
+- write_per_model_artifacts: Persist per-model results
+- write_global_summary: Persist multi-model summary
+
+Note: For running feature selection, use group_selection module instead.
 """
 
 import hashlib
@@ -39,7 +41,7 @@ from .config import (
     SearchConfig,
     TaskType,
 )
-from .pipeline import LooseTightConfig, LooseTightPipeline
+# Note: LooseTightPipeline removed - use group_selection instead
 
 
 # =============================================================================
@@ -205,208 +207,6 @@ def compute_run_signature(
         f"model={model_key}"
     )
     return hashlib.md5(signature_str.encode()).hexdigest()[:12]
-
-
-# =============================================================================
-# Core Selection Function
-# =============================================================================
-
-def run_single_model_selection(
-    X: pd.DataFrame,
-    y: pd.Series,
-    model_key: ModelKey,
-    features: List[str],
-    sample_weight: Optional[pd.Series] = None,
-    cv_config: Optional[CVConfig] = None,
-    model_config: Optional[ModelConfig] = None,
-    metric_config: Optional[MetricConfig] = None,
-    pipeline_config: Optional[LooseTightConfig] = None,
-    verbose: bool = True,
-    checkpoint_path: Optional[str] = None,
-) -> FeatureSelectionResult:
-    """Run feature selection for a single model.
-
-    This is the core reusable function that runs the Loose-Tight pipeline
-    for a single model target.
-
-    Args:
-        X: Feature DataFrame with all candidate features
-        y: Target Series (binary labels for this model)
-        model_key: Model key (LONG_NORMAL, etc.)
-        features: List of candidate feature names to consider
-        sample_weight: Optional sample weights (e.g., overlap inverse)
-        cv_config: Cross-validation configuration
-        model_config: LightGBM/XGBoost configuration
-        metric_config: Metrics configuration
-        pipeline_config: Loose-Tight pipeline configuration
-        verbose: Whether to print progress
-        checkpoint_path: Custom checkpoint path
-
-    Returns:
-        FeatureSelectionResult with selected features and metrics
-    """
-    start_time = time.time()
-
-    # Use defaults if not provided
-    if cv_config is None:
-        cv_config = CVConfig(
-            n_splits=5,
-            scheme=CVScheme.EXPANDING,
-            gap=20,
-            purge_window=0,
-            min_train_samples=1000,
-        )
-
-    if model_config is None:
-        model_config = ModelConfig(
-            model_type=ModelType.LIGHTGBM,
-            task_type=TaskType.CLASSIFICATION,
-            params={
-                'learning_rate': 0.05,
-                'max_depth': 6,
-                'num_leaves': 31,
-                'min_child_samples': 50,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'reg_alpha': 0.1,
-                'reg_lambda': 0.1,
-            },
-            num_threads=1,
-            early_stopping_rounds=50,
-            num_boost_round=300,
-        )
-
-    if metric_config is None:
-        metric_config = MetricConfig(
-            primary_metric=MetricType.AUC,
-            secondary_metrics=[MetricType.AUPR, MetricType.LOG_LOSS],
-            tail_quantile=0.1,
-        )
-
-    if pipeline_config is None:
-        # Auto-detect CPU count for parallelism
-        import os
-        n_jobs = os.cpu_count() or 8
-        pipeline_config = LooseTightConfig(
-            run_base_elimination=False,
-            epsilon_add_loose=0.0002,
-            min_fold_improvement_ratio_loose=0.6,
-            max_features_loose=80,
-            epsilon_remove_strict=0.0,
-            run_interactions=True,
-            max_interactions=8,
-            epsilon_add_interaction=0.001,
-            epsilon_swap=0.0005,
-            max_swap_iterations=50,
-            n_jobs=n_jobs,
-        )
-
-    search_config = SearchConfig(n_jobs=1, random_state=42)
-
-    # Filter X to valid features
-    valid_features = [f for f in features if f in X.columns]
-    X_subset = X[valid_features].copy()
-
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"Feature Selection: {model_key.value.upper()}")
-        print(f"{'='*60}")
-        print(f"Candidate features: {len(valid_features)}")
-        print(f"Samples: {len(X_subset)}")
-
-    # Create and run pipeline
-    pipeline = LooseTightPipeline(
-        model_config=model_config,
-        cv_config=cv_config,
-        search_config=search_config,
-        metric_config=metric_config,
-        pipeline_config=pipeline_config,
-        checkpoint_path=checkpoint_path,
-    )
-
-    # Align sample weights with X for pipeline
-    # sample_weight must have same index as X for boolean masking in evaluation
-    sample_weight_aligned = None
-    if sample_weight is not None:
-        if len(sample_weight) == len(X_subset):
-            # Already aligned in length - set index to match X's index
-            sample_weight_aligned = sample_weight.copy()
-            sample_weight_aligned.index = X_subset.index
-        else:
-            # Length mismatch - try to align or create uniform weights
-            try:
-                sample_weight_aligned = sample_weight.loc[X_subset.index]
-            except (KeyError, TypeError):
-                # Fallback: create uniform weights with correct index
-                # This handles cases where sample_weight has different length/index
-                sample_weight_aligned = pd.Series(
-                    np.ones(len(X_subset)),
-                    index=X_subset.index
-                )
-
-    # Run pipeline
-    pipeline.run(X_subset, y, verbose=verbose, sample_weight=sample_weight_aligned)
-
-    elapsed = time.time() - start_time
-
-    # Extract results
-    best_features = pipeline.get_best_features()
-    best_metric = pipeline.get_best_metric()
-
-    # Compute hashes for reproducibility
-    cv_hash = compute_cv_config_hash(cv_config)
-    universe_hash = compute_universe_hash(valid_features)
-
-    # Get date range
-    date_min = str(X.index.min().date()) if hasattr(X.index.min(), 'date') else str(X.index.min())
-    date_max = str(X.index.max().date()) if hasattr(X.index.max(), 'date') else str(X.index.max())
-    date_range = (date_min, date_max)
-
-    # Extract algorithm params
-    algorithm_params = {
-        'epsilon_add_loose': pipeline_config.epsilon_add_loose,
-        'epsilon_remove_strict': pipeline_config.epsilon_remove_strict,
-        'epsilon_add_interaction': pipeline_config.epsilon_add_interaction,
-        'epsilon_swap': pipeline_config.epsilon_swap,
-        'max_features_loose': pipeline_config.max_features_loose,
-        'max_interactions': pipeline_config.max_interactions,
-        'run_interactions': pipeline_config.run_interactions,
-    }
-
-    run_sig = compute_run_signature(
-        universe_hash, cv_hash, date_range, algorithm_params, model_key.value
-    )
-
-    # Extract secondary metrics from best snapshot
-    secondary_metrics = {}
-    if pipeline.best_snapshot and pipeline.best_snapshot.fold_metrics:
-        # Get extended metrics by re-evaluating (already done in pipeline)
-        secondary_metrics['auc'] = (best_metric[0], best_metric[1])
-
-    result = FeatureSelectionResult(
-        model_key=model_key.value,
-        selected_features=best_features,
-        n_features=len(best_features),
-        cv_auc_mean=best_metric[0],
-        cv_auc_std=best_metric[1],
-        fold_metrics=pipeline.best_snapshot.fold_metrics if pipeline.best_snapshot else [],
-        secondary_metrics=secondary_metrics,
-        best_stage=pipeline.best_snapshot.stage if pipeline.best_snapshot else "",
-        algorithm="loose_tight_pipeline",
-        algorithm_params=algorithm_params,
-        cv_config_hash=cv_hash,
-        date_range=date_range,
-        universe_hash=universe_hash,
-        timestamp=datetime.utcnow().isoformat() + "Z",
-        run_signature=run_sig,
-        elapsed_seconds=elapsed,
-    )
-
-    if verbose:
-        print(f"\nResult: {len(best_features)} features, AUC={best_metric[0]:.4f}±{best_metric[1]:.4f}")
-        print(f"Elapsed: {elapsed/60:.1f} minutes")
-
-    return result
 
 
 # =============================================================================
