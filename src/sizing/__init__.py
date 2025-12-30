@@ -23,13 +23,23 @@ from .config import (
 )
 from .multi_model import (
     MultiModelSizingEngine,
-    compute_edge_score,
-    combine_model_weights,
+    compute_edge_scores,
+    combine_model_weights_with_justification,
+    compute_model_weights_with_justification,
+    create_decision_log,
+    get_justification_columns,
+    JUSTIFY_PREFIX,
 )
 from .regime_gating import (
-    RegimeGate,
+    RegimeMultipliers,
+    GatingJustification,
     apply_regime_gating,
-    compute_regime_exposure_multiplier,
+    apply_regime_gating_vectorized,
+    compute_regime_multipliers,
+    suggest_gating_params,
+    suggest_short_selectivity_params,
+    create_gating_config_from_params,
+    get_gating_diagnostics,
 )
 from .predictions import (
     load_multi_model_predictions,
@@ -47,12 +57,22 @@ __all__ = [
     "save_multi_model_config",
     # Multi-model engine
     "MultiModelSizingEngine",
-    "compute_edge_score",
-    "combine_model_weights",
+    "compute_edge_scores",
+    "combine_model_weights_with_justification",
+    "compute_model_weights_with_justification",
+    "create_decision_log",
+    "get_justification_columns",
+    "JUSTIFY_PREFIX",
     # Regime gating
-    "RegimeGate",
+    "RegimeMultipliers",
+    "GatingJustification",
     "apply_regime_gating",
-    "compute_regime_exposure_multiplier",
+    "apply_regime_gating_vectorized",
+    "compute_regime_multipliers",
+    "suggest_gating_params",
+    "suggest_short_selectivity_params",
+    "create_gating_config_from_params",
+    "get_gating_diagnostics",
     # Predictions
     "load_multi_model_predictions",
     "validate_predictions_format",

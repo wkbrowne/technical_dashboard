@@ -28,10 +28,16 @@ from .config import (
     MultiModelSizingConfig,
     MonotoneSizingParams,
     RegimeGatingConfig,
+    ShortSelectivityConfig,
     get_tpe_param_range,
 )
 from .multi_model import MultiModelSizingEngine
-from .regime_gating import suggest_gating_params, create_gating_config_from_params
+from .regime_gating import (
+    suggest_gating_params,
+    suggest_short_selectivity_params,
+    create_gating_config_from_params,
+    get_gating_diagnostics,
+)
 
 
 @dataclass
@@ -46,6 +52,7 @@ class MultiModelOptimizationResult:
         param_importance: Parameter importance dict.
         trials_df: DataFrame of all trials.
         cv_metrics: List of CV fold metrics.
+        trial_logs: List of per-trial detailed logs.
     """
     best_params: Dict[str, float]
     best_config: MultiModelSizingConfig
@@ -54,12 +61,14 @@ class MultiModelOptimizationResult:
     param_importance: Dict[str, float]
     trials_df: pd.DataFrame
     cv_metrics: List[Dict[str, float]]
+    trial_logs: List[Dict] = field(default_factory=list)
 
 
 def create_config_from_trial(
     trial: Trial,
     models: List[ModelType],
     optimize_gating: bool = False,
+    optimize_short_selectivity: bool = False,
     base_config: Optional[MultiModelSizingConfig] = None,
 ) -> MultiModelSizingConfig:
     """Create sizing config from Optuna trial parameters.
@@ -68,6 +77,7 @@ def create_config_from_trial(
         trial: Optuna trial object.
         models: List of models to configure.
         optimize_gating: Whether to optimize gating parameters.
+        optimize_short_selectivity: Whether to optimize short selectivity.
         base_config: Base config for defaults.
 
     Returns:
@@ -103,6 +113,17 @@ def create_config_from_trial(
     else:
         gating_config = RegimeGatingConfig.disabled()
 
+    # Build short selectivity config
+    if optimize_short_selectivity:
+        short_params = suggest_short_selectivity_params(trial)
+        short_selectivity = ShortSelectivityConfig(
+            short_threshold_offset=short_params["short_threshold_offset"],
+            short_max_weight_mult=short_params["short_max_weight_mult"],
+            short_exposure_mult=short_params["short_exposure_mult"],
+        )
+    else:
+        short_selectivity = base_config.short_selectivity if base_config else ShortSelectivityConfig()
+
     # Create full config
     config = MultiModelSizingConfig(
         models=[m.value for m in models],
@@ -110,6 +131,7 @@ def create_config_from_trial(
         netting_policy=base_config.netting_policy if base_config else "strongest",
         sizing_params=sizing_params,
         regime_gating=gating_config,
+        short_selectivity=short_selectivity,
         max_gross_exposure=base_config.max_gross_exposure if base_config else 1.0,
         max_net_exposure=base_config.max_net_exposure if base_config else 1.0,
         max_weight_per_name=base_config.max_weight_per_name if base_config else 0.10,
@@ -133,7 +155,7 @@ def compute_backtest_objective(
         turnover_penalty: Penalty per unit turnover.
 
     Returns:
-        Dict of metrics.
+        Dict of metrics including objective components and diagnostics.
     """
     if "final_weight" not in signals.columns or "actual_return" not in signals.columns:
         return {"portfolio_return": 0.0, "penalized_return": 0.0}
@@ -152,7 +174,7 @@ def compute_backtest_objective(
     else:
         portfolio_return = np.sum(weights * returns)
 
-    # Hit rate
+    # Hit rate (overall and by direction)
     if np.abs(weights).sum() > 0:
         wins = (returns > 0).astype(float)
         hit_rate = np.sum(np.abs(weights) * wins) / np.abs(weights).sum()
@@ -165,13 +187,56 @@ def compute_backtest_objective(
     # Net exposure
     net_exposure = weights.sum()
 
+    # Long exposure
+    long_exposure = np.sum(weights[weights > 0])
+
+    # Short exposure (absolute value)
+    short_exposure = np.abs(np.sum(weights[weights < 0]))
+
     # Position counts
     n_longs = (weights > 0).sum()
     n_shorts = (weights < 0).sum()
     n_positions = n_longs + n_shorts
 
+    # Short participation rate
+    if n_positions > 0:
+        short_participation = n_shorts / n_positions
+    else:
+        short_participation = 0.0
+
     # Penalized return (turnover computed separately)
     penalized_return = portfolio_return
+
+    # Long/short hit rates
+    long_mask = weights > 0
+    short_mask = weights < 0
+
+    if long_mask.sum() > 0:
+        long_wins = returns[long_mask] > 0
+        long_hit_rate = long_wins.sum() / long_mask.sum()
+    else:
+        long_hit_rate = 0.0
+
+    if short_mask.sum() > 0:
+        # For shorts, a "win" is when the return is negative
+        short_wins = returns[short_mask] < 0
+        short_hit_rate = short_wins.sum() / short_mask.sum()
+    else:
+        short_hit_rate = 0.0
+
+    # Long/short returns
+    if long_mask.sum() > 0:
+        long_return = np.sum(weights[long_mask] * returns[long_mask])
+    else:
+        long_return = 0.0
+
+    if short_mask.sum() > 0:
+        short_return = np.sum(weights[short_mask] * returns[short_mask])
+    else:
+        short_return = 0.0
+
+    # Regime gating diagnostics
+    gating_diagnostics = get_gating_diagnostics(signals) if "gating_triggered" in signals.columns else {}
 
     return {
         "portfolio_return": portfolio_return,
@@ -179,9 +244,17 @@ def compute_backtest_objective(
         "hit_rate": hit_rate,
         "gross_exposure": gross_exposure,
         "net_exposure": net_exposure,
+        "long_exposure": long_exposure,
+        "short_exposure": short_exposure,
         "n_positions": n_positions,
         "n_longs": n_longs,
         "n_shorts": n_shorts,
+        "short_participation": short_participation,
+        "long_hit_rate": long_hit_rate,
+        "short_hit_rate": short_hit_rate,
+        "long_return": long_return,
+        "short_return": short_return,
+        **gating_diagnostics,
     }
 
 
@@ -193,16 +266,21 @@ class MultiModelSizingOptimizer:
     - Parabolic threshold offset
     - Turnover penalty
     - Regime gating parameters (optional)
+    - Short selectivity parameters (optional)
 
     Evaluation uses purged walk-forward CV.
+
+    Objective: mean(penalized_returns) - 0.5 * std(penalized_returns)
 
     Attributes:
         models: List of models to optimize.
         n_trials: Number of optimization trials.
         metric: Metric to optimize.
         optimize_gating: Whether to optimize gating parameters.
+        optimize_short_selectivity: Whether to optimize short selectivity.
         base_config: Base configuration for defaults.
         cv_splitter: CV splitter for evaluation.
+        trial_logs: List of per-trial log dicts.
     """
 
     def __init__(
@@ -211,9 +289,11 @@ class MultiModelSizingOptimizer:
         n_trials: int = 100,
         metric: str = "penalized_return",
         optimize_gating: bool = False,
+        optimize_short_selectivity: bool = False,
         base_config: Optional[MultiModelSizingConfig] = None,
         cv_splitter=None,
         random_state: int = 42,
+        verbose_logging: bool = True,
     ):
         """Initialize optimizer.
 
@@ -222,9 +302,11 @@ class MultiModelSizingOptimizer:
             n_trials: Number of optimization trials.
             metric: Metric to optimize.
             optimize_gating: Whether to optimize gating.
+            optimize_short_selectivity: Whether to optimize short selectivity.
             base_config: Base configuration.
             cv_splitter: CV splitter (uses WeeklySignalCV if not provided).
             random_state: Random seed.
+            verbose_logging: Whether to log per-trial details.
         """
         if not OPTUNA_AVAILABLE:
             raise ImportError("optuna is required for MultiModelSizingOptimizer")
@@ -233,9 +315,12 @@ class MultiModelSizingOptimizer:
         self.n_trials = n_trials
         self.metric = metric
         self.optimize_gating = optimize_gating
+        self.optimize_short_selectivity = optimize_short_selectivity
         self.base_config = base_config or MultiModelSizingConfig()
         self.cv_splitter = cv_splitter
         self.random_state = random_state
+        self.verbose_logging = verbose_logging
+        self.trial_logs: List[Dict] = []
 
     def _objective(
         self,
@@ -244,6 +329,8 @@ class MultiModelSizingOptimizer:
         regime_features: Optional[pd.DataFrame] = None,
     ) -> float:
         """Optuna objective function.
+
+        Objective: mean(penalized_returns) - 0.5 * std(penalized_returns)
 
         Args:
             trial: Optuna trial.
@@ -258,6 +345,7 @@ class MultiModelSizingOptimizer:
             trial,
             self.models,
             optimize_gating=self.optimize_gating,
+            optimize_short_selectivity=self.optimize_short_selectivity,
             base_config=self.base_config,
         )
 
@@ -297,11 +385,33 @@ class MultiModelSizingOptimizer:
         metric_values = [m[self.metric] for m in fold_metrics]
         mean_metric = np.mean(metric_values)
 
-        # Penalize high variance
+        # Penalize high variance (stability penalty)
         std_metric = np.std(metric_values) if len(metric_values) > 1 else 0
         stability_penalty = 0.5 * std_metric
+        objective_value = mean_metric - stability_penalty
 
-        return mean_metric - stability_penalty
+        # Per-trial logging
+        if self.verbose_logging:
+            # Aggregate metrics across folds
+            agg_metrics = {}
+            for key in fold_metrics[0].keys():
+                values = [m.get(key, 0) for m in fold_metrics]
+                agg_metrics[f"mean_{key}"] = np.mean(values)
+                if len(values) > 1:
+                    agg_metrics[f"std_{key}"] = np.std(values)
+
+            trial_log = {
+                "trial_number": trial.number,
+                "objective": objective_value,
+                "mean_metric": mean_metric,
+                "std_metric": std_metric,
+                "stability_penalty": stability_penalty,
+                **trial.params,
+                **agg_metrics,
+            }
+            self.trial_logs.append(trial_log)
+
+        return objective_value
 
     def optimize(
         self,
@@ -319,6 +429,9 @@ class MultiModelSizingOptimizer:
         Returns:
             MultiModelOptimizationResult.
         """
+        # Clear trial logs from previous runs
+        self.trial_logs = []
+
         # Create study
         sampler = optuna.samplers.TPESampler(seed=self.random_state)
         study = optuna.create_study(
@@ -362,6 +475,7 @@ class MultiModelSizingOptimizer:
             param_importance=importance,
             trials_df=trials_df,
             cv_metrics=cv_metrics,
+            trial_logs=self.trial_logs,
         )
 
     def _create_best_config(self, params: Dict) -> MultiModelSizingConfig:
@@ -386,12 +500,22 @@ class MultiModelSizingOptimizer:
         else:
             gating_config = RegimeGatingConfig.disabled()
 
+        if self.optimize_short_selectivity:
+            short_selectivity = ShortSelectivityConfig(
+                short_threshold_offset=params.get("short_threshold_offset", 0.05),
+                short_max_weight_mult=params.get("short_max_weight_mult", 0.8),
+                short_exposure_mult=params.get("short_exposure_mult", 1.0),
+            )
+        else:
+            short_selectivity = self.base_config.short_selectivity
+
         return MultiModelSizingConfig(
             models=[m.value for m in self.models],
             combine_policy=self.base_config.combine_policy,
             netting_policy=self.base_config.netting_policy,
             sizing_params=sizing_params,
             regime_gating=gating_config,
+            short_selectivity=short_selectivity,
             max_gross_exposure=self.base_config.max_gross_exposure,
             max_net_exposure=self.base_config.max_net_exposure,
             max_weight_per_name=self.base_config.max_weight_per_name,
@@ -458,7 +582,10 @@ def print_optimization_summary(result: MultiModelOptimizationResult) -> None:
 
     print("\nBest parameters:")
     for param, value in sorted(result.best_params.items()):
-        print(f"  {param}: {value:.4f}")
+        if isinstance(value, float):
+            print(f"  {param}: {value:.4f}")
+        else:
+            print(f"  {param}: {value}")
 
     if result.param_importance:
         print("\nParameter importance:")
@@ -476,7 +603,27 @@ def print_optimization_summary(result: MultiModelOptimizationResult) -> None:
         ret = metrics.get("portfolio_return", 0)
         hit = metrics.get("hit_rate", 0)
         n_pos = metrics.get("n_positions", 0)
-        print(f"  Fold {fold}: return={ret:.4f}, hit_rate={hit:.2%}, n_pos={n_pos}")
+        n_longs = metrics.get("n_longs", 0)
+        n_shorts = metrics.get("n_shorts", 0)
+        short_part = metrics.get("short_participation", 0)
+        gating_pct = metrics.get("pct_gating_triggered", 0)
+        print(
+            f"  Fold {fold}: return={ret:.4f}, hit_rate={hit:.2%}, "
+            f"n_pos={n_pos} (L:{n_longs}/S:{n_shorts}), "
+            f"short_part={short_part:.1%}, gating_triggered={gating_pct:.1f}%"
+        )
+
+    # Short/long breakdown for best trial
+    if result.trial_logs:
+        best_log = max(result.trial_logs, key=lambda x: x.get("objective", float("-inf")))
+        print("\nBest trial diagnostics:")
+        print(f"  Long hit rate: {best_log.get('mean_long_hit_rate', 0):.2%}")
+        print(f"  Short hit rate: {best_log.get('mean_short_hit_rate', 0):.2%}")
+        print(f"  Long return contribution: {best_log.get('mean_long_return', 0):.4f}")
+        print(f"  Short return contribution: {best_log.get('mean_short_return', 0):.4f}")
+        print(f"  Short participation: {best_log.get('mean_short_participation', 0):.1%}")
+        if "mean_pct_gating_triggered" in best_log:
+            print(f"  Regime gating triggered: {best_log.get('mean_pct_gating_triggered', 0):.1f}%")
 
     print("=" * 60)
 
@@ -538,5 +685,12 @@ def save_optimization_result(
         with open(importance_path, "w") as f:
             json.dump(result.param_importance, f, indent=2)
         paths["importance"] = importance_path
+
+    # Save detailed trial logs (includes objective components, regime diagnostics)
+    if result.trial_logs:
+        trial_logs_path = output_dir / f"trial_logs_{name}.csv"
+        trial_logs_df = pd.DataFrame(result.trial_logs)
+        trial_logs_df.to_csv(trial_logs_path, index=False)
+        paths["trial_logs"] = trial_logs_path
 
     return paths

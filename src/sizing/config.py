@@ -2,8 +2,9 @@
 
 This module defines configuration dataclasses and JSON schema for:
 - Multi-model sizing with 4 models (LONG_NORMAL, LONG_PARABOLIC, SHORT_NORMAL, SHORT_PARABOLIC)
+- Per-model sizing parameters with short selectivity controls
 - Combining policies (mode_priority, blend)
-- Regime gating overlay
+- Direction-aware regime gating overlay
 - TPE-optimizable parameters
 """
 
@@ -57,6 +58,11 @@ class ModelType(Enum):
         return self in self.short_models()
 
     @property
+    def is_parabolic(self) -> bool:
+        """Check if this is a parabolic model."""
+        return self in self.parabolic_models()
+
+    @property
     def direction_sign(self) -> int:
         """Get direction sign (+1 for long, -1 for short)."""
         return 1 if self.is_long else -1
@@ -78,7 +84,7 @@ class NettingPolicy(Enum):
 class MonotoneSizingParams:
     """Parameters for monotone probability sizing.
 
-    Formula: raw_weight = exposure_mult * clip(sigmoid(slope * (p - intercept)), 0, 1)
+    Formula: raw_weight = exposure_mult * clip(slope * (p - intercept), 0, max_weight)
 
     Attributes:
         slope: Sensitivity to probability (higher = steeper).
@@ -104,51 +110,100 @@ class MonotoneSizingParams:
 
 
 @dataclass
+class ShortSelectivityConfig:
+    """Configuration for making shorts more selective than longs.
+
+    Short selectivity is achieved through multiple mechanisms that compound:
+    1. Intercept offset: shorts require higher probability to trigger
+    2. Max weight multiplier: shorts get smaller position sizes
+    3. Regime gating: shorts can have additional gating multiplier
+
+    All defaults are set to make shorts more selective.
+
+    Attributes:
+        short_threshold_offset: Added to intercept for short models (default 0.05).
+            e.g., if base intercept=0.5, shorts need p > 0.55.
+        short_max_weight_mult: Multiplier for max_weight on shorts (default 0.8).
+            e.g., if base max_weight=0.10, shorts max at 0.08.
+        short_exposure_mult: Additional exposure multiplier for shorts (default 1.0).
+            Applied after base exposure_mult.
+    """
+    short_threshold_offset: float = 0.05
+    short_max_weight_mult: float = 0.8
+    short_exposure_mult: float = 1.0
+
+    def to_dict(self) -> Dict:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "ShortSelectivityConfig":
+        """Create from dictionary."""
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+    @classmethod
+    def neutral(cls) -> "ShortSelectivityConfig":
+        """Create neutral config (no short bias)."""
+        return cls(
+            short_threshold_offset=0.0,
+            short_max_weight_mult=1.0,
+            short_exposure_mult=1.0,
+        )
+
+
+@dataclass
 class RegimeGatingConfig:
     """Configuration for regime-based exposure gating.
 
     Gating acts as a hard risk-control overlay that adjusts exposure
     based on market conditions, independent of model predictions.
 
-    Why gating even if regime is in the model?
-    - Models include regime features for alpha (predicting returns)
-    - Gating is for risk control (hard exposure limits regardless of alpha)
-    - Separation of concerns: models predict, gating controls risk
+    Direction-aware gating:
+    - VIX and credit rules affect both directions equally by default
+    - Breadth rules affect longs and shorts separately
 
     Attributes:
         enabled: Whether regime gating is active.
+        strict_missing_features: If True, raise error when regime features missing.
+            If False, warn and use multiplier=1.0 for missing rules.
+
         vix_high_threshold: VIX percentile above which to reduce exposure.
-        vix_high_exposure_mult: Exposure multiplier when VIX is high.
+        vix_high_exposure_mult: Exposure multiplier when VIX is high (both directions).
+
         credit_risk_threshold: Credit spread z-score threshold.
         credit_risk_exposure_mult: Exposure multiplier when credit risk is high.
-        breadth_poor_threshold: Breadth percentile below which to reduce longs.
+
+        breadth_poor_threshold: Breadth percentile below which to reduce exposure.
         breadth_poor_long_mult: Long exposure multiplier when breadth is poor.
-        allowed_models: Set of models allowed in current regime (None = all).
+        breadth_poor_short_mult: Short exposure multiplier when breadth is poor.
+            Default 1.0 means shorts are not reduced by poor breadth.
+            Set < 1.0 if poor breadth should also reduce shorts (unusual).
+
+        short_regime_mult: Additional regime multiplier applied only to shorts.
+            This is a "short gating" mechanism that makes shorts more conservative.
     """
     enabled: bool = False
+    strict_missing_features: bool = False
 
-    # VIX gating
+    # VIX gating (affects both directions)
     vix_high_threshold: float = 80.0  # 80th percentile
     vix_high_exposure_mult: float = 0.7
 
-    # Credit spread gating
+    # Credit spread gating (affects both directions)
     credit_risk_threshold: float = 1.5  # Z-score
     credit_risk_exposure_mult: float = 0.8
 
-    # Breadth gating
+    # Breadth gating (direction-aware)
     breadth_poor_threshold: float = 30.0  # 30th percentile
     breadth_poor_long_mult: float = 0.8
+    breadth_poor_short_mult: float = 1.0  # Shorts not reduced by poor breadth by default
 
-    # Model filtering (optional)
-    allowed_models: Optional[List[str]] = None  # None = all models allowed
+    # Additional short gating multiplier
+    short_regime_mult: float = 1.0  # Set < 1.0 to always reduce shorts
 
     def to_dict(self) -> Dict:
         """Convert to dictionary."""
-        d = asdict(self)
-        # Handle None properly
-        if self.allowed_models is None:
-            d["allowed_models"] = None
-        return d
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Dict) -> "RegimeGatingConfig":
@@ -160,12 +215,15 @@ class RegimeGatingConfig:
         """Create a disabled (neutral) gating config."""
         return cls(
             enabled=False,
+            strict_missing_features=False,
             vix_high_threshold=100.0,  # Never triggers
             vix_high_exposure_mult=1.0,
             credit_risk_threshold=100.0,
             credit_risk_exposure_mult=1.0,
             breadth_poor_threshold=0.0,
             breadth_poor_long_mult=1.0,
+            breadth_poor_short_mult=1.0,
+            short_regime_mult=1.0,
         )
 
 
@@ -173,18 +231,28 @@ class RegimeGatingConfig:
 class MultiModelSizingConfig:
     """Configuration for multi-model position sizing.
 
-    Supports four models with configurable combining and gating.
+    Supports four models with configurable combining, gating, and short selectivity.
+
+    Sizing parameter precedence (highest to lowest):
+    1. Per-model overrides in model_params[model_name]
+    2. Short selectivity adjustments (for short models)
+    3. Parabolic threshold offset (for parabolic models)
+    4. Base sizing_params
 
     Attributes:
         models: List of model types to use.
-        combine_policy: How to combine model signals.
-        netting_policy: How to handle long/short conflicts.
-        sizing_params: Per-model sizing parameters (or shared).
+        combine_policy: How to combine model signals ("mode_priority" or "blend").
+        netting_policy: How to handle long/short conflicts ("strongest" or "net").
+        sizing_params: Base sizing parameters (shared across models).
+        model_params: Per-model parameter overrides (optional).
+        short_selectivity: Short selectivity configuration.
         regime_gating: Regime gating configuration.
         max_gross_exposure: Maximum gross exposure as NAV fraction.
         max_net_exposure: Maximum net exposure (long - short).
         max_weight_per_name: Maximum weight per position.
-        turnover_penalty: Penalty per unit turnover.
+        min_weight: Minimum weight threshold.
+        max_positions: Maximum number of positions (optional).
+        turnover_penalty: Penalty per unit turnover (optimizer proxy for costs).
         parabolic_threshold_offset: Extra threshold for parabolic models.
     """
     # Models to use
@@ -206,6 +274,9 @@ class MultiModelSizingConfig:
 
     # Per-model overrides (optional)
     model_params: Optional[Dict[str, Dict]] = None
+
+    # Short selectivity
+    short_selectivity: ShortSelectivityConfig = field(default_factory=ShortSelectivityConfig)
 
     # Regime gating
     regime_gating: RegimeGatingConfig = field(default_factory=RegimeGatingConfig)
@@ -239,20 +310,32 @@ class MultiModelSizingConfig:
     def get_sizing_params_for_model(self, model: ModelType) -> MonotoneSizingParams:
         """Get sizing params for a specific model.
 
-        Falls back to shared params if no per-model override.
+        Applies adjustments in order:
+        1. Start with base sizing_params
+        2. Apply per-model overrides from model_params
+        3. Apply short selectivity (for short models)
+        4. Apply parabolic offset (for parabolic models)
         """
+        # Start with base params
+        base = asdict(self.sizing_params)
+
+        # Apply per-model overrides if present
         if self.model_params and model.value in self.model_params:
-            base = asdict(self.sizing_params)
             base.update(self.model_params[model.value])
-            return MonotoneSizingParams.from_dict(base)
 
-        # Apply parabolic offset if applicable
-        if model in ModelType.parabolic_models():
-            params = MonotoneSizingParams.from_dict(asdict(self.sizing_params))
+        params = MonotoneSizingParams.from_dict(base)
+
+        # Apply short selectivity for short models
+        if model.is_short:
+            params.intercept += self.short_selectivity.short_threshold_offset
+            params.max_weight *= self.short_selectivity.short_max_weight_mult
+            params.exposure_mult *= self.short_selectivity.short_exposure_mult
+
+        # Apply parabolic offset for parabolic models
+        if model.is_parabolic:
             params.intercept += self.parabolic_threshold_offset
-            return params
 
-        return self.sizing_params
+        return params
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -262,6 +345,7 @@ class MultiModelSizingConfig:
             "netting_policy": self.netting_policy,
             "sizing_params": self.sizing_params.to_dict(),
             "model_params": self.model_params,
+            "short_selectivity": self.short_selectivity.to_dict(),
             "regime_gating": self.regime_gating.to_dict(),
             "max_gross_exposure": self.max_gross_exposure,
             "max_net_exposure": self.max_net_exposure,
@@ -277,6 +361,7 @@ class MultiModelSizingConfig:
     def from_dict(cls, d: Dict) -> "MultiModelSizingConfig":
         """Create from dictionary."""
         sizing_params = MonotoneSizingParams.from_dict(d.get("sizing_params", {}))
+        short_selectivity = ShortSelectivityConfig.from_dict(d.get("short_selectivity", {}))
         regime_gating = RegimeGatingConfig.from_dict(d.get("regime_gating", {}))
 
         return cls(
@@ -285,6 +370,7 @@ class MultiModelSizingConfig:
             netting_policy=d.get("netting_policy", "strongest"),
             sizing_params=sizing_params,
             model_params=d.get("model_params"),
+            short_selectivity=short_selectivity,
             regime_gating=regime_gating,
             max_gross_exposure=d.get("max_gross_exposure", 1.0),
             max_net_exposure=d.get("max_net_exposure", 1.0),
@@ -319,6 +405,7 @@ class MultiModelSizingConfig:
                 exposure_mult=exposure_mult,
                 max_weight=max_weight,
             ),
+            short_selectivity=ShortSelectivityConfig.neutral(),
             max_gross_exposure=max_gross_exposure,
             turnover_penalty=turnover_penalty,
             regime_gating=RegimeGatingConfig.disabled(),
@@ -377,12 +464,17 @@ def save_multi_model_config(
 
 # TPE parameter ranges for optimization
 TPE_PARAM_RANGES = {
-    # Sizing params
+    # Base sizing params
     "slope": (1.0, 5.0),
     "intercept": (0.3, 0.7),
     "exposure_mult": (0.5, 1.5),
     "turnover_penalty": (0.0, 0.02),
     "parabolic_threshold_offset": (0.0, 0.15),
+
+    # Short selectivity params
+    "short_threshold_offset": (0.0, 0.15),
+    "short_max_weight_mult": (0.5, 1.0),
+    "short_exposure_mult": (0.5, 1.0),
 
     # Regime gating params
     "vix_high_threshold": (60.0, 95.0),
@@ -391,6 +483,8 @@ TPE_PARAM_RANGES = {
     "credit_risk_exposure_mult": (0.5, 1.0),
     "breadth_poor_threshold": (20.0, 50.0),
     "breadth_poor_long_mult": (0.5, 1.0),
+    "breadth_poor_short_mult": (0.7, 1.0),  # Typically less aggressive reduction
+    "short_regime_mult": (0.7, 1.0),
 }
 
 
@@ -404,3 +498,24 @@ def get_tpe_param_range(param_name: str) -> tuple:
         Tuple of (min, max) values.
     """
     return TPE_PARAM_RANGES.get(param_name, (0.0, 1.0))
+
+
+# Regime feature column names (used by regime_gating and regime_data modules)
+REGIME_FEATURE_COLS = {
+    "vix_percentile": [
+        "vix_percentile_252d",
+        "vix_pct_rank_252d",
+        "w_vix_percentile_252d",
+    ],
+    "credit_spread": [
+        "fred_bamlh0a0hym2_z60",
+        "credit_spread_zscore",
+        "hy_spread_z60",
+        "w_fred_bamlh0a0hym2_z60",
+    ],
+    "breadth": [
+        "sector_breadth_pct_above_ma200",
+        "breadth_pct_above_200dma",
+        "w_sector_breadth_pct_above_ma200",
+    ],
+}
