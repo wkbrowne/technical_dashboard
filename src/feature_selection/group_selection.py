@@ -7,7 +7,7 @@ Key algorithms:
 - grouped_forward_selection: Add entire groups if improvement > epsilon
 - grouped_swap_selection: Deterministic group swaps (no randomness)
 - grouped_backward_elimination: Remove entire groups if loss < epsilon
-- interaction_group_selection: Select from curated INTERACTION_GROUPS
+- template_interaction_selection: Select from INTERACTION_TEMPLATES (parent-gated)
 - run_outer_cv: Walk-forward outer CV wrapper for robustness estimation
 
 Design principles:
@@ -36,10 +36,10 @@ from .progress import ProgressTracker
 from .parallel_config import get_joblib_kwargs, get_loky_kwargs
 from .executor import parallel_map, shutdown_executor, get_worker_stats, reset_worker_stats
 from .base_features import (
-    CORE_GROUPS, HEAD_GROUPS, CANDIDATE_GROUPS, INTERACTION_GROUPS,
+    CORE_GROUPS, HEAD_GROUPS, CANDIDATE_GROUPS,
     INTERACTION_TEMPLATES,
     get_core_groups, get_head_groups, get_candidate_groups,
-    get_baseline_groups, get_all_groups, get_interaction_groups,
+    get_baseline_groups, get_all_groups,
     get_eligible_templates, generate_interaction_feature_names,
 )
 from .evaluation import EvaluationCache
@@ -113,18 +113,19 @@ class GroupSelectionResult:
 class GroupSelectionConfig:
     """Configuration for group-first selection."""
     # Thresholds for selection decisions (epsilon = minimum improvement in metric units)
-    epsilon_add: float = 0.0001      # Min improvement to add a group
-    epsilon_swap: float = 0.0005     # Min improvement to accept a swap
-    epsilon_remove: float = 0.001    # Max loss allowed when removing a group
+    epsilon_add: float = 0.0003      # Min improvement to add a group
+    epsilon_swap: float = 0.0003     # Min improvement to accept a swap
+    epsilon_remove: float = 0.0005   # Max loss allowed when removing a group
     epsilon_drop: float = 0.0005     # Min improvement to drop a group (for add/drop moves)
-    epsilon_add_interaction: float = 0.0015  # Min improvement for interaction groups
+    epsilon_add_interaction: float = 0.0008  # Min improvement for interaction groups
 
     # Signal-to-noise thresholds (t = delta_mean / SE, measures improvement reliability)
     # A move is accepted if: delta_mean > epsilon AND t > t_threshold
     # Higher t means more confident the improvement is real, not noise
-    t_add: float = 0.5               # t-threshold for add moves (lenient: want exploration)
-    t_swap: float = 1.0              # t-threshold for swap moves (moderate)
-    t_drop: float = 1.0              # t-threshold for drop moves (moderate)
+    t_add: float = 0.1               # t-threshold for add moves (lenient: want exploration)
+    t_swap: float = 0.6              # t-threshold for swap moves (moderate)
+    t_drop: float = 0.7              # t-threshold for drop moves (moderate)
+    t_remove: float = 0.25           # t-threshold for backward elimination (reject if t < -t_remove)
     t_add_interaction: float = 0.5   # t-threshold for interaction group adds
 
     # Debug flag for acceptance diagnostics
@@ -1373,14 +1374,45 @@ def grouped_swap_selection(
     start_metric = current_metric
 
     if config.verbose:
-        move_types = "swap"
+        # Calculate search space
+        n_selected = len(selected)
+        n_selected_removable = len([g for g in selected if g not in baseline_group_names])
+        n_unselected = len([g for g in candidate_groups if g not in selected])
+
+        # Count potential moves
+        n_swaps = n_selected_removable * n_unselected  # Each removable can swap with each unselected
+        n_adds = n_unselected if config.enable_add_drop_moves else 0
+        n_drops = n_selected_removable if config.enable_add_drop_moves else 0
+        total_moves = n_swaps + n_adds + n_drops
+
+        print()
+        print("=" * 70)
+        print("LOCAL SEARCH (HILL-CLIMBING) PHASE")
+        print("=" * 70)
+        print(f"  Starting metric: {current_metric:.4f}")
+        print(f"  Max iterations: {config.max_search_iterations}")
+        print()
+        print(f"  Search space:")
+        print(f"    Selected groups: {n_selected} ({n_selected_removable} removable, "
+              f"{n_selected - n_selected_removable} baseline-protected)")
+        print(f"    Unselected candidates: {n_unselected}")
+        print(f"    Potential swaps: {n_swaps}")
         if config.enable_add_drop_moves:
-            move_types = "swap/add/drop"
-        k_info = ""
+            print(f"    Potential adds: {n_adds}")
+            print(f"    Potential drops: {n_drops}")
+        print(f"    Total moves per iteration: {total_moves}")
+        print()
+        print(f"  Acceptance thresholds:")
+        print(f"    epsilon_swap: {config.epsilon_swap:.4f} (t >= {config.t_swap:.1f})")
+        print(f"    epsilon_add:  {config.epsilon_add:.4f} (t >= {config.t_add:.1f})")
+        if config.enable_add_drop_moves:
+            print(f"    epsilon_drop: {config.epsilon_remove:.4f} (t >= {config.t_drop:.1f})")
+        print()
+        print(f"  Options: tabu={config.enable_tabu}", end="")
         if config.enable_k_of_n:
-            k_info = f", K-of-N=True (K={config.group_k_default})"
-        print(f"Local search: starting metric = {current_metric:.4f} "
-              f"(moves: {move_types}, tabu: {config.enable_tabu}{k_info})")
+            print(f", K-of-N=True (K={config.group_k_default})", end="")
+        print()
+        print("-" * 70)
 
     iteration = 0
 
@@ -1649,10 +1681,9 @@ def _find_best_drop_move(
             for spec in specs
         ]
 
-    # Apply acceptance for removal: accept if loss is within tolerance
-    # For removal: accept if delta_mean >= -epsilon_remove (loss <= epsilon_remove)
-    # Note: We compute per-fold deltas for accurate statistics, but don't use t-stat gate
-    # (backward elimination tests "no significant harm", not "significant improvement")
+    # Apply acceptance for removal: accept if loss is within tolerance AND t-stat gate passes
+    # For removal: accept if delta_mean >= -epsilon_remove AND (delta_mean >= 0 OR t_stat >= -t_remove)
+    # The t-stat gate ensures we don't remove groups where we're confident the removal hurts
     accepted_moves = []
     for r in move_results:
         if r.result is None:
@@ -1673,20 +1704,30 @@ def _find_best_drop_move(
             delta_mean = r.result.metric_main - current_result.metric_main
             delta_std = 0.0
 
-        # For removal: accept if loss <= epsilon_remove
-        acceptable = delta_mean >= -config.epsilon_remove
+        # Compute t_stat for SNR acceptance
+        n_folds = len(current_result.fold_metrics)
+        delta_se = delta_std / np.sqrt(n_folds) if n_folds > 1 else 0.0
+        t_stat = delta_mean / (delta_se + 1e-12) if delta_se > 0 else float('inf')
+
+        # For removal: accept if loss <= epsilon_remove AND t_stat >= -t_remove
+        # If delta_mean >= 0 (removal helps), always pass t-stat gate
+        epsilon_ok = delta_mean >= -config.epsilon_remove
+        t_ok = delta_mean >= 0 or t_stat >= -config.t_remove
+        acceptable = epsilon_ok and t_ok
 
         if config.debug_acceptance:
             status = "ACCEPT" if acceptable else "REJECT"
+            reject_reason = ""
+            if not acceptable:
+                if not epsilon_ok:
+                    reject_reason = " (epsilon fail)"
+                elif not t_ok:
+                    reject_reason = " (t-stat fail)"
             print(f"    remove {r.spec.group_out}: Δ_mean={delta_mean:.5f}, "
-                  f"Δ_std={delta_std:.5f}, thresh=-{config.epsilon_remove:.5f} → {status}")
+                  f"Δ_std={delta_std:.5f}, t={t_stat:.2f}, "
+                  f"thresh=(-{config.epsilon_remove:.5f}, -{config.t_remove:.2f}) → {status}{reject_reason}")
 
         if acceptable:
-            # Compute t_stat for logging (even though not used for acceptance in backward elim)
-            n_folds = len(current_result.fold_metrics)
-            delta_se = delta_std / np.sqrt(n_folds) if n_folds > 1 else 0.0
-            t_stat = delta_mean / (delta_se + 1e-12) if delta_se > 0 else float('inf')
-
             move = LocalSearchMove(
                 move_type="drop",
                 group_out=r.spec.group_out,
@@ -1708,120 +1749,8 @@ def _find_best_drop_move(
 
 
 # =============================================================================
-# INTERACTION GROUP SELECTION
+# TEMPLATE-BASED INTERACTION SELECTION
 # =============================================================================
-
-def interaction_group_selection(
-    evaluator: SubsetEvaluator,
-    current_groups: Dict[str, List[str]],
-    interaction_groups: Dict[str, List[str]],
-    config: GroupSelectionConfig,
-    progress: Optional[ProgressTracker] = None,
-    cache: Optional[EvaluationCache] = None,
-) -> Tuple[Dict[str, List[str]], List[GroupResult], float]:
-    """
-    Select from curated interaction groups with parallel evaluation.
-
-    Each round, all remaining interaction groups are evaluated in parallel.
-    The best one that passes variance-adjusted threshold is added.
-    Repeat until max_interaction_groups or no improvement.
-
-    Args:
-        evaluator: Configured SubsetEvaluator
-        current_groups: Current selected groups
-        interaction_groups: Curated interaction groups to consider
-        config: Selection configuration
-        progress: Optional progress tracker
-        cache: Optional evaluation cache
-
-    Returns:
-        Tuple of (final_groups, interaction_results, final_metric)
-    """
-    selected = dict(current_groups)
-    results = []
-
-    # Initialize cache if not provided and caching is enabled
-    # Note: cache is disabled when using loky (processes don't share memory)
-    if cache is None and config.enable_caching and not config.use_loky_for_moves:
-        cache = EvaluationCache(max_size=config.cache_max_size)
-
-    # Evaluate current
-    current_features = _groups_to_features(selected)
-    current_result = _cached_evaluate(evaluator, current_features, cache, n_jobs=config.n_jobs)
-    current_metric = current_result.metric_main
-
-    if config.verbose:
-        print(f"Interaction selection: starting metric = {current_metric:.4f}, "
-              f"{len(interaction_groups)} candidate interaction groups")
-
-    # Filter interaction groups to those with available features
-    available_interactions = {}
-    for group_name, group_features in interaction_groups.items():
-        if group_name in selected:
-            continue
-        available_features = [f for f in group_features if f in evaluator._all_features]
-        if len(available_features) > 0:
-            available_interactions[group_name] = available_features
-        elif config.verbose:
-            print(f"  - Skipped '{group_name}': no features available in data")
-
-    # Iteratively add best interaction until max reached or none pass
-    n_interactions_added = 0
-    round_num = 0
-
-    while available_interactions and n_interactions_added < config.max_interaction_groups:
-        round_num += 1
-        current_features = _groups_to_features(selected)
-
-        # Find best add move among remaining interactions (parallel)
-        best_move = _find_best_add_move(
-            evaluator=evaluator,
-            current_features=current_features,
-            candidate_groups=available_interactions,
-            current_metric=current_metric,
-            current_result=current_result,
-            config=config,
-            cache=cache,
-        )
-
-        if best_move is None:
-            if config.verbose:
-                print(f"  Round {round_num}: No improving interaction found, stopping")
-            break
-
-        # Record result
-        result = GroupResult(
-            group_name=best_move.group_in,
-            features=best_move.features_in,
-            metric_before=current_metric,
-            metric_after=best_move.new_metric,
-            delta=best_move.delta,
-            accepted=True,
-            reason=f"Best of {len(available_interactions)} interactions"
-        )
-        results.append(result)
-
-        # Accept the move
-        selected[best_move.group_in] = best_move.features_in
-        current_metric = best_move.new_metric
-        # Re-evaluate to get full SubsetResult for next round
-        new_features = _groups_to_features(selected)
-        current_result = _cached_evaluate(evaluator, new_features, cache, n_jobs=config.n_jobs)
-
-        # Remove from remaining
-        del available_interactions[best_move.group_in]
-        n_interactions_added += 1
-
-        if config.verbose:
-            print(f"  Round {round_num}: + Added '{best_move.group_in}' "
-                  f"({len(best_move.features_in)} features): "
-                  f"Δ = {best_move.delta:+.4f}, metric = {current_metric:.4f}")
-
-    if n_interactions_added >= config.max_interaction_groups and config.verbose:
-        print(f"  Max interaction groups ({config.max_interaction_groups}) reached")
-
-    return selected, results, current_metric
-
 
 def template_interaction_selection(
     evaluator: SubsetEvaluator,
@@ -1925,11 +1854,15 @@ def template_interaction_selection(
                 print(f"  - Skipped template '{template_name}': no features could be computed")
             continue
 
-        # Update evaluator's X with new interaction features
-        # We need to update the evaluator's internal data
+        # Update evaluator's internal data with new interaction features
+        # Note: X may already have the columns (from compute_template_interactions)
+        # but we need to ensure evaluator's mapping is updated too
         for feat in available_features:
+            # Add to DataFrame if not present
             if feat not in evaluator._X.columns:
                 evaluator._X[feat] = X[feat]
+            # Always update mapping if not present (even if column exists)
+            if feat not in evaluator._feature_to_idx:
                 evaluator._feature_to_idx[feat] = len(evaluator._feature_to_idx)
                 evaluator._all_features.append(feat)
 
@@ -2013,7 +1946,7 @@ def run_group_selection(
     2. Forward selection from candidate groups
     3. Deterministic swaps between groups
     4. Backward elimination of non-essential groups
-    5. Add curated interaction groups
+    5. Template-based interaction selection (INTERACTION_TEMPLATES)
 
     Args:
         X: Feature DataFrame
@@ -2051,7 +1984,6 @@ def run_group_selection(
     # Get groups
     baseline_groups = get_baseline_groups(model_key)
     candidate_groups = get_candidate_groups()
-    interaction_groups = get_interaction_groups()
 
     baseline_group_names = set(baseline_groups.keys())
 
@@ -2067,7 +1999,7 @@ def run_group_selection(
         print(f"Baseline: {len(baseline_groups)} groups, "
               f"{len(_groups_to_features(baseline_groups))} features")
         print(f"Candidates: {len(candidate_groups)} groups")
-        print(f"Interactions: {len(interaction_groups)} groups")
+        print(f"Interaction templates: {len(INTERACTION_TEMPLATES)}")
         if config.enable_k_of_n:
             print(f"K-of-N: ENABLED (default K={config.group_k_default})")
             if config.group_k:
@@ -2109,11 +2041,11 @@ def run_group_selection(
         evaluator, selected, baseline_group_names, config, progress, cache
     )
 
-    # Stage 4: Interaction groups
+    # Stage 4: Template-based interaction selection
     if config.verbose:
-        print(f"\n--- Stage 4: Interaction Selection ---")
-    selected, interaction_results, metric = interaction_group_selection(
-        evaluator, selected, interaction_groups, config, progress, cache
+        print(f"\n--- Stage 4: Template Interaction Selection ---")
+    selected, interaction_results, metric = template_interaction_selection(
+        evaluator, X, selected, config, progress, cache
     )
 
     total_time = time.time() - start_time
@@ -2615,7 +2547,7 @@ def run_outer_cv(
                 verbose=False,  # Suppress inner verbosity during outer CV
             )
         else:
-            # Make a copy with verbose disabled for inner selection
+            # Make a copy preserving verbose/debug settings from original config
             selection_config = GroupSelectionConfig(
                 epsilon_add=selection_config.epsilon_add,
                 epsilon_swap=selection_config.epsilon_swap,
@@ -2639,7 +2571,8 @@ def run_outer_cv(
                 n_jobs=selection_config.n_jobs,
                 parallelize_moves=selection_config.parallelize_moves,
                 n_move_workers=selection_config.n_move_workers,
-                verbose=False,  # Suppress for outer CV
+                verbose=selection_config.verbose,  # Preserve from original config
+                debug_acceptance=selection_config.debug_acceptance,  # Preserve debug flag
             )
 
         # Run group selection on outer-train data
@@ -2846,14 +2779,20 @@ def _get_features_for_groups(
     Returns:
         List of feature names.
     """
-    from .base_features import get_all_groups, get_interaction_groups
+    from .base_features import get_all_groups, generate_interaction_feature_names
 
-    # Get all group definitions
+    # Get all group definitions (CORE, HEAD, CANDIDATE)
     all_groups = get_all_groups(model_key)
-    interaction_groups = get_interaction_groups(model_key)
+
+    # For interaction templates, generate feature names dynamically
+    template_features = {}
+    for template_name, template in INTERACTION_TEMPLATES.items():
+        template_features[template_name] = generate_interaction_feature_names(
+            template_name, template
+        )
 
     # Merge group definitions
-    group_defs = {**all_groups, **interaction_groups}
+    group_defs = {**all_groups, **template_features}
 
     features = []
     available_set = set(available_columns)
