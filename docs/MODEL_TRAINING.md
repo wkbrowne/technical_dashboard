@@ -246,14 +246,34 @@ Use `--gap` to customize the embargo period if your targets use a different hori
 
 ### 4.7 Composite Objective
 
-Optimizes multiple financial metrics (not just AUC):
+The hyperopt objective uses a **"mean minus SE penalty"** formulation that aligns with the SNR-based gating in feature selection:
+
+```
+objective = S_mean - λ × S_se
+```
+
+Where:
+- `S_fold[i]` = per-fold composite score (weighted sum of metrics)
+- `S_mean` = mean of per-fold scores
+- `S_se` = std(S_fold) / sqrt(n_folds) (standard error)
+- `λ` = `lambda_stability` penalty coefficient (default: 0.5)
+
+**Per-fold composite score** (computed before aggregation):
 
 | Component | Weight | Metric |
 |-----------|--------|--------|
-| Discrimination | 35% | AUC (20%) + AUPR (15%) |
-| Calibration | 15% | 1 - Brier/0.25 |
-| Tail performance | 30% | Precision@10% (20%) + Spread (10%) |
-| Stability | 20% | 1 - CV coefficient×5 |
+| Discrimination | 40% | AUC (25%) + AUPR (15%) |
+| Calibration | 15% | 1 - clamp(Brier/0.25, 0, 1) |
+| Tail performance | 45% | Precision@10% (25%) + Spread (20%) |
+
+**Why per-fold first, then aggregate?**
+- Ensures the stability penalty reflects true fold-to-fold variance in the composite objective, not just AUC variance
+- Aligns with financial intuition: we want stable *overall* performance, not just stable discrimination
+- Consistent with SNR gating used in feature selection (SE-based, not CV-coefficient-based)
+
+**AUC floor constraint**: Trials that sacrifice AUC below `baseline - 0.002` are pruned, preventing the composite from trading discrimination for other metrics.
+
+**Fold weighting**: In `--cv-score weighted` mode, later folds get higher weight (recency bias) but SE penalty is skipped (proper weighted variance requires careful effective-N handling).
 
 ### 4.8 Hyperparameter Philosophy
 
@@ -458,7 +478,7 @@ See [MODEL_FEATURIZATION.md](MODEL_FEATURIZATION.md) for detailed feature docume
 | AUPR | 0.50-0.58 | 0.58-0.65 | > 0.65 |
 | Brier | 0.23-0.25 | 0.20-0.23 | < 0.20 |
 | Precision@10% | 0.50-0.55 | 0.55-0.60 | > 0.60 |
-| CV(AUC) | 0.10-0.15 | 0.05-0.10 | < 0.05 |
+| S_se (composite SE) | > 0.02 | 0.01-0.02 | < 0.01 |
 
 ### 6.3 File Dependencies
 

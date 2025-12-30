@@ -11,12 +11,14 @@ A production-quality position sizing, optimization, and backtesting system for t
 5. [Model Training and Calibration](#model-training-and-calibration)
 6. [Position Sizing Rules](#position-sizing-rules)
 7. [NAV Exposure vs Volatility-Targeted Exposure](#nav-exposure-vs-volatility-targeted-exposure)
-8. [Regime Gating](#regime-gating)
-9. [Optimizer Design](#optimizer-design)
-10. [Backtest Assumptions](#backtest-assumptions)
-11. [Running the Pipeline](#running-the-pipeline)
-12. [Configuration Examples](#configuration-examples)
-13. [Known Failure Modes and Sanity Checks](#known-failure-modes-and-sanity-checks)
+8. [Regime Gating](#regime-gating) (Direction-aware)
+9. [Short Selectivity](#short-selectivity)
+10. [Justification Outputs](#justification-outputs)
+11. [Optimizer Design](#optimizer-design)
+12. [Backtest Assumptions](#backtest-assumptions)
+13. [Running the Pipeline](#running-the-pipeline)
+14. [Configuration Examples](#configuration-examples)
+15. [Known Failure Modes and Sanity Checks](#known-failure-modes-and-sanity-checks)
 
 ---
 
@@ -28,29 +30,102 @@ The position sizing system sits on top of an existing LightGBM binary classifier
 
 ## Multi-Model Sizing System
 
-The multi-model sizing system extends the single-model approach to support four models with different targets and directions.
+The multi-model sizing system supports four models with different targets and directions, combining their predictions into final position weights.
 
 ### The Four Models
 
-| Model | Target | Direction | Use Case |
-|-------|--------|-----------|----------|
-| LONG_NORMAL | Upper barrier hit (normal move) | Long (+) | Standard bullish bets |
-| LONG_PARABOLIC | Upper barrier hit (parabolic move) | Long (+) | High-conviction momentum |
-| SHORT_NORMAL | Lower barrier hit (normal move) | Short (-) | Standard bearish bets |
-| SHORT_PARABOLIC | Lower barrier hit (parabolic move) | Short (-) | High-conviction reversals |
+| Model | Target | Direction | Probability Column | Use Case |
+|-------|--------|-----------|-------------------|----------|
+| LONG_NORMAL | Upper barrier hit (normal move) | Long (+1) | `p_long_normal` | Standard bullish bets, moderate conviction |
+| LONG_PARABOLIC | Upper barrier hit (parabolic move) | Long (+1) | `p_long_parabolic` | High-conviction momentum, rare but larger moves |
+| SHORT_NORMAL | Lower barrier hit (normal move) | Short (-1) | `p_short_normal` | Standard bearish bets, moderate conviction |
+| SHORT_PARABOLIC | Lower barrier hit (parabolic move) | Short (-1) | `p_short_parabolic` | High-conviction reversals, extreme moves |
 
-Parabolic models have higher thresholds (via `parabolic_threshold_offset`) because parabolic moves are rarer but have larger expected returns.
+Parabolic models have higher thresholds (via `parabolic_threshold_offset`, default 0.05) because parabolic moves are rarer but have larger expected returns.
 
 ### Module Structure
 
 ```
 src/sizing/
 ├── __init__.py          # Module exports
-├── config.py            # Configuration dataclasses
+├── config.py            # Configuration dataclasses + ShortSelectivityConfig
 ├── predictions.py       # Multi-model prediction loading
-├── multi_model.py       # Core sizing engine
-├── regime_gating.py     # Regime-based exposure gating
-└── optimizer.py         # TPE optimization
+├── multi_model.py       # Core MultiModelSizingEngine + justification outputs
+├── regime_gating.py     # Direction-aware regime-based exposure gating
+├── regime_data.py       # Regime data loading and joining utilities
+└── optimizer.py         # TPE optimization with short selectivity
+```
+
+### Pipeline Flow: Predictions → Position Weights
+
+The `MultiModelSizingEngine.compute_weights()` method processes predictions through this sequence:
+
+```
+Raw Predictions (4 probability columns)
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ STEP 1: Compute Model Weights (compute_model_weights)   │
+│   For each model:                                       │
+│   • raw_weight = slope × (probability - intercept)      │
+│   • Clip to [0, max_weight]                             │
+│   • Apply exposure_mult scaling                         │
+│   • Apply direction sign (+1 for longs, -1 for shorts)  │
+│   Outputs: w_long_normal, w_long_parabolic, etc.        │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ STEP 2: Compute Edge Scores (compute_edge_scores)       │
+│   edge = probability - intercept                        │
+│   Higher edge = stronger signal above threshold         │
+│   Outputs: edge_long_normal, edge_long_parabolic, etc.  │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ STEP 3: Combine Model Signals (combine_model_weights)   │
+│   MODE_PRIORITY (default):                              │
+│     For each symbol, pick model with highest |edge|     │
+│     Use that model's weight and direction               │
+│   BLEND:                                                │
+│     Average all model weights (simple mean)             │
+│   Outputs: combined_weight, contributing_model          │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ STEP 4: Handle Long/Short Conflicts (_apply_netting)    │
+│   STRONGEST (default):                                  │
+│     Pick direction with larger absolute weight          │
+│   NET:                                                  │
+│     Subtract short weights from long weights            │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ STEP 5: Apply Regime Gating (if enabled)                │
+│   Compute exposure multipliers from regime features:    │
+│   • VIX high → reduce all exposure                      │
+│   • Credit spread high → reduce all exposure            │
+│   • Breadth poor → reduce long exposure only            │
+│   final_mult = vix_mult × credit_mult × breadth_mult    │
+│   weights = weights × final_mult                        │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│ STEP 6: Apply Portfolio Constraints (in order!)         │
+│   1. Clip individual weights to max_weight_per_name     │
+│   2. Filter by minimum weight threshold                 │
+│   3. Enforce max_positions (keep top N by |weight|)     │
+│   4. Scale to max_gross_exposure                        │
+│   5. Enforce max_net_exposure                           │
+│   Output: final_weight                                  │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+Final Position Weights (per symbol)
 ```
 
 ### Quick Start
@@ -69,13 +144,12 @@ python scripts/run_multi_model_backtest.py \
 
 ### Prediction Format
 
-**Wide format** (recommended): Single parquet with all model predictions:
+**Wide format** (required): Single parquet with all model predictions:
 ```
 date        symbol  p_long_normal  p_long_parabolic  p_short_normal  p_short_parabolic
 2024-01-01  AAPL    0.65           0.45              0.32            0.28
+2024-01-01  MSFT    0.58           0.42              0.35            0.30
 ```
-
-**Separate files**: Directory with per-model parquets.
 
 ### Combining Policies
 
@@ -84,21 +158,22 @@ For each symbol, pick the model with highest "edge score":
 ```python
 edge_score = probability - intercept
 ```
-The winning model's weight is used with its direction sign.
+The winning model's weight is used with its direction sign. This produces sparse allocations where each symbol gets contribution from 1-2 models.
 
 #### Blend
 Average all model weights (after applying direction signs):
 ```python
 combined = mean(w_long_normal, w_long_parabolic, w_short_normal, w_short_parabolic)
 ```
+This produces denser allocations where all symbols get contributions from all models.
 
 ### Direction and Netting
 
 Long models contribute positive weights, short models negative weights.
 
-When both long and short signals exist:
-- **Strongest (default)**: Pick direction with larger absolute edge
-- **Net**: Subtract short weight from long weight
+When both long and short signals exist for a symbol:
+- **Strongest (default)**: Compare aggregate long vs short weights, pick the direction with larger absolute value
+- **Net**: Subtract short weight from long weight, can result in mixed/near-zero final weights
 
 ### Configuration Example
 
@@ -110,14 +185,39 @@ When both long and short signals exist:
   "sizing_params": {
     "slope": 2.0,
     "intercept": 0.5,
-    "exposure_mult": 0.9
+    "exposure_mult": 0.9,
+    "max_weight": 0.10
   },
   "parabolic_threshold_offset": 0.05,
-  "regime_gating": {"enabled": true},
+  "regime_gating": {
+    "enabled": true,
+    "vix_high_threshold": 80.0,
+    "vix_high_exposure_mult": 0.7,
+    "credit_risk_threshold": 1.5,
+    "credit_risk_exposure_mult": 0.8,
+    "breadth_poor_threshold": 30.0,
+    "breadth_poor_long_mult": 0.8
+  },
   "max_gross_exposure": 1.0,
-  "max_net_exposure": 0.5
+  "max_net_exposure": 0.5,
+  "max_weight_per_name": 0.10,
+  "max_positions": 50
 }
 ```
+
+### Optimization Parameters
+
+The TPE optimizer searches over these parameter ranges:
+
+| Parameter | Range | Description |
+|-----------|-------|-------------|
+| `slope` | [1.0, 5.0] | Probability mapping sensitivity |
+| `intercept` | [0.3, 0.7] | Probability threshold for positive weight |
+| `exposure_mult` | [0.5, 1.5] | Global exposure scaling factor |
+| `turnover_penalty` | [0.0, 0.02] | Cost of turnover in objective |
+| `parabolic_threshold_offset` | [0.0, 0.15] | Extra threshold for parabolic models |
+
+**Note**: All models currently share the same `slope`, `intercept`, and `exposure_mult`. Only `parabolic_threshold_offset` differentiates normal vs parabolic models.
 
 ### Backward Compatibility
 
@@ -416,7 +516,7 @@ exposure = min(exposure, max_exposure_cap)
 
 ## Regime Gating
 
-Regime gating is a **risk-control overlay** that adjusts exposure based on market conditions, independent of model predictions.
+Regime gating is a **risk-control overlay** that adjusts exposure based on market conditions, independent of model predictions. The system is **direction-aware**, applying different multipliers to long and short positions.
 
 ### Why Gating If Regime Is in the Model?
 
@@ -429,11 +529,25 @@ Regime gating is a **risk-control overlay** that adjusts exposure based on marke
 
 Models include regime features to predict returns better. Gating provides hard limits that override model confidence when risk is elevated.
 
+### Direction-Aware Gating
+
+The gating system applies **separate multipliers** to longs and shorts:
+
+| Rule | Long Multiplier | Short Multiplier | Rationale |
+|------|-----------------|------------------|-----------|
+| VIX High | `vix_high_exposure_mult` | `vix_high_exposure_mult` | Both reduced equally |
+| Credit Stress | `credit_risk_exposure_mult` | `credit_risk_exposure_mult` | Both reduced equally |
+| Poor Breadth | `breadth_poor_long_mult` | `breadth_poor_short_mult` | Shorts may thrive in poor breadth |
+| Short Regime | N/A | `short_regime_mult` | Additional short-specific dampening |
+
+**Key Design**: Poor breadth reduces longs (they struggle when few stocks participate) but may not reduce shorts (they can profit from narrow markets).
+
 ### Gating Rules
 
 ```yaml
 regime_gating:
   enabled: true
+  strict_missing_features: false  # Warn on missing features instead of failing
 
   # VIX-based: reduce exposure when VIX is high
   vix_high_threshold: 80.0       # 80th percentile
@@ -443,14 +557,25 @@ regime_gating:
   credit_risk_threshold: 1.5     # Z-score
   credit_risk_exposure_mult: 0.8 # Scale to 80%
 
-  # Breadth: reduce longs when breadth is poor
-  breadth_poor_threshold: 30.0   # 30th percentile
-  breadth_poor_long_mult: 0.8    # Scale longs to 80%
+  # Breadth: direction-aware reduction
+  breadth_poor_threshold: 30.0       # 30th percentile
+  breadth_poor_long_mult: 0.8        # Scale longs to 80%
+  breadth_poor_short_mult: 1.0       # Shorts NOT reduced
+
+  # Additional short dampening (always applied)
+  short_regime_mult: 0.9             # Scale shorts to 90%
 ```
 
-Rules combine multiplicatively:
-```
-final_mult = vix_mult * credit_mult * breadth_mult
+### Multiplier Computation
+
+Rules combine multiplicatively with direction awareness:
+
+```python
+# Long positions
+final_long_mult = vix_mult × credit_mult × breadth_long_mult
+
+# Short positions
+final_short_mult = vix_mult × credit_mult × breadth_short_mult × short_regime_mult
 ```
 
 ### Available Regime Features
@@ -488,6 +613,109 @@ python scripts/run_multi_model_sizing.py \
 ```
 
 Optimized parameters are saved in `best_config_*.json` and included in trial logs.
+
+---
+
+## Short Selectivity
+
+Short positions are inherently riskier (unlimited loss, borrow costs, squeeze risk). The short selectivity system makes shorts **more selective** than longs.
+
+### Short Selectivity Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `short_threshold_offset` | 0.05 | Added to intercept for short models |
+| `short_max_weight_mult` | 0.8 | Multiplier for max weight on shorts |
+| `short_exposure_mult` | 1.0 | Multiplier for short exposure |
+
+### How It Works
+
+When computing weights for short models, the sizing parameters are modified:
+
+```python
+# For SHORT_NORMAL and SHORT_PARABOLIC models:
+effective_intercept = base_intercept + short_threshold_offset
+effective_max_weight = base_max_weight × short_max_weight_mult
+```
+
+**Example**: With `intercept=0.55`, `short_threshold_offset=0.05`:
+- Long models require p > 0.55 for positive weight
+- Short models require p > 0.60 for positive weight
+
+### Configuration
+
+```yaml
+short_selectivity:
+  short_threshold_offset: 0.05    # Shorts need p > 0.60 vs longs p > 0.55
+  short_max_weight_mult: 0.8      # Shorts max at 8% vs longs max at 10%
+  short_exposure_mult: 1.0        # No additional exposure reduction
+```
+
+### TPE Optimization
+
+Short selectivity parameters are optimized when `--short-selectivity on` is passed:
+
+```bash
+python scripts/run_multi_model_sizing.py \
+    --short-selectivity on \
+    --regime-gating on \
+    --n-trials 300
+```
+
+---
+
+## Justification Outputs
+
+Every sizing decision can be accompanied by justification columns for dashboard display and audit trails. All justification columns use the `j_` prefix.
+
+### Justification Columns
+
+| Column | Description |
+|--------|-------------|
+| `j_winning_model` | Which model contributed (for MODE_PRIORITY) |
+| `j_winning_edge` | Edge score of the winning model |
+| `j_gated` | Whether regime gating was applied |
+| `j_long_mult` | Regime gating multiplier for longs |
+| `j_short_mult` | Regime gating multiplier for shorts |
+| `j_vix_triggered` | Whether VIX rule triggered |
+| `j_credit_triggered` | Whether credit rule triggered |
+| `j_breadth_triggered` | Whether breadth rule triggered |
+
+### Generating Justification Outputs
+
+```python
+engine = MultiModelSizingEngine(config)
+weighted = engine.compute_weights(signals, include_justification=True)
+
+# Get all justification columns
+j_cols = [c for c in weighted.columns if c.startswith('j_')]
+```
+
+### Decision Log
+
+The decision log is a parquet file containing all decisions with justifications:
+
+```bash
+# Generate during optimization
+python scripts/run_multi_model_sizing.py \
+    --decision-log artifacts/sizing/decision_log.parquet
+
+# Generate during backtest
+python scripts/run_multi_model_backtest.py \
+    --decision-log artifacts/backtests/decision_log.parquet
+```
+
+### Decision Log Schema
+
+```python
+decision_log_columns = [
+    'run_id',           # Unique run identifier
+    'date',             # Trading date
+    'symbol',           # Stock symbol
+    'final_weight',     # Final position weight
+    # ... all j_ columns ...
+]
+```
 
 ---
 
@@ -579,43 +807,75 @@ turnover_penalty:   0.15
 
 ## Running the Pipeline
 
-### Quick Start (Recommended)
+### Multi-Model Pipeline
 
-The unified pipeline handles everything correctly:
+The multi-model sizing pipeline requires predictions from all four models:
 
 ```bash
 conda activate stocks_predictor
 
-# Full pipeline: CV predictions + optimization + backtest
-python scripts/run_sizing_pipeline.py --n-trials 100
+# Step 1: Optimize sizing parameters (basic)
+python scripts/run_multi_model_sizing.py \
+    --prediction-path artifacts/predictions/cv_predictions_multi.parquet \
+    --n-trials 200
 
-# Quick test run (fewer optimization trials)
-python scripts/run_sizing_pipeline.py --n-trials 20
+# Step 1b: Optimize with regime gating and short selectivity
+python scripts/run_multi_model_sizing.py \
+    --prediction-path artifacts/predictions/cv_predictions_multi.parquet \
+    --regime-gating on \
+    --short-selectivity on \
+    --n-trials 300 \
+    --decision-log artifacts/sizing/decision_log.parquet
+
+# Step 2: Run backtest with optimized config
+python scripts/run_multi_model_backtest.py \
+    --prediction-path artifacts/predictions/cv_predictions_multi.parquet \
+    --sizing-config artifacts/sizing/best_config_multi_model.json
+
+# Step 2b: Run backtest with decision log output
+python scripts/run_multi_model_backtest.py \
+    --prediction-path artifacts/predictions/cv_predictions_multi.parquet \
+    --sizing-config artifacts/sizing/best_config_multi_model.json \
+    --decision-log artifacts/backtests/decision_log.parquet
 ```
 
-### Step-by-Step Execution
+### Pipeline Implementation Status
 
-```bash
-# Step 1: Generate out-of-sample predictions via walk-forward CV
-# This creates TRUE out-of-sample predictions - no leakage!
-python scripts/generate_cv_predictions.py --use-hyperopt-params
+| Component | Status | Script/Module |
+|-----------|--------|---------------|
+| Multi-model sizing engine | ✅ Implemented | `src/sizing/multi_model.py` |
+| Regime gating overlay | ✅ Implemented | `src/sizing/regime_gating.py` |
+| TPE optimizer | ✅ Implemented | `src/sizing/optimizer.py` |
+| Configuration management | ✅ Implemented | `src/sizing/config.py` |
+| Multi-model optimization | ✅ Implemented | `scripts/run_multi_model_sizing.py` |
+| Multi-model backtest | ✅ Implemented | `scripts/run_multi_model_backtest.py` |
+| CV prediction generation | ⚠️ Not integrated | Requires manual multi-model CV setup |
+| Pipeline orchestrator | ⚠️ Partial | `scripts/run_sizing_pipeline.py` references some scripts not yet available |
 
-# Step 2: Optimize sizing parameters using CV predictions
-python scripts/run_optimize_sizing.py --n-trials 100
+### Generating Multi-Model Predictions
 
-# Step 3: Run backtest with optimized params
-python scripts/run_backtest.py \
-    --config artifacts/sizing/best_params_monotone_probability.json
+To use the sizing pipeline, you need predictions from all four models. The predictions must include:
+
+```python
+# Required columns in cv_predictions_multi.parquet
+required_columns = [
+    'date',              # Trading date
+    'symbol',            # Stock symbol
+    'p_long_normal',     # Probability from LONG_NORMAL model
+    'p_long_parabolic',  # Probability from LONG_PARABOLIC model
+    'p_short_normal',    # Probability from SHORT_NORMAL model
+    'p_short_parabolic', # Probability from SHORT_PARABOLIC model
+]
 ```
 
 ### Understanding the Two Training Approaches
 
 | Use Case | Script | Data Used | Valid For |
 |----------|--------|-----------|-----------|
-| **Backtesting/Evaluation** | `generate_cv_predictions.py` | Walk-forward CV folds | Sizing optimization, strategy validation |
+| **Backtesting/Evaluation** | Walk-forward CV | Out-of-sample folds | Sizing optimization, strategy validation |
 | **Live Trading** | `run_training.py` | All historical data | Forward-looking predictions on new data |
 
-**CRITICAL**: Never use predictions from `run_training.py` for backtesting - that would be information leakage!
+**CRITICAL**: Never use predictions from full-sample training for backtesting - that would be information leakage!
 
 ### Full Pipeline (From Scratch)
 
@@ -629,18 +889,28 @@ python run_feature_selection.py
 # Step 3: Run hyperparameter tuning (optional)
 python run_model_tuning.py
 
-# Step 4: Run the sizing pipeline (CV + optimization)
-python scripts/run_sizing_pipeline.py --n-trials 200
+# Step 4: Train models and generate CV predictions for each target type
+# (Run for each of: long_normal, long_parabolic, short_normal, short_parabolic)
+python run_training.py --target-type long_normal --cv-predictions
 
-# Step 5: Generate tear sheet
-python scripts/run_report.py --output-dir artifacts/reports
+# Step 5: Run the multi-model sizing optimization
+python scripts/run_multi_model_sizing.py \
+    --prediction-path artifacts/predictions/cv_predictions_multi.parquet \
+    --n-trials 200
+
+# Step 6: Run backtest with optimized params
+python scripts/run_multi_model_backtest.py \
+    --sizing-config artifacts/sizing/best_config_multi_model.json
 ```
 
 ### Production Model (For Live Trading)
 
 ```bash
-# Train production model on all data
-python run_training.py
+# Train production models on all data (one per target type)
+python run_training.py --target-type long_normal
+python run_training.py --target-type long_parabolic
+python run_training.py --target-type short_normal
+python run_training.py --target-type short_parabolic
 
 # Generate predictions for latest date
 python run_predict.py
@@ -651,13 +921,17 @@ python run_predict.py
 ```
 artifacts/
 ├── models/
-│   ├── sizing_model_fold*.pkl    # Per-fold models
-│   ├── sizing_model_summary.json # CV metrics
+│   ├── model_long_normal_*.pkl      # LONG_NORMAL model
+│   ├── model_long_parabolic_*.pkl   # LONG_PARABOLIC model
+│   ├── model_short_normal_*.pkl     # SHORT_NORMAL model
+│   ├── model_short_parabolic_*.pkl  # SHORT_PARABOLIC model
 │   └── feature_importance.csv
+├── predictions/
+│   └── cv_predictions_multi.parquet # All 4 model predictions
 ├── sizing/
-│   ├── best_params_*.json        # Optimized parameters
-│   ├── trials_*.csv              # Optimization history
-│   └── param_importance_*.json
+│   ├── best_config_multi_model.json # Optimized multi-model config
+│   ├── trials_multi_model.csv       # Optimization history
+│   └── param_importance.json
 ├── backtests/
 │   ├── backtest_equity_curve.csv
 │   ├── backtest_metrics.json
@@ -737,6 +1011,16 @@ sizing:
 | Survivorship bias | Missing delisted symbols | Use point-in-time universe |
 | Overfitting | Poor out-of-sample | Reduce optimizer trials, increase folds |
 
+### Multi-Model Specific Issues
+
+| Issue | Location | Impact |
+|-------|----------|--------|
+| Shared parameters across models | `optimizer.py` | All 4 models use same slope/intercept - may not be optimal for each |
+| High stability penalty | `optimizer.py` line 302 | 0.5 × std(folds) can push toward conservative parameters |
+| Breadth-only gating | `regime_gating.py` | Breadth poor multiplier should only affect longs, logic may need review |
+| Silent feature dropping | `regime_gating.py` | Missing regime features disable gating rules silently |
+| Weight clipping order | `multi_model.py` | Constraints applied sequentially, order matters for final weights |
+
 ### Sanity Checks
 
 Run before trusting results:
@@ -750,6 +1034,9 @@ pytest tests/test_purged_cv.py -v
 
 # 3. Check backtest alignment
 pytest tests/test_backtest_alignment.py -v
+
+# 4. Check multi-model sizing
+pytest tests/sizing_multi_model_test.py -v
 ```
 
 ### Manual Verification
@@ -759,6 +1046,7 @@ pytest tests/test_backtest_alignment.py -v
 3. **Stability**: Compare fold-to-fold metrics variance
 4. **Sensitivity**: Vary parameters ±10%, check performance stability
 5. **Regime Analysis**: Check performance in high vs low VIX periods
+6. **Model Contribution**: Check which model wins most often in MODE_PRIORITY
 
 ### Red Flags
 
@@ -766,6 +1054,8 @@ pytest tests/test_backtest_alignment.py -v
 - Zero turnover with changing weights (implementation bug)
 - All folds have identical metrics (data leakage)
 - Returns uncorrelated with hit rate (implementation bug)
+- Single model dominates all symbol/date pairs (model imbalance)
+- Regime gating never activates (missing features or misconfigured thresholds)
 
 ---
 
@@ -776,4 +1066,4 @@ pytest tests/test_backtest_alignment.py -v
 
 ---
 
-*Last updated: 2024*
+*Last updated: 2025-12-28 - Added direction-aware gating, short selectivity, and justification outputs*

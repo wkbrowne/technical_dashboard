@@ -541,8 +541,15 @@ python -m src.cli.compute --list-checkpoints
 
 | File | Contents | Use Case |
 |------|----------|----------|
-| `features_complete.parquet` | All computed features | Debugging, exploration |
-| `features_filtered.parquet` | Curated ML-ready set | Model training, production |
+| `features_complete.parquet` | All ~600 computed features | Debugging, exploration |
+| `features_filtered.parquet` | Curated subset (~193 by default) | Feature selection, model training |
+
+**Filtering behavior (controlled by `--use-registry` flag):**
+
+| Flag | features_filtered.parquet | Use Case |
+|------|---------------------------|----------|
+| (default) | ~193 candidate features from base_features.py | Feature selection experimentation |
+| `--use-registry` | ~50 selected features from registries | Production inference, minimal storage |
 
 ### 7.2 Feature Classification
 
@@ -550,19 +557,41 @@ python -m src.cli.compute --list-checkpoints
 
 | Category | Purpose |
 |----------|---------|
-| `BASE_FEATURES` | Core features for production models |
-| `EXPANSION_CANDIDATES` | Features for selection experiments |
+| `CORE_FEATURES` | Features shared across all 4 models |
+| `HEAD_FEATURES` | Model-specific features per model key |
+| `CANDIDATE_GROUPS` | Feature groups available for selection experiments |
+| `EXPANSION_CANDIDATES` | Individual features for forward selection |
 | `RETIRED_FEATURES` | Tested but consistently not selected |
 | `INTERMEDIATE_FEATURES` | Required to compute kept features |
 | `META_COLUMNS` | Always kept: `symbol`, `date` |
+
+**Feature Registry:**
+
+After feature selection, each model gets a registry at `artifacts/<model>/features.json`:
+
+```json
+{
+  "schema_version": 1,
+  "model": "long_normal",
+  "resolved_features": ["rsi_14", "atr_percent", ...],
+  "feature_signature": "sha256:abc123..."
+}
+```
+
+The registry records exactly which features were selected via K-of-N selection, providing reproducibility across training and inference.
 
 **Filtering:**
 
 ```python
 from src.feature_selection.base_features import filter_output_columns, validate_features
 
-# Filter to curated set
+# Filter to candidate pool (from base_features.py) - default
+# Produces ~193 features for feature selection experimentation
 df_filtered = filter_output_columns(df, keep_all=False)
+
+# Filter to features from model registries (minimal set)
+# Produces ~50 features (union of selected features across all 4 models)
+df_filtered = filter_output_columns(df, keep_all=False, use_registry=True)
 
 # Validate presence of required features
 result = validate_features(df)
@@ -571,8 +600,11 @@ result = validate_features(df)
 ### 7.3 CLI Options
 
 ```bash
-# Normal run
+# Normal run (uses base_features.py for filtering)
 python -m src.cli.compute --timeframes D,W
+
+# Use feature registry for filtering (minimal set for trained models)
+python -m src.cli.compute --timeframes D,W --use-registry
 
 # Exclude retired features (saves disk)
 python -m src.cli.compute --exclude-retired

@@ -1,6 +1,6 @@
-# Model-Aware Featurization (Phase 1)
+# Model-Aware Featurization
 
-This document describes the 4-model feature architecture for the momentum trading system.
+This document describes the 4-model feature architecture and the feature registry system for reproducible ML pipelines.
 
 ## Overview
 
@@ -13,11 +13,157 @@ The system supports four distinct models, each targeting a specific trade type:
 | `SHORT_NORMAL` | Short | Standard | Breakdown, fragility, liquidity stress |
 | `SHORT_PARABOLIC` | Short | Panic | Regime shift, vol-of-vol, capitulation |
 
+## Feature Registry
+
+The feature registry provides reproducible feature lists across the ML pipeline stages. Each model gets its own registry artifact that records exactly which features were selected.
+
+### Registry Location
+
+```
+artifacts/<model_name>/features.json
+```
+
+Example: `artifacts/long_normal/features.json`
+
+### Registry Schema
+
+```json
+{
+  "schema_version": 1,
+  "model": "long_normal",
+  "created_at": "2025-01-15T10:30:00Z",
+  "data_signature": "optional_dataset_version",
+  "selection": {
+    "baseline_k_of_n": {
+      "alpha_momentum": {"k": 2, "chosen": ["w_rel_strength_sector", "xsec_mom_20d_z"]},
+      "volatility_regime": {"k": 1, "chosen": ["vol_regime_ema10"]}
+    },
+    "include_features": [],
+    "exclude_features": []
+  },
+  "selection_metadata": {
+    "final_metric": 0.5803,
+    "baseline_metric": 0.5287,
+    "holdout_auc": 0.5621
+  },
+  "resolved_features": ["w_rel_strength_sector", "xsec_mom_20d_z", ...],
+  "feature_signature": "sha256:abc123..."
+}
+```
+
+### Key Fields
+
+| Field | Description |
+|-------|-------------|
+| `resolved_features` | Final ordered list of features for training/inference |
+| `feature_signature` | SHA256 hash of features for reproducibility checks |
+| `selection.baseline_k_of_n` | K-of-N selection results per group |
+| `selection_metadata` | Metrics from feature selection (CV AUC, holdout AUC) |
+
+### API Usage
+
+```python
+from src.features.registry import (
+    load_registry,
+    registry_exists,
+    get_registry_path,
+    validate_registry,
+    compare_registries,
+)
+
+# Check if registry exists
+if registry_exists("long_normal"):
+    registry = load_registry(get_registry_path("long_normal"))
+    features = registry["resolved_features"]
+    signature = registry["feature_signature"]
+
+    # Validate integrity
+    result = validate_registry(registry)
+    assert result["valid"], result["issues"]
+```
+
+### Building a Registry
+
+After feature selection, build and save a registry:
+
+```python
+from src.features.registry import (
+    build_registry_from_selection,
+    save_registry,
+    get_registry_summary,
+)
+
+# After group selection completes
+registry = build_registry_from_selection(
+    model_name="long_normal",
+    selected_groups=result.selected_groups,
+    selection_metadata={
+        "final_metric": result.final_metric,
+        "baseline_metric": result.baseline_metric,
+    },
+)
+
+# Save to standard location
+save_registry(registry, "artifacts/long_normal/features.json")
+
+# Print summary
+print(get_registry_summary(registry))
+# Output: long_normal: 23 features, sha256:abc123...
+```
+
+## Pipeline Integration
+
+### Feature Selection Stage
+
+`run_group_selection.py` automatically creates feature registries:
+
+```bash
+python run_group_selection.py --model long_normal
+# Outputs:
+#   artifacts/group_selection/group_selection_long_normal.json  (legacy)
+#   artifacts/long_normal/features.json                          (registry)
+```
+
+### Training Stage
+
+`run_training.py` reads from the registry if available:
+
+```python
+# In run_training.py
+features, signature = load_model_features(model_key)
+# Prefers registry, falls back to base_features.py
+```
+
+The model metadata includes the feature signature for traceability:
+
+```json
+{
+  "training_date": "2025-01-15T12:00:00",
+  "model_key": "long_normal",
+  "n_features": 23,
+  "feature_signature": "sha256:abc123...",
+  "train_auc": 0.6543
+}
+```
+
+### Hyperparameter Optimization
+
+Hyperopt should load features from the registry:
+
+```python
+registry = load_registry("artifacts/long_normal/features.json")
+features = registry["resolved_features"]
+signature = registry["feature_signature"]
+
+# Log signature for traceability
+print(f"Optimizing with features: {signature}")
+```
+
 ## Feature Architecture
 
-### CORE_FEATURES (Shared Backbone)
+### CORE_GROUPS (Shared Backbone)
 
-All models share a common backbone of curated features selected via the Loose-Tight pipeline. Groups are organized for **hypothesis purity** (one hypothesis per group):
+All models share a common backbone of groups selected via group-first feature selection:
 
 - **alpha_momentum**: Cross-sectional momentum, alpha vs SPY/sector benchmarks
 - **macro_credit_labor**: Credit spreads, labor market indicators (FRED)
@@ -33,189 +179,118 @@ All models share a common backbone of curated features selected via the Loose-Ti
 - **volatility_state**: Bollinger width, squeeze intensity, realized vol zscore
 - **gap_dynamics**: Gap/ATR ratio, overnight return patterns
 
-### HEAD_FEATURES (Model-Specific)
+### HEAD_GROUPS (Model-Specific)
 
-Each model has additive head features that augment the core. Groups are split for hypothesis purity:
+Each model can have additional head groups that augment the core. These are selected during model-specific feature selection.
 
-#### LONG_NORMAL
-Focus: Impulse/transition/gap behavior, squeeze setups
+### CANDIDATE_GROUPS
 
-**price_action** (candlestick geometry, VWAP position, divergences):
-- `lower_shadow_ratio`, `upper_shadow_ratio`
-- `vwap_dist_10d_zscore`
-- `w_rsi_price_div_20d`, `rsi_price_div_20d`
+Groups available for forward selection experiments. See `src/feature_selection/base_features.py` for the full list.
 
-**trend_cross_sectional** (trend slope, cross-sectional momentum):
-- `trend_score_slope`, `w_pct_slope_ma_50`
-- `w_xsec_mom_4w_z`, `atr_percent`
+## K-of-N Selection
 
-**relative_strength** (extended with sector alpha):
-- Includes `w_alpha_mom_sector_60_ema10`
-
-**drawdown_recovery, macro_sector** (unchanged)
-
-#### LONG_PARABOLIC
-Focus: Persistence, continuation, extended momentum
-- Persistence: `trend_persist_ema`, `w_trend_persist_ema`
-- Vol expansion: `atr_percent_chg_5`
-- Cross-sectional: `xsec_mom_60d_z`, `w_xsec_mom_13w_z`
-- Alpha (longer): `alpha_mom_spy_60_ema10`, `alpha_mom_qqq_60_ema10`
-- Breakouts: `breakout_up_20d`, `range_expansion_20d`
-
-#### SHORT_NORMAL
-Focus: Breakdown, fragility, liquidity stress
-- Drawdown: `drawdown_20d_z`, `drawdown_velocity_20d`, `drawdown_regime`
-- Liquidity: `illiquidity_score`, `amihud_illiq_ratio`
-- Volume: `volshock_dir`
-- Weekly: `w_drawdown_60d_z`
-- Candlestick: `lower_shadow_ratio` (inverse signal)
-- Breakdown: `breakout_dn_20d`
-
-#### SHORT_PARABOLIC
-Focus: Panic, regime shift, vol-of-vol
-- VIX: `vix_change_5d`, `vix_change_20d`, `vix_regime`, `w_vix_change_4w`
-- Credit: `credit_spread_zscore`, `w_credit_spread_zscore`
-- Correlation: `equity_bond_corr_60d`
-- Gaps: `overnight_ret`, `gap_fill_frac`
-- Vol explosion: `squeeze_release_20`
-
-## Pipeline Output
-
-The feature pipeline outputs a **single dataset** containing all computed features. Model-specific column selection happens at **training time**, not during feature production. This approach:
-
-- Avoids redundant computation of shared features
-- Allows flexible experimentation with different model configurations
-- Keeps the feature pipeline simple and deterministic
+Within each selected group, K-of-N selection chooses the most informative features:
 
 ```bash
-# Compute features (outputs single dataset with ALL features)
-python -m src.cli.compute --timeframes D,W
-
-# Output files:
-#   artifacts/features_complete.parquet  - All computed features (~600+)
-#   artifacts/features_filtered.parquet  - BASE_FEATURES curated set
+python run_group_selection.py --model long_normal --group-k 2
 ```
 
-At training time, use `get_featureset()` to select the appropriate columns:
+This means: for each group, select up to 2 features (not all features in the group).
+
+The registry records which features were chosen per group:
+
+```json
+{
+  "selection": {
+    "baseline_k_of_n": {
+      "alpha_momentum": {
+        "k": 2,
+        "chosen": ["w_rel_strength_sector", "xsec_mom_20d_z"]
+      }
+    }
+  }
+}
+```
+
+## Deterministic Resolution
+
+The registry ensures deterministic feature ordering:
+
+1. Groups are processed in alphabetical order by name
+2. Chosen features within groups preserve the selection order
+3. `include_features` are sorted alphabetically
+4. `exclude_features` are removed after deduplication
+
+This means running the same selection twice produces identical `resolved_features` and `feature_signature`.
+
+## Validation and Comparison
+
+### Validate a Registry
 
 ```python
-import pandas as pd
-from src.config.model_keys import ModelKey
-from src.feature_selection.base_features import get_featureset
+from src.features.registry import validate_registry
 
-# Load the complete feature file
-df = pd.read_parquet('artifacts/features_complete.parquet')
-
-# Select columns for a specific model at training time
-features = get_featureset(ModelKey.LONG_NORMAL)
-df_model = df[['symbol', 'date'] + [f for f in features if f in df.columns]]
+result = validate_registry(registry)
+if not result["valid"]:
+    print("Issues:", result["issues"])
 ```
 
-## Usage
-
-### Getting Feature Sets
+### Compare Two Registries
 
 ```python
-from src.config.model_keys import ModelKey
-from src.feature_selection.base_features import (
-    get_core_features,
-    get_head_features,
-    get_featureset,
-    get_all_selectable_features,
-)
+from src.features.registry import compare_registries
 
-# Core features (shared across all models)
-core = get_core_features()
-
-# Head features for a specific model
-head = get_head_features(ModelKey.LONG_NORMAL)
-
-# Complete featureset for a model (CORE + HEAD)
-features = get_featureset(ModelKey.LONG_NORMAL)
-
-# With expansion candidates
-features_expanded = get_featureset(ModelKey.LONG_NORMAL, include_expansion=True)
-
-# All selectable features (union across all models)
-all_features = get_all_selectable_features()
-
-# All selectable for a specific model
-model_features = get_all_selectable_features(ModelKey.SHORT_PARABOLIC)
+comparison = compare_registries(registry_old, registry_new)
+print(f"Jaccard similarity: {comparison['jaccard_similarity']:.2%}")
+print(f"Only in new: {comparison['only_in_b']}")
 ```
 
-### Structured Feature Set
+## Quick Commands
 
-```python
-# Get structured breakdown instead of flat list
-structured = get_featureset(ModelKey.LONG_NORMAL, flat=False)
-# Returns: {'core': [...], 'head': [...]}
+```bash
+# Feature selection (creates registry)
+python run_group_selection.py --model long_normal
 
-structured_expanded = get_featureset(ModelKey.LONG_NORMAL, flat=False, include_expansion=True)
-# Returns: {'core': [...], 'head': [...], 'expansion': [...]}
+# Training (reads from registry)
+python run_training.py --model long_normal
+
+# Train all models
+python run_training.py --all-models
 ```
-
-### Validation
-
-```python
-import pandas as pd
-from src.config.model_keys import ModelKey
-from src.feature_selection.base_features import (
-    validate_features,
-    validate_model_featuresets,
-    report_head_features_status,
-)
-
-# Load feature DataFrame
-df = pd.read_parquet('artifacts/features_complete.parquet')
-
-# Validate features for a specific model
-result = validate_features(df, model_key=ModelKey.LONG_NORMAL)
-print(f"Valid: {len(result['valid'])}, Missing: {result['missing']}")
-
-# Validate all model featuresets for consistency
-validation = validate_model_featuresets()
-print(f"All valid: {validation['all_valid']}")
-
-# Check head features specifically
-status = report_head_features_status(df, ModelKey.SHORT_PARABOLIC)
-print(status['summary'])
-```
-
-### Retired Features and Dependencies
-
-```python
-from src.feature_selection.base_features import (
-    get_retired_features_safe_to_skip,
-    get_features_required_for_model,
-)
-
-# Get retired features that can be skipped (excluding head features)
-safe_to_skip = get_retired_features_safe_to_skip(ModelKey.LONG_NORMAL)
-
-# Get all features required for a model (including intermediate dependencies)
-required = get_features_required_for_model(ModelKey.LONG_NORMAL)
-```
-
-## Backwards Compatibility
-
-For legacy code, the following aliases are preserved:
-
-```python
-from src.feature_selection.base_features import (
-    BASE_FEATURES,      # Alias to get_featureset(LONG_NORMAL)
-    get_base_features,  # Returns BASE_FEATURES (deprecated)
-)
-```
-
-## Phase 2/3 Preview
-
-- **Phase 2**: Separate model training per model_key with dedicated CV and hyperparameters
-- **Phase 3**: Sizing integration combining predictions from all 4 models
 
 ## File Locations
 
 | File | Description |
 |------|-------------|
-| `src/config/model_keys.py` | ModelKey enum and utilities |
-| `src/feature_selection/base_features.py` | Feature registry and retrieval functions |
-| `scripts/test_model_featuresets.py` | Smoke test for featureset validation |
+| `src/features/registry.py` | Feature registry module |
+| `src/feature_selection/base_features.py` | Group definitions and feature retrieval |
+| `artifacts/<model>/features.json` | Per-model feature registry |
+| `artifacts/group_selection/*.json` | Group selection results (legacy format) |
+| `artifacts/models/<model>/model_metadata.json` | Trained model metadata with signature |
+
+## Migration from Legacy
+
+If you have existing `group_selection_*.json` files without registries:
+
+1. Re-run feature selection to generate registries:
+   ```bash
+   python run_group_selection.py --model all
+   ```
+
+2. Or manually create registries from existing results:
+   ```python
+   import json
+   from src.features.registry import build_registry_from_selection, save_registry
+
+   # Load legacy result
+   with open("artifacts/group_selection/group_selection_long_normal.json") as f:
+       legacy = json.load(f)
+
+   # Build registry
+   registry = build_registry_from_selection(
+       model_name="long_normal",
+       selected_groups=legacy["selected_groups"],
+   )
+
+   save_registry(registry, "artifacts/long_normal/features.json")
+   ```

@@ -12,6 +12,7 @@ For detailed implementation guides, see:
 | [docs/DOWNLOADER.md](docs/DOWNLOADER.md) | Data download CLI, cache structure, ETF/FRED lists, API keys |
 | [docs/FEATURE_PIPELINE_ARCHITECTURE.md](docs/FEATURE_PIPELINE_ARCHITECTURE.md) | Pipeline stages, parallelism, data flow, target generation |
 | [docs/FEATURE_SELECTION.md](docs/FEATURE_SELECTION.md) | Feature selection methodology, sample weighting, CV strategy |
+| [docs/MODEL_FEATURIZATION.md](docs/MODEL_FEATURIZATION.md) | Feature registry, K-of-N selection, model-specific features |
 | [docs/TARGETS.md](docs/TARGETS.md) | Triple barrier targets, barrier calibration, targets-only recomputation |
 
 ## Quick Commands
@@ -49,7 +50,8 @@ src/
 │   ├── cross_sectional.py  # Cross-symbol features (alpha, relative strength)
 │   ├── factor_regression.py # Joint 4-factor model (beta, alpha)
 │   ├── macro.py            # FRED macro features
-│   └── target_generation.py # Triple barrier targets
+│   ├── target_generation.py # Triple barrier targets
+│   └── registry.py         # Feature registry for reproducibility
 ├── pipelines/orchestrator.py  # Main pipeline coordinator
 ├── data/loader.py          # Data loading + SPAC/ADR filtering
 ├── cli/                    # CLI commands (download.py, compute.py)
