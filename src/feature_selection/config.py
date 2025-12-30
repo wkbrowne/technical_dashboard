@@ -53,10 +53,10 @@ class ModelConfig:
     model_type: ModelType = ModelType.LIGHTGBM
     task_type: TaskType = TaskType.CLASSIFICATION
     params: Dict[str, Any] = field(default_factory=lambda: {
-        'learning_rate': 0.05,
+        'learning_rate': 0.03,
         'max_depth': 6,
-        'num_leaves': 31,
-        'min_child_samples': 20,
+        'num_leaves': 63,
+        'min_child_samples': 50,
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'reg_alpha': 0.1,

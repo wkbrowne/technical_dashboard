@@ -140,16 +140,15 @@ from .search import (
 
 # Base features configuration
 from .base_features import (
-    # Group-first data structures (NEW)
+    # Group-first data structures
     CORE_GROUPS,
     HEAD_GROUPS,
     CANDIDATE_GROUPS,
-    INTERACTION_GROUPS,
-    # Group-first retrieval functions (NEW)
+    INTERACTION_TEMPLATES,
+    # Group-first retrieval functions
     get_core_groups,
     get_head_groups,
     get_candidate_groups,
-    get_interaction_groups,
     get_all_groups,
     get_baseline_groups,
     get_group_names,
@@ -208,7 +207,7 @@ from .algorithms import (
     late_interaction_refinement,
 )
 
-# Group-first selection (NEW)
+# Group-first selection
 from .group_selection import (
     GroupResult,
     GroupSelectionResult,
@@ -216,7 +215,7 @@ from .group_selection import (
     grouped_forward_selection,
     grouped_swap_selection,
     grouped_backward_elimination,
-    interaction_group_selection,
+    template_interaction_selection,
     run_group_selection,
     select_groups_for_model,
     # Outer CV for robustness estimation
@@ -343,16 +342,15 @@ __all__ = [
     # Main class
     'FeatureSubsetSearch',
     'create_default_search',
-    # Group-first data structures (NEW)
+    # Group-first data structures
     'CORE_GROUPS',
     'HEAD_GROUPS',
     'CANDIDATE_GROUPS',
-    'INTERACTION_GROUPS',
-    # Group-first retrieval functions (NEW)
+    'INTERACTION_TEMPLATES',
+    # Group-first retrieval functions
     'get_core_groups',
     'get_head_groups',
     'get_candidate_groups',
-    'get_interaction_groups',
     'get_all_groups',
     'get_baseline_groups',
     'get_group_names',
@@ -399,14 +397,14 @@ __all__ = [
     'TopKTracker',
     'parallel_interaction_forward_selection',
     'late_interaction_refinement',
-    # Group-first selection (NEW)
+    # Group-first selection
     'GroupResult',
     'GroupSelectionResult',
     'GroupSelectionConfig',
     'grouped_forward_selection',
     'grouped_swap_selection',
     'grouped_backward_elimination',
-    'interaction_group_selection',
+    'template_interaction_selection',
     'run_group_selection',
     'select_groups_for_model',
     # Outer CV for robustness estimation

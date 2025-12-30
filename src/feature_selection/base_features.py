@@ -9,7 +9,7 @@ Architecture:
 - CORE_GROUPS: Dict[str, List[str]] - Shared backbone groups across all models
 - HEAD_GROUPS: Dict[ModelKey, Dict[str, List[str]]] - Model-specific additive groups
 - CANDIDATE_GROUPS: Dict[str, List[str]] - Groups available for selection
-- INTERACTION_GROUPS: Dict[str, List[str]] - Curated interaction feature groups
+- INTERACTION_TEMPLATES: Dict[str, Dict] - Template-based group-to-group interactions
 
 Group Design Rules:
 - Each group contains 3-12 features
@@ -175,6 +175,13 @@ CORE_GROUPS: Dict[str, List[str]] = {
         "range_efficiency",           # Range efficiency (directional)
         "pos_in_5d_range",            # Position in 5-day range
     ],
+
+    # --- DRAWDOWN RECOVERY (merged from LONG_NORMAL + LONG_PARABOLIC) ---
+    # --- DRAWDOWN DEPTH ---
+    "drawdown_depth": [
+        "drawdown_60d_z",             # Drawdown from 60d high, z-scored
+        "drawdown_120d_z",            # Drawdown from 120d high, z-scored
+    ],
 }
 
 
@@ -319,7 +326,7 @@ CANDIDATE_GROUPS: Dict[str, List[str]] = {
     ],
     # --- CROSS-SECTIONAL MOMENTUM (8 features) ---
     # --- CROSS-SECTIONAL MOMENTUM (RETURNS) ---
-    "xsec_momentum": [
+    "xsec_momentum_multi": [
         "xsec_mom_5d_z",
         "xsec_mom_60d_z",
         "w_xsec_mom_1w_z",
@@ -350,7 +357,7 @@ CANDIDATE_GROUPS: Dict[str, List[str]] = {
     "macro_labor_stress_extended": [
         "fred_icsa_z52w", "fred_ccsa_chg4w", "w_fred_ccsa_z52w",
     ],
-    "macro_financial_conditions": [
+    "macro_financial_conditions_broad": [
         "fred_nfci_z52w", "w_fred_nfci_chg4w", "fred_bamlh0a0hym2_pct252",
     ],
 
@@ -486,19 +493,9 @@ CANDIDATE_GROUPS: Dict[str, List[str]] = {
     # models to select during forward selection.
     # =========================================================================
 
-    # --- DRAWDOWN RECOVERY (merged from LONG_NORMAL + LONG_PARABOLIC) ---
-    # --- DRAWDOWN DEPTH ---
-    "drawdown_depth": [
-        "drawdown_60d_z",             # Drawdown from 60d high, z-scored
-        "drawdown_120d_z",            # Drawdown from 120d high, z-scored
-    ],
+    
 
-    # --- DRAWDOWN DYNAMICS ---
-    "drawdown_dynamics": [
-        "drawdown_expanding",         # Expanding drawdown from ATH
-        "drawdown_velocity_20d",      # Speed of drawdown (20d window)
-    ],
-
+    
     # --- TIME SINCE PEAK ---
     "drawdown_time_since_high": [
         "days_since_high_20d_norm",   # Days since 20d high, normalized
@@ -545,7 +542,7 @@ CANDIDATE_GROUPS: Dict[str, List[str]] = {
     ],
 
     # --- FINANCIAL CONDITIONS ---
-    "macro_financial_conditions": [
+    "head_macro_financial_conditions_nfci": [
         "w_fred_nfci_chg4w",    # NFCI momentum
         "fred_nfci_z52w",       # NFCI regime
     ],
@@ -586,7 +583,7 @@ CANDIDATE_GROUPS: Dict[str, List[str]] = {
     ],
 
     # --- CROSS-SECTIONAL MOMENTUM ---
-    "xsec_momentum": [
+    "xsec_momentum_4w": [
         "w_xsec_mom_4w_z",
     ],
 
@@ -731,20 +728,140 @@ CANDIDATE_GROUPS: Dict[str, List[str]] = {
         "vwap_dist_20d_zscore",       # VWAP distance z-score (20d)
         "trend_score_sign",           # Trend score sign
     ],
-}
+    # --- TREND: CURVATURE / ACCELERATION ---
+    "trend_curvature": [
+        "macd_hist_deriv_ema3",
+        "w_macd_hist_deriv_ema3",
+    ],
 
+    # --- TREND: GRANULAR COMPOSITE STATE ---
+    # Use if your current trend_score_sign/slope feel too coarse.
+    "trend_state_granular": [
+        "trend_score_granular",
+        "w_trend_score_granular",
+    ],
 
-# =============================================================================
-# INTERACTION_GROUPS - Curated interaction feature groups (legacy)
-# =============================================================================
-# These are pre-computed interaction features organized by hypothesis.
-# Each group represents a coherent interaction pattern.
-# NOTE: See INTERACTION_TEMPLATES for the new template-based system.
+    # --- TREND: SHORT-END SLOPE (adds a 10d “kick” you don’t have) ---
+    # You already have pct_slope_ma_20 and pct_slope_ma_100 in CORE.
+    "trend_slope_short_end": [
+        "pct_slope_ma_10",
+        "w_pct_slope_ma_10",
+    ],
 
-INTERACTION_GROUPS: Dict[str, List[str]] = {
-    # Gold/safe-haven × breadth (risk-on/off detection)
-    "gold_breadth_interactions": [
-        "gold_spy_ratio_zscore_x_w_rsp_spy_cumret_12",
+    # --- TREND: LONG-END SLOPE (adds true long trend anchor you don’t have) ---
+    # You have 100d slope; this adds 200d slope as a separate hypothesis.
+    "trend_slope_long_end": [
+        "pct_slope_ma_200",
+        "w_pct_slope_ma_200",
+    ],
+      # --- BREAKOUT STATE: UPSIDE/ DOWNSIDE PRESSURE (daily) ---
+    "breakout_state_daily": [
+        "breakout_up_10d",
+        "breakout_up_20d",
+        "breakout_dn_10d",
+        "breakout_dn_20d",
+    ],
+
+    # --- BREAKOUT STATE: UPSIDE/DOWNSIDE PRESSURE (weekly) ---
+    "breakout_state_weekly": [
+        "w_breakout_up_10d",
+        "w_breakout_up_20d",
+        "w_breakout_dn_10d",
+        "w_breakout_dn_20d",
+    ],
+
+    # --- RANGE EXPANSION (daily + weekly) ---
+    "range_expansion_regime": [
+        "range_expansion_10d",
+        "range_expansion_20d",
+        "w_range_expansion_10d",
+        "w_range_expansion_20d",
+    ],
+
+    # --- RANGE EXTREMENESS (z-scored range as “compression/expansion level”) ---
+    "range_extremeness": [
+        "range_z_10d",
+        "range_z_20d",
+        "w_range_z_10d",
+        "w_range_z_20d",
+    ],
+
+    # --- MULTI-HORIZON RANGE POSITIONING (adds 10d/20d positioning) ---
+    # NOTE: You already use pos_in_5d_range in CORE.
+    "range_position_multi": [
+        "pos_in_10d_range",
+        "w_pos_in_10d_range",
+        "w_pos_in_20d_range",
+    ],
+    # --- VOL: TREND / SLOPE OF REALIZED VOL ---
+    "vol_trend_slopes": [
+        "rv60_slope_norm",
+        "rv100_slope_norm",
+        "w_rv60_slope_norm",
+        "w_rv100_slope_norm",
+    ],
+
+    # --- VOL: CROSS-SECTIONAL / RELATIVE REGIME ---
+    # These are different from simple level z-scores: they encode “vol relative to peers”.
+    "vol_regime_relative": [
+        "vol_regime_cs_median",
+        "vol_regime_rel",
+    ],
+    # --- VOLUME FLOW: ACCUMULATION / DISTRIBUTION ---
+    "flow_obv_state": [
+        "obv_z_60",
+        "w_obv_z_60",
+    ],
+
+    # --- VOLUME SHOCK: DIRECTIONAL / NORMALIZED ---
+    # You have volshock_ema; this adds explicit “sign” and standardized magnitude.
+    "volshock_directional": [
+        "volshock_z",
+        "volshock_dir",
+        "w_volshock_z",
+        "w_volshock_dir",
+    ],
+
+    # --- LIQUIDITY CAPACITY: DOLLAR VOLUME ---
+    "dollar_volume_capacity": [
+        "rdollar_vol_20",
+        "w_rdollar_vol_20",
+    ],
+    # --- EFFICIENCY (weekly) ---
+    "range_efficiency_weekly": [
+        "w_range_efficiency",
+    ],
+    # --- VOL REGIME: TERM STRUCTURE / RELATIVE FEAR ---
+  "vol_term_structure": [
+      "vix_vxn_spread",
+    ],
+
+    # --- VOL REGIME: MOMENTUM / RATE OF CHANGE ---
+    "vol_momentum": [
+        "vix_change_5d",
+        "vix_change_20d",
+        "w_vix_change_4w",
+    ],
+
+    # --- VOL REGIME: LEVEL VS MA (different from z-score) ---
+    "vol_level_vs_trend": [
+        "vix_ma20_ratio",
+        "w_vix_ma4_ratio",
+    ],
+    # --- SECTOR ROTATION RATIOS (risk-on/off within equities) ---
+    "sector_rotation_ratios": [
+        "financials_utilities_ratio",
+        "w_financials_utilities_ratio",
+        "tech_spy_ratio",
+        "w_tech_spy_ratio",
+    ],
+
+    # --- COMMODITY / FX PRESSURE (macro impulse channel) ---
+    "macro_impulse_commodity_fx": [
+        "oil_momentum_20d",
+        "dollar_momentum_20d",
+        "w_dollar_momentum_20d",
+        "dollar_percentile_252d",
     ],
 }
 
@@ -772,9 +889,6 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # MOMENTUM × VOLATILITY STATE GATE
     # =========================================================================
-    # Hypothesis: Momentum signals are more reliable in specific volatility states.
-    # In low-vol, trends persist; in high-vol, mean reversion dominates.
-    # Parents updated from volatility_squeeze -> volatility_state
     "momentum_x_vol_gate": {
         "parents": ("momentum_quality", "volatility_state"),
         "type": "gate",
@@ -784,8 +898,8 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "chop_14",
         ],
         "gate_features": [
-            "squeeze_intensity_20",  # Gate: squeeze state affects momentum reliability
-            "rv_z_60",               # Gate: realized vol level
+            "squeeze_intensity_20",
+            "rv_z_60",
         ],
         "description": "Momentum indicators gated by volatility state",
     },
@@ -793,9 +907,6 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # TREND × VOLATILITY STATE GATE
     # =========================================================================
-    # Hypothesis: Trend strength indicators are more predictive when vol is stable.
-    # High vol = noisy trends; squeeze = potential breakout.
-    # Parents updated from volatility_squeeze -> volatility_state
     "trend_x_vol_gate": {
         "parents": ("trend_strength", "volatility_state"),
         "type": "signed_gate",
@@ -805,8 +916,8 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "w_macd_histogram",
         ],
         "gate_features": [
-            "rv_z_60",               # Gate: vol level affects trend reliability
-            "squeeze_intensity_20",  # Gate: squeeze state
+            "rv_z_60",
+            "squeeze_intensity_20",
         ],
         "description": "Trend strength gated by volatility state (signed)",
     },
@@ -814,8 +925,6 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # BREADTH × TREND CONFIRMATION
     # =========================================================================
-    # Hypothesis: Individual stock trends are more reliable when confirmed by
-    # broad market participation. Breadth confirms or diverges from stock trend.
     "breadth_x_trend_confirm": {
         "parents": ("sector_breadth", "trend_strength"),
         "type": "product",
@@ -828,34 +937,31 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "pct_slope_ma_20",
             "w_macd_histogram",
         ],
-        "description": "Breadth signals multiplied by trend confirmation",
+        "description": "Breadth multiplied by trend confirmation",
     },
 
     # =========================================================================
-    # DRAWDOWN × BREADTH MOTION
+    # DRAWDOWN DEPTH × BREADTH MOTION
     # =========================================================================
-    # Hypothesis: Drawdown/recovery signals are more meaningful when breadth
-    # is deteriorating or improving in the same direction.
-    "drawdown_x_breadth": {
-        "parents": ("drawdown_level", "breadth_motion"),
+    # Aligned to your documented drawdown splits + existing breadth group.
+    # If you later add a dedicated "breadth_motion" group, you can revert parents.
+    "drawdown_depth_x_breadth": {
+        "parents": ("drawdown_depth", "sector_breadth"),
         "type": "gate",
         "base_features": [
             "drawdown_expanding",
             "drawdown_60d_z",
-            "recovery_60d",
         ],
         "gate_features": [
             "sector_breadth_ad_chg_10d",
             "sector_breadth_mcclellan_chg_5d",
         ],
-        "description": "Drawdown/recovery gated by breadth momentum",
+        "description": "Drawdown depth gated by breadth momentum",
     },
 
     # =========================================================================
-    # ALPHA × MACRO REGIME
+    # ALPHA × MACRO REGIME (CREDIT/LABOR)
     # =========================================================================
-    # Hypothesis: Stock-specific alpha signals are more reliable in stable
-    # macro conditions. High VIX/credit stress = correlated selloffs.
     "alpha_x_macro_regime": {
         "parents": ("alpha_momentum", "macro_credit_labor"),
         "type": "signed_gate",
@@ -865,19 +971,17 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "xsec_mom_20d_z",
         ],
         "gate_features": [
-            "fred_bamlh0a0hym2_z60",  # HY spread (credit stress)
-            "w_fred_icsa_z52w",       # Claims (labor stress)
+            "fred_bamlh0a0hym2_z60",
+            "w_fred_icsa_z52w",
         ],
+        # Your compute code must honor this if you want inverted behavior.
+        "invert_gate": True,
         "description": "Alpha/relative signals gated by macro stress (inverted)",
-        "invert_gate": True,  # High stress = dampen alpha signals
     },
 
     # =========================================================================
     # PRICE POSITION × VOLATILITY REGIME (Mean Reversion Context)
     # =========================================================================
-    # Hypothesis: Mean reversion signals (distance to MA) work better in
-    # calm markets. In stress, oversold can stay oversold.
-    # Parents updated from market_regime -> volatility_regime
     "price_position_x_regime": {
         "parents": ("price_position", "volatility_regime"),
         "type": "gate",
@@ -890,37 +994,31 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "vix_zscore_60d",
             "vix_percentile_252d",
         ],
-        "description": "Price position/mean reversion gated by VIX regime",
-        "invert_gate": True,  # Low VIX = mean reversion works
+        "invert_gate": True,  # low VIX => mean reversion works better
+        "description": "Price position/mean reversion gated by VIX regime (inverted)",
     },
 
     # =========================================================================
-    # RANGE/BREAKOUT × VOLATILITY STATE
+    # RANGE/BREAKOUT × VOLATILITY STATE (Squeeze Release)
     # =========================================================================
-    # Hypothesis: Breakout signals are most powerful when emerging from
-    # a volatility squeeze (energy building then releasing).
-    # Parents updated from volatility_squeeze -> volatility_state
-    # Base features updated to match new range_breakout group
     "breakout_x_squeeze": {
         "parents": ("range_breakout", "volatility_state"),
         "type": "product",
         "base_features": [
-            "gap_fill_frac",      # Breakout confirmation
-            "range_efficiency",   # Directional efficiency
-            "pos_in_5d_range",    # Short-term position
+            "gap_fill_frac",
+            "range_efficiency",
+            "pos_in_5d_range",
         ],
         "gate_features": [
             "squeeze_release_20",
             "days_in_squeeze_20",
         ],
-        "description": "Range/breakout signals amplified by squeeze release",
+        "description": "Breakout/range signals amplified by squeeze release",
     },
 
     # =========================================================================
     # GAP DYNAMICS × VOLATILITY STATE
     # =========================================================================
-    # Hypothesis: Gap behavior (overnight returns) is more meaningful when
-    # combined with volatility state context.
     "gap_x_vol_state": {
         "parents": ("gap_dynamics", "volatility_state"),
         "type": "gate",
@@ -933,14 +1031,12 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "squeeze_release_20",
             "bb_width_20_2",
         ],
-        "description": "Gap signals gated by volatility squeeze state",
+        "description": "Gap signals gated by volatility state",
     },
 
     # =========================================================================
     # MICROSTRUCTURE × VOLUME SHOCK
     # =========================================================================
-    # Hypothesis: VWAP position combined with volume shocks indicates
-    # institutional activity with conviction.
     "microstructure_x_volume": {
         "parents": ("microstructure_position", "volume_shock"),
         "type": "product",
@@ -952,90 +1048,82 @@ INTERACTION_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "volshock_ema",
             "w_volshock_ema",
         ],
-        "description": "Microstructure position amplified by volume shock",
+        "description": "VWAP distance amplified by volume shock",
     },
 
     # =========================================================================
-    # VOLATILITY REGIME × MOMENTUM QUALITY
+    # MOMENTUM QUALITY × VOLATILITY REGIME (VIX)
     # =========================================================================
-    # Hypothesis: VIX regime gates momentum signal quality - different
-    # signals work in fear vs complacency regimes.
+    # Fixed direction: momentum signals gated by VIX regime.
     "vol_regime_x_momentum": {
-        "parents": ("volatility_regime", "momentum_quality"),
+        "parents": ("momentum_quality", "volatility_regime"),
         "type": "signed_gate",
         "base_features": [
-            "vix_percentile_252d",
-            "vix_zscore_60d",
-        ],
-        "gate_features": [
             "rsi_14",
             "adx_14",
         ],
-        "description": "VIX regime signals modulated by momentum quality",
+        "gate_features": [
+            "vix_percentile_252d",
+            "vix_zscore_60d",
+        ],
+        "description": "Momentum gated by VIX regime (signed)",
     },
 }
 
+# ============================================================================
+# Public API (backward-compatible with your current call sites)
+# ============================================================================
 
 def get_interaction_templates() -> Dict[str, Dict[str, Any]]:
-    """Return all interaction templates."""
+    """Return a shallow copy of all interaction templates."""
     return {k: dict(v) for k, v in INTERACTION_TEMPLATES.items()}
 
 
 def generate_interaction_feature_names(
     template_name: str,
-    template: Dict[str, Any]
+    template: Dict[str, Any],
 ) -> List[str]:
-    """Generate deterministic feature names from an interaction template.
-
-    Args:
-        template_name: Name of the template (e.g., "momentum_x_vol_gate")
-        template: Template definition dict
-
-    Returns:
-        List of generated interaction feature names
-    """
+    """Generate deterministic feature names from an interaction template."""
     interaction_type = template["type"]
-    base_features = template["base_features"]
-    gate_features = template["gate_features"]
+    base_features: List[str] = template.get("base_features", [])
+    gate_features: List[str] = template.get("gate_features", [])
 
-    feature_names = []
+    feature_names: List[str] = []
 
     if interaction_type in ("gate", "signed_gate"):
-        # Generate: ix__{template}__{base}__gated__{gate}
+        # ix__{template}__{base}__gated__{gate}
         for base_feat in base_features:
             for gate_feat in gate_features:
-                name = f"ix__{template_name}__{base_feat}__gated__{gate_feat}"
-                feature_names.append(name)
+                feature_names.append(
+                    f"ix__{template_name}__{base_feat}__gated__{gate_feat}"
+                )
+
     elif interaction_type == "product":
-        # Generate: ix__{template}__{feat_a}__x__{feat_b}
+        # ix__{template}__{base}__x__{gate}
         for base_feat in base_features:
             for gate_feat in gate_features:
-                name = f"ix__{template_name}__{base_feat}__x__{gate_feat}"
-                feature_names.append(name)
+                feature_names.append(
+                    f"ix__{template_name}__{base_feat}__x__{gate_feat}"
+                )
+    else:
+        raise ValueError(
+            f"Unknown interaction type '{interaction_type}' "
+            f"for template '{template_name}'."
+        )
 
     return feature_names
 
 
 def get_all_template_feature_names() -> Dict[str, List[str]]:
-    """Get all interaction feature names from all templates.
-
-    Returns:
-        Dict mapping template_name -> list of feature names
-    """
-    result = {}
-    for template_name, template in INTERACTION_TEMPLATES.items():
-        result[template_name] = generate_interaction_feature_names(
-            template_name, template
-        )
-    return result
+    """Get all interaction feature names from all templates."""
+    return {
+        template_name: generate_interaction_feature_names(template_name, template)
+        for template_name, template in INTERACTION_TEMPLATES.items()
+    }
 
 
 def get_template_parents() -> Dict[str, Tuple[str, str]]:
-    """Get parent group pairs for each template.
-
-    Returns:
-        Dict mapping template_name -> (parent_group_a, parent_group_b)
-    """
+    """Get parent group pairs for each template."""
     return {
         name: template["parents"]
         for name, template in INTERACTION_TEMPLATES.items()
@@ -1045,21 +1133,81 @@ def get_template_parents() -> Dict[str, Tuple[str, str]]:
 def get_eligible_templates(selected_groups: Set[str]) -> List[str]:
     """Get templates eligible for selection based on selected parent groups.
 
-    A template is eligible if BOTH parent groups are in the selected set.
-
-    Args:
-        selected_groups: Set of currently selected group names
-
-    Returns:
-        List of eligible template names
+    A template is eligible if BOTH parent groups are present in selected_groups.
+    Ordering follows INTERACTION_TEMPLATES definition order.
     """
-    eligible = []
+    eligible: List[str] = []
     for template_name, template in INTERACTION_TEMPLATES.items():
         parent_a, parent_b = template["parents"]
         if parent_a in selected_groups and parent_b in selected_groups:
             eligible.append(template_name)
     return eligible
 
+
+# ============================================================================
+# Optional utilities (non-breaking): validation + introspection
+# ============================================================================
+
+def validate_templates(
+    available_groups: Optional[Set[str]] = None,
+    available_features: Optional[Set[str]] = None,
+) -> Dict[str, List[str]]:
+    """Validate template definitions against known groups/features.
+
+    Returns:
+        Dict[template_name, list_of_problems]
+    """
+    problems: Dict[str, List[str]] = {}
+
+    for name, t in INTERACTION_TEMPLATES.items():
+        errs: List[str] = []
+
+        # Type
+        ttype = t.get("type")
+        if ttype not in ("gate", "signed_gate", "product"):
+            errs.append(f"Invalid type: {ttype!r}")
+
+        # Parents
+        parents = t.get("parents")
+        if not isinstance(parents, tuple) or len(parents) != 2:
+            errs.append(f"Invalid parents: {parents!r}")
+        else:
+            if available_groups is not None:
+                pa, pb = parents
+                if pa not in available_groups:
+                    errs.append(f"Unknown parent group: {pa!r}")
+                if pb not in available_groups:
+                    errs.append(f"Unknown parent group: {pb!r}")
+
+        # Features lists
+        base = t.get("base_features", [])
+        gate = t.get("gate_features", [])
+        if not isinstance(base, list) or not all(isinstance(x, str) for x in base):
+            errs.append("base_features must be a list[str]")
+        if not isinstance(gate, list) or not all(isinstance(x, str) for x in gate):
+            errs.append("gate_features must be a list[str]")
+        if len(base) == 0:
+            errs.append("base_features is empty")
+        if len(gate) == 0:
+            errs.append("gate_features is empty")
+
+        if available_features is not None:
+            missing_base = [f for f in base if f not in available_features]
+            missing_gate = [f for f in gate if f not in available_features]
+            if missing_base:
+                errs.append(f"Missing base features: {missing_base}")
+            if missing_gate:
+                errs.append(f"Missing gate features: {missing_gate}")
+
+        if errs:
+            problems[name] = errs
+
+    return problems
+
+
+def get_template_flag(template: Dict[str, Any], flag_name: str, default: Any = None) -> Any:
+    """Convenience accessor for optional template flags (e.g., invert_gate)."""
+    return template.get(flag_name, default)
 
 # =============================================================================
 # FEATURE CATEGORIES - For reference and validation
@@ -1239,63 +1387,96 @@ EXCLUDED_FEATURES = [
 
 RETIRED_FEATURES_BY_MODULE = {
     "trend": [
-        "macd_hist_deriv_ema3", "w_macd_hist_deriv_ema3",
+        # Keep curvature + granular score active (removed from retired):
+        # "macd_hist_deriv_ema3", "w_macd_hist_deriv_ema3",
+        # "trend_score_granular", "w_trend_score_granular",
+        # "pct_slope_ma_10", "w_pct_slope_ma_10",
+        # "pct_slope_ma_200", "w_pct_slope_ma_200",
+
+        # RSI variants are redundant given rsi_14 + other momentum/quality features
         "rsi_21", "rsi_30", "w_rsi_14", "w_rsi_21",
-        "trend_score_granular", "w_trend_score_granular",
-        "pct_slope_ma_10", "pct_slope_ma_30", "pct_slope_ma_50",
-        "pct_slope_ma_75", "pct_slope_ma_150", "pct_slope_ma_200",
-        "w_pct_slope_ma_10", "w_pct_slope_ma_20", "w_pct_slope_ma_30",
-        "w_pct_slope_ma_75", "w_pct_slope_ma_100", "w_pct_slope_ma_150",
-        "w_pct_slope_ma_200", "w_trend_score_slope",
+
+        # Mid-slope grid is mostly redundant once you have 20/100/200 + MA distance families
+        "pct_slope_ma_30", "pct_slope_ma_50", "pct_slope_ma_75", "pct_slope_ma_150",
+        "w_pct_slope_ma_20", "w_pct_slope_ma_30", "w_pct_slope_ma_75",
+        "w_pct_slope_ma_100", "w_pct_slope_ma_150",
+
+        # Often redundant / unstable if you already have trend_score_slope and sign proxies
+        "w_trend_score_slope",
     ],
+
     "range_breakout": [
-        "breakout_up_5d", "breakout_up_10d", "breakout_up_20d",
-        "breakout_dn_5d", "breakout_dn_10d", "breakout_dn_20d",
-        "w_breakout_up_5d", "w_breakout_up_10d", "w_breakout_up_20d",
-        "w_breakout_dn_5d", "w_breakout_dn_10d", "w_breakout_dn_20d",
-        "range_expansion_5d", "range_expansion_10d", "range_expansion_20d",
-        "w_range_expansion_5d", "w_range_expansion_10d", "w_range_expansion_20d",
-        "range_z_5d", "range_z_10d", "range_z_20d",
-        "w_range_z_5d", "w_range_z_10d", "w_range_z_20d",
-        "pos_in_5d_range", "pos_in_10d_range",
-        "w_pos_in_5d_range", "w_pos_in_10d_range", "w_pos_in_20d_range",
+        # You reintroduced most of the 10d/20d variants; keep the 5d grid retired as redundancy/noise.
+        "breakout_up_5d", "breakout_dn_5d",
+        "w_breakout_up_5d", "w_breakout_dn_5d",
+        "range_expansion_5d", "w_range_expansion_5d",
+        "range_z_5d", "w_range_z_5d",
+
+        # Already in CORE, so keep retired to avoid duplicate computation lists:
+        # (Core should be the source of truth for computed features.)
+        "pos_in_5d_range",
+        "w_pos_in_5d_range",
     ],
+
     "volatility": [
+        # You reintroduced relative regime + vol slopes; remove from retired:
+        # "vol_regime_cs_median", "vol_regime_rel",
+        # "rv60_slope_norm", "rv100_slope_norm",
+        # "w_rv60_slope_norm", "w_rv100_slope_norm",
+
+        # vol_regime base is redundant with vol_regime_ema10 + RV ratios
         "vol_regime",
+
+        # These are redundant with rv_z_60, vol_level_structure, vol_acceleration, vol_impulse, squeeze sets
         "vol_z_20", "vol_z_60", "rvol_20", "w_rvol_20",
-        "vol_regime_cs_median", "vol_regime_rel",
         "w_rv_z_60", "w_vol_z_60",
         "w_vol_regime", "w_vol_regime_ema10", "w_vol_regime_rel",
-        "rv60_slope_norm", "rv100_slope_norm",
-        "w_rv60_slope_norm", "w_rv100_slope_norm",
     ],
+
     "volume": [
-        "obv_z_60", "w_obv_z_60", "volshock_z", "volshock_dir",
-        "w_volshock_z", "w_volshock_dir", "rdollar_vol_20", "w_rdollar_vol_20",
+        # You reintroduced these; remove from retired:
+        # "obv_z_60", "w_obv_z_60",
+        # "volshock_z", "volshock_dir", "w_volshock_z", "w_volshock_dir",
+        # "rdollar_vol_20", "w_rdollar_vol_20",
     ],
+
     "liquidity": [
-        "vwap_dist_10d_zscore", "w_vwap_dist_20d_zscore",
-        "w_range_efficiency",
+        # w_range_efficiency was reintroduced; remove it from retired:
+        # "w_range_efficiency",
+
+        # vwap_dist_10d_zscore already exists in candidate groups; don't double-list as retired unless you truly want it excluded
+        # If you want to exclude it, keep it retired. Otherwise remove it.
+        "w_vwap_dist_20d_zscore",
     ],
+
     "alpha": [
+        # If you want to stay “hypothesis-light” here, keep beta surface retired.
+        # You already have w_beta_qqq in CORE; bringing the full beta surface back often adds redundancy.
         "beta_market", "beta_qqq", "beta_bestmatch", "beta_breadth",
         "beta_spy_simple", "beta_qqq_simple", "beta_sector",
         "w_beta_market", "w_beta_bestmatch", "w_beta_breadth",
         "w_beta_spy_simple", "w_beta_qqq_simple",
     ],
+
     "macro": [
-        "vix_ma20_ratio", "vix_vxn_spread",
-        "vix_change_5d", "vix_change_20d", "vix_regime",
+        # You reintroduced these; remove from retired:
+        # "vix_ma20_ratio", "vix_vxn_spread", "vix_change_5d", "vix_change_20d", "w_vix_ma4_ratio", "w_vix_change_4w",
+
+        # These remain redundant given your VIX percentile/z and the reintroduced momentum/term-structure set
+        "vix_regime",
         "w_vix_percentile_52w", "w_vix_zscore_12w", "w_vix_regime",
-        "w_vix_ma4_ratio", "w_vix_change_4w", "w_vxn_percentile_252d",
+        "w_vxn_percentile_252d",
     ],
+
     "spread_features": [
+        # Already represented in zscore forms or core:
         "copper_gold_ratio", "w_copper_gold_ratio",
         "gold_spy_ratio", "w_gold_spy_ratio",
         "cyclical_defensive_ratio",
-        "financials_utilities_ratio", "w_financials_utilities_ratio",
-        "tech_spy_ratio", "w_tech_spy_ratio", "oil_momentum_20d",
-        "dollar_momentum_20d", "w_dollar_momentum_20d", "dollar_percentile_252d",
+        # These were reintroduced; remove from retired:
+        # "financials_utilities_ratio", "w_financials_utilities_ratio",
+        # "tech_spy_ratio", "w_tech_spy_ratio",
+        # "oil_momentum_20d", "dollar_momentum_20d", "w_dollar_momentum_20d", "dollar_percentile_252d",
     ],
 }
 
@@ -1451,11 +1632,6 @@ def get_candidate_groups() -> Dict[str, List[str]]:
     return {k: list(v) for k, v in CANDIDATE_GROUPS.items()}
 
 
-def get_interaction_groups() -> Dict[str, List[str]]:
-    """Return all curated interaction groups."""
-    return {k: list(v) for k, v in INTERACTION_GROUPS.items()}
-
-
 def get_all_groups(model_key: ModelKey) -> Dict[str, List[str]]:
     """
     Return all groups for a model (CORE + HEAD + CANDIDATE).
@@ -1506,8 +1682,8 @@ def get_group_names(group_type: str = "all", model_key: Optional[ModelKey] = Non
         return list(HEAD_GROUPS.get(model_key, {}).keys())
     elif group_type == "candidate":
         return list(CANDIDATE_GROUPS.keys())
-    elif group_type == "interaction":
-        return list(INTERACTION_GROUPS.keys())
+    elif group_type == "template":
+        return list(INTERACTION_TEMPLATES.keys())
     elif group_type == "all":
         if model_key is None:
             raise ValueError("model_key required for all groups")
@@ -1565,20 +1741,12 @@ def validate_group_sizes(
         elif size > max_size:
             issues.append(f"CANDIDATE_GROUPS['{name}']: {size} features (max {max_size})")
 
-    # Check INTERACTION_GROUPS (allowed to be smaller)
-    for name, features in INTERACTION_GROUPS.items():
-        size = len(features)
-        if size < interaction_min_size:
-            issues.append(f"INTERACTION_GROUPS['{name}']: {size} features (min {interaction_min_size})")
-        elif size > max_size:
-            issues.append(f"INTERACTION_GROUPS['{name}']: {size} features (max {max_size})")
-
     return {
         "valid": len(issues) == 0,
         "issues": issues,
         "total_core_groups": len(CORE_GROUPS),
         "total_candidate_groups": len(CANDIDATE_GROUPS),
-        "total_interaction_groups": len(INTERACTION_GROUPS),
+        "total_interaction_templates": len(INTERACTION_TEMPLATES),
     }
 
 
@@ -1928,17 +2096,69 @@ META_COLUMNS = ['symbol', 'date']
 REQUIRED_FEATURES = ['atr_percent']
 
 
-def get_output_features(model_key: Optional[ModelKey] = None) -> Set[str]:
+def get_registry_features(model_keys: Optional[List[ModelKey]] = None) -> Set[str]:
+    """
+    Get features from feature registries.
+
+    This function reads the resolved_features from feature registry files
+    (artifacts/<model>/features.json) and returns the union of all features.
+
+    Args:
+        model_keys: List of models to include. If None, uses all 4 models.
+
+    Returns:
+        Set of feature names from all specified registries.
+        Returns empty set if no registries exist.
+    """
+    from src.features.registry import load_registry, registry_exists, get_registry_path
+
+    if model_keys is None:
+        model_keys = list(ModelKey.all_keys())
+
+    all_features: Set[str] = set()
+
+    for model_key in model_keys:
+        model_name = model_key.value if isinstance(model_key, ModelKey) else model_key
+        if registry_exists(model_name):
+            try:
+                registry = load_registry(get_registry_path(model_name))
+                features = registry.get("resolved_features", [])
+                all_features.update(features)
+            except Exception:
+                pass  # Silently skip invalid registries
+
+    return all_features
+
+
+def get_output_features(
+    model_key: Optional[ModelKey] = None,
+    use_registry: bool = False
+) -> Set[str]:
     """
     Get the curated list of features to include in pipeline output.
 
     Args:
         model_key: If provided, include CORE + HEAD for this model.
                    If None, include CORE + all heads (legacy behavior).
+        use_registry: If True, use feature registries as source of truth.
+                      Falls back to base_features.py if no registries exist.
 
     Returns:
         Set of feature names to include in output
     """
+    # Try registry first if requested
+    if use_registry:
+        registry_features = get_registry_features(
+            [model_key] if model_key else None
+        )
+        if registry_features:
+            # Add meta columns and required features
+            output_features = set(META_COLUMNS + REQUIRED_FEATURES)
+            output_features.update(registry_features)
+            return output_features
+        # Fall through to base_features.py if no registries
+
+    # Legacy behavior: use base_features.py definitions
     if model_key is not None:
         base = get_featureset(model_key)
     else:
@@ -1957,7 +2177,8 @@ def filter_output_columns(
     df,
     keep_all: bool = False,
     exclude_retired: bool = False,
-    model_key: Optional[ModelKey] = None
+    model_key: Optional[ModelKey] = None,
+    use_registry: bool = False
 ):
     """
     Filter DataFrame columns to only include curated output features.
@@ -1967,6 +2188,8 @@ def filter_output_columns(
         keep_all: If True, return all columns (no filtering for curated set)
         exclude_retired: If True, also exclude retired features
         model_key: If provided, filter to CORE + HEAD for this model
+        use_registry: If True, use feature registries as source of truth.
+                      This filters to only features needed by the ML models.
 
     Returns:
         DataFrame with filtered columns
@@ -1989,8 +2212,10 @@ def filter_output_columns(
             logger.info(f"Excluded {retired_removed} retired features from output")
 
     if not keep_all:
-        output_features = get_output_features(model_key)
+        output_features = get_output_features(model_key, use_registry=use_registry)
         cols_to_keep &= output_features
+        if use_registry:
+            logger.info(f"Filtering to {len(output_features)} registry features")
 
     keep_cols = [c for c in df.columns if c in cols_to_keep]
 
