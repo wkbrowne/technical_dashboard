@@ -25,6 +25,9 @@ Support:
 - hurst: Hurst exponent features
 - postprocessing: NaN interpolation, lags, outlier handling
 - target_generation: Triple barrier target labels
+
+Registry:
+- registry: Feature registry for ML pipeline reproducibility
 """
 
 from .single_stock import compute_single_stock_features, compute_single_stock_features_safe
@@ -36,6 +39,19 @@ from .timeframe import (
     TimeframeResampler,
     partition_by_symbol,
     combine_to_long,
+)
+
+from .registry import (
+    build_registry_from_selection,
+    resolve_features,
+    compute_feature_signature,
+    load_registry,
+    save_registry,
+    get_registry_summary,
+    validate_registry,
+    get_registry_path,
+    registry_exists,
+    compare_registries,
 )
 
 __all__ = [
@@ -55,4 +71,15 @@ __all__ = [
     'TimeframeResampler',
     'partition_by_symbol',
     'combine_to_long',
+    # Registry
+    'build_registry_from_selection',
+    'resolve_features',
+    'compute_feature_signature',
+    'load_registry',
+    'save_registry',
+    'get_registry_summary',
+    'validate_registry',
+    'get_registry_path',
+    'registry_exists',
+    'compare_registries',
 ]
