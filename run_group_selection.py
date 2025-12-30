@@ -40,8 +40,12 @@ from src.feature_selection import (
     GroupSelectionConfig,
     run_group_selection,
     select_groups_for_model,
+    # Outer CV for robustness
+    OuterCVResult,
+    StabilityAggregationResult,
+    run_outer_cv_with_finalization,
     # Group data structures
-    CORE_GROUPS, HEAD_GROUPS, CANDIDATE_GROUPS, INTERACTION_GROUPS,
+    CORE_GROUPS, HEAD_GROUPS, CANDIDATE_GROUPS, INTERACTION_TEMPLATES,
     get_baseline_groups, get_all_groups,
     validate_group_sizes,
     # Configuration
@@ -53,6 +57,92 @@ from src.feature_selection import (
     validate_data,
     filter_features_by_nan_rate,
 )
+from src.features.registry import (
+    build_registry_from_selection,
+    save_registry,
+    get_registry_summary,
+)
+from src.feature_selection.base_features import generate_interaction_feature_names
+
+
+def validate_feature_availability(X: pd.DataFrame, model_key: ModelKey) -> bool:
+    """Validate that all declared features exist in the data.
+
+    Prints a BIG FAT WARNING if any features are missing.
+
+    Args:
+        X: Feature DataFrame
+        model_key: Model key for HEAD_GROUPS lookup
+
+    Returns:
+        True if all features present, False if any missing
+    """
+    available = set(X.columns)
+    missing_by_source = {}
+
+    # Check CORE_GROUPS
+    for group_name, features in CORE_GROUPS.items():
+        missing = [f for f in features if f not in available]
+        if missing:
+            missing_by_source[f"CORE_GROUPS['{group_name}']"] = missing
+
+    # Check HEAD_GROUPS for this model
+    head_groups = HEAD_GROUPS.get(model_key, {})
+    for group_name, features in head_groups.items():
+        missing = [f for f in features if f not in available]
+        if missing:
+            missing_by_source[f"HEAD_GROUPS[{model_key.value}]['{group_name}']"] = missing
+
+    # Check CANDIDATE_GROUPS
+    for group_name, features in CANDIDATE_GROUPS.items():
+        missing = [f for f in features if f not in available]
+        if missing:
+            missing_by_source[f"CANDIDATE_GROUPS['{group_name}']"] = missing
+
+    # Check INTERACTION_TEMPLATES (base/gate features, not generated names)
+    for template_name, template in INTERACTION_TEMPLATES.items():
+        base_feats = template.get("base_features", [])
+        gate_feats = template.get("gate_features", [])
+        missing_base = [f for f in base_feats if f not in available]
+        missing_gate = [f for f in gate_feats if f not in available]
+        if missing_base:
+            missing_by_source[f"INTERACTION_TEMPLATES['{template_name}'].base_features"] = missing_base
+        if missing_gate:
+            missing_by_source[f"INTERACTION_TEMPLATES['{template_name}'].gate_features"] = missing_gate
+
+    if missing_by_source:
+        # Count totals
+        total_missing = sum(len(v) for v in missing_by_source.values())
+        unique_missing = set()
+        for feats in missing_by_source.values():
+            unique_missing.update(feats)
+
+        print()
+        print("!" * 80)
+        print("!" * 80)
+        print("!!  FEATURE AVAILABILITY WARNING")
+        print("!" * 80)
+        print(f"!!  {len(unique_missing)} UNIQUE FEATURES MISSING FROM DATA")
+        print(f"!!  {len(missing_by_source)} groups/templates affected")
+        print("!" * 80)
+        print()
+
+        for source, missing in sorted(missing_by_source.items()):
+            print(f"  {source}:")
+            for feat in missing[:10]:
+                print(f"    - {feat}")
+            if len(missing) > 10:
+                print(f"    ... and {len(missing) - 10} more")
+            print()
+
+        print("!" * 80)
+        print("!!  FIX: Update base_features.py or regenerate features_complete.parquet")
+        print("!" * 80)
+        print()
+
+        return False
+
+    return True
 
 
 def compute_scale_pos_weight(y: pd.Series) -> float:
@@ -65,7 +155,6 @@ def compute_scale_pos_weight(y: pd.Series) -> float:
 def split_by_date_holdout(
     X: pd.DataFrame,
     y: pd.Series,
-    sample_weight: pd.Series | None,
     holdout_pct: float = 0.05,
 ) -> tuple:
     """Split data temporally, reserving final holdout_pct of dates for evaluation.
@@ -73,11 +162,10 @@ def split_by_date_holdout(
     Args:
         X: Feature matrix with date index
         y: Target series
-        sample_weight: Optional sample weights
         holdout_pct: Fraction of dates to reserve (0.05 = 5%)
 
     Returns:
-        Tuple of (X_train, y_train, sw_train, X_holdout, y_holdout, sw_holdout, holdout_dates)
+        Tuple of (X_train, y_train, X_holdout, y_holdout, holdout_dates)
     """
     # Get unique dates sorted
     unique_dates = sorted(X.index.unique())
@@ -101,10 +189,7 @@ def split_by_date_holdout(
     X_holdout = X[holdout_mask].copy()
     y_holdout = y[holdout_mask].copy()
 
-    sw_train = sample_weight[train_mask].copy() if sample_weight is not None else None
-    sw_holdout = sample_weight[holdout_mask].copy() if sample_weight is not None else None
-
-    return X_train, y_train, sw_train, X_holdout, y_holdout, sw_holdout, holdout_dates
+    return X_train, y_train, X_holdout, y_holdout, holdout_dates
 
 
 def evaluate_on_holdout(
@@ -236,19 +321,16 @@ def load_and_prepare_data(
     model_key: ModelKey,
     max_symbols: int = 5000,
     min_samples_per_symbol: int = 100,
-    use_weights: bool = False,
-) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+) -> tuple[pd.DataFrame, pd.Series]:
     """Load and prepare data for group selection.
 
     Args:
         model_key: The model key to load target for (determines which hit_* column to use)
         max_symbols: Maximum number of symbols to include
         min_samples_per_symbol: Minimum samples per symbol (unused currently)
-        use_weights: If True, load sample weights from overlap inverse weighting.
-                     If False (default), sample_weight will be None.
 
     Returns:
-        Tuple of (X, y, sample_weight)
+        Tuple of (X, y)
     """
     print("Loading data...")
 
@@ -310,35 +392,22 @@ def load_and_prepare_data(
     else:
         y = (merged[target_col] == 1).astype(int)
 
-    # Sample weights (only load if use_weights=True)
-    sample_weight = None
-    if use_weights and 'weight_final' in merged.columns:
-        sample_weight = merged['weight_final'].copy()
-        print(f"  Sample weights: ENABLED (overlap inverse weighting)")
-    elif use_weights:
-        print(f"  Sample weights: weight_final column not found, using uniform weights")
-    else:
-        print(f"  Sample weights: DISABLED (uniform weights)")
-
     # Set date as index
     X.index = merged['date']
     y.index = merged['date']
-    if sample_weight is not None:
-        sample_weight.index = merged['date']
 
     print(f"\nData prepared for {model_key.value}:")
     print(f"  X shape: {X.shape}")
     print(f"  y distribution: {y.value_counts().to_dict()}")
     print(f"  Date range: {X.index.min()} to {X.index.max()}")
 
-    return X, y, sample_weight
+    return X, y
 
 
 def run_selection_for_model(
     X: pd.DataFrame,
     y: pd.Series,
     model_key: ModelKey,
-    sample_weight: pd.Series = None,
     scale_pos_weight: float = None,
     n_folds: int = 5,
     epsilon_add: float = 0.002,
@@ -368,7 +437,7 @@ def run_selection_for_model(
     print(f"\nGroup Configuration:")
     print(f"  Baseline groups: {len(baseline_groups)}")
     print(f"  Candidate groups: {len(candidate_groups)}")
-    print(f"  Interaction groups: {len(INTERACTION_GROUPS)}")
+    print(f"  Interaction templates: {len(INTERACTION_TEMPLATES)}")
 
     # Configure model
     lgbm_params = {
@@ -461,24 +530,232 @@ def run_selection_for_model(
     return result
 
 
-def save_results(results: dict, output_dir: Path):
-    """Save selection results to disk."""
+def run_outer_cv_for_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    model_key: ModelKey,
+    scale_pos_weight: float = None,
+    n_folds: int = 5,
+    n_outer_folds: int = 3,
+    outer_test_frac: float = 0.10,
+    holdout_frac: float = 0.05,
+    # Selection params: None = use GroupSelectionConfig defaults
+    epsilon_add: float = None,
+    epsilon_swap: float = None,
+    allow_baseline_demotions: bool = False,
+    max_groups: int = None,
+    max_interactions: int = None,
+    n_jobs: int = 4,
+    model_threads: int = 1,
+    verbose: bool = True,
+    inner_verbose: bool = False,
+    debug_acceptance: bool = False,
+    enable_k_of_n: bool = False,
+    group_k_default: int = None,
+    epsilon_add_feature: float = None,
+):
+    """Run outer CV selection with stability-based aggregation.
+
+    This runs feature selection N times (default 3), each on a different
+    temporal split, then keeps groups selected in >= 2/3 of the folds.
+
+    Returns:
+        Tuple of (GroupSelectionResult-like object, OuterCVResult, StabilityAggregationResult)
+    """
+    from src.feature_selection.group_selection import GroupSelectionResult
+    import math
+
+    print(f"\n{'='*70}")
+    print(f"OUTER CV SELECTION FOR: {model_key.value}")
+    print(f"{'='*70}")
+
+    # Show baseline info
+    baseline_groups = get_baseline_groups(model_key)
+    print(f"\nGroup Configuration:")
+    print(f"  Baseline groups: {len(baseline_groups)}")
+    print(f"  Candidate groups: {len(CANDIDATE_GROUPS)}")
+    print(f"  Outer CV folds: {n_outer_folds}")
+    print(f"  Stability threshold: >= {math.ceil(n_outer_folds * 2 / 3)}/{n_outer_folds} folds")
+
+    # Configure model
+    lgbm_params = {
+        'learning_rate': 0.03,
+        'max_depth': 5,
+        'num_leaves': 31,
+        'min_data_in_leaf': 100,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 1,
+        'verbose': -1,
+    }
+    if scale_pos_weight is not None:
+        lgbm_params['scale_pos_weight'] = scale_pos_weight
+
+    model_config = ModelConfig(
+        model_type=ModelType.LIGHTGBM,
+        task_type=TaskType.CLASSIFICATION,
+        params=lgbm_params,
+        num_threads=model_threads,
+    )
+
+    cv_config = CVConfig(
+        n_splits=n_folds,
+        scheme=CVScheme.EXPANDING,
+        gap=20,
+        purge_window=2,
+    )
+
+    metric_config = MetricConfig(
+        primary_metric=MetricType.AUC,
+        secondary_metrics=[MetricType.AUPR, MetricType.BRIER, MetricType.LOG_LOSS],
+        tail_quantile=0.1,
+    )
+
+    search_config = SearchConfig(
+        n_jobs=n_jobs,
+        random_state=42,
+    )
+
+    # Build config kwargs, only including non-None values so config defaults apply
+    config_kwargs = {
+        'allow_baseline_demotions': allow_baseline_demotions,
+        'max_search_iterations': 100,
+        'enable_add_drop_moves': True,
+        'enable_caching': True,
+        'n_jobs': n_jobs,
+        'verbose': inner_verbose,  # Controlled by --verbose flag
+        'debug_acceptance': debug_acceptance,  # Controlled by --debug-acceptance flag
+        'enable_k_of_n': enable_k_of_n,
+    }
+    # Only set these if explicitly provided (otherwise use GroupSelectionConfig defaults)
+    if epsilon_add is not None:
+        config_kwargs['epsilon_add'] = epsilon_add
+    if epsilon_swap is not None:
+        config_kwargs['epsilon_swap'] = epsilon_swap
+        config_kwargs['epsilon_remove'] = epsilon_swap  # Use same as swap
+    if max_groups is not None:
+        config_kwargs['max_groups'] = max_groups
+    if max_interactions is not None:
+        config_kwargs['max_interaction_groups'] = max_interactions
+    if group_k_default is not None:
+        config_kwargs['group_k_default'] = group_k_default
+    if epsilon_add_feature is not None:
+        config_kwargs['epsilon_add_feature'] = epsilon_add_feature
+
+    group_config = GroupSelectionConfig(**config_kwargs)
+
+    # Print effective config values
+    print(f"\nSelection Config (from GroupSelectionConfig defaults + CLI overrides):")
+    print(f"  epsilon_add: {group_config.epsilon_add:.4f}")
+    print(f"  epsilon_swap: {group_config.epsilon_swap:.4f}")
+    print(f"  max_groups: {group_config.max_groups}")
+    print(f"  max_interaction_groups: {group_config.max_interaction_groups}")
+    print(f"  K-of-N: {'enabled' if group_config.enable_k_of_n else 'disabled'}"
+          f"{f' (K={group_config.group_k_default})' if group_config.enable_k_of_n else ''}")
+
+    start_time = time.time()
+
+    # Run outer CV with finalization
+    outer_cv_result, agg_result = run_outer_cv_with_finalization(
+        X=X,
+        y=y,
+        model_key=model_key,
+        model_config=model_config,
+        cv_config=cv_config,
+        metric_config=metric_config,
+        search_config=search_config,
+        group_config=group_config,
+        n_outer_splits=n_outer_folds,
+        test_frac=outer_test_frac,
+        final_holdout_frac=holdout_frac,
+        allow_baseline_demotions=allow_baseline_demotions,
+        verbose=verbose,
+    )
+
+    total_time = time.time() - start_time
+
+    # Convert chosen_groups list to dict format {group_name: [features]}
+    all_groups = get_all_groups(model_key)
+    selected_groups_dict = {}
+    for group_name in agg_result.chosen_groups:
+        if group_name in all_groups:
+            # Get features that exist in the data
+            group_features = [f for f in all_groups[group_name] if f in X.columns]
+            selected_groups_dict[group_name] = group_features
+
+    # Get baseline AUC from first outer fold (as reference)
+    baseline_auc = outer_cv_result.outer_fold_results[0].baseline_auc if outer_cv_result.outer_fold_results else 0.5
+
+    # Create a compatible result object
+    result = GroupSelectionResult(
+        selected_groups=selected_groups_dict,
+        selected_features=agg_result.chosen_features,
+        final_metric=agg_result.holdout_auc,
+        baseline_metric=baseline_auc,
+        final_secondary_metrics={},  # Not tracked in outer CV mode
+        baseline_secondary_metrics={},
+        total_time_seconds=total_time,
+    )
+
+    # Add outer CV specific info to result for later use
+    result._outer_cv_result = outer_cv_result
+    result._stability_result = agg_result
+
+    return result, outer_cv_result, agg_result
+
+
+def save_results(results: dict, output_dir: Path, holdout_results: dict = None):
+    """Save selection results to disk, including feature registries."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for model_name, result in results.items():
-        # Save JSON summary
+        # Save JSON summary (legacy format for backwards compatibility)
         result_dict = result.to_dict()
         json_path = output_dir / f"group_selection_{model_name}.json"
         with open(json_path, 'w') as f:
             json.dump(result_dict, f, indent=2, default=str)
         print(f"Saved: {json_path}")
 
-        # Save feature list
+        # Save feature list (legacy format)
         features_path = output_dir / f"selected_features_{model_name}.txt"
         with open(features_path, 'w') as f:
             for feat in result.selected_features:
                 f.write(feat + '\n')
         print(f"Saved: {features_path}")
+
+        # Build and save feature registry
+        # Include selection metadata for traceability
+        selection_metadata = {
+            "final_metric": result.final_metric,
+            "baseline_metric": result.baseline_metric,
+            "improvement": result.final_metric - result.baseline_metric,
+            "n_groups": len(result.selected_groups),
+            "total_groups_evaluated": result.total_groups_evaluated,
+            "total_time_seconds": result.total_time_seconds,
+        }
+
+        # Add holdout metrics if available
+        if holdout_results and model_name in holdout_results:
+            selection_metadata["holdout_auc"] = holdout_results[model_name].get("holdout_auc")
+            selection_metadata["holdout_aupr"] = holdout_results[model_name].get("holdout_aupr")
+
+        registry = build_registry_from_selection(
+            model_name=model_name,
+            selected_groups=result.selected_groups,
+            groups=None,  # Don't include full groups to keep file compact
+            selection_metadata=selection_metadata,
+        )
+
+        # Save to model-specific directory
+        registry_dir = Path("artifacts") / model_name
+        registry_dir.mkdir(parents=True, exist_ok=True)
+        registry_path = registry_dir / "features.json"
+        save_registry(registry, registry_path)
+
+        # Print summary
+        summary = get_registry_summary(registry)
+        print(f"Registry: {summary}")
+        print(f"Saved: {registry_path}")
 
 
 def main():
@@ -491,37 +768,43 @@ def main():
     parser.add_argument('--model', type=str, default='long_normal',
                         help='Model key: long_normal, long_parabolic, short_normal, short_parabolic, or all')
 
-    # Selection parameters
-    parser.add_argument('--epsilon-add', type=float, default=0.002,
-                        help='Minimum improvement to add a group (default: 0.002)')
-    parser.add_argument('--epsilon-swap', type=float, default=0.001,
-                        help='Minimum improvement for swaps (default: 0.001)')
+    # Selection parameters (defaults from GroupSelectionConfig if not specified)
+    parser.add_argument('--epsilon-add', type=float, default=None,
+                        help='Minimum improvement to add a group (config default: 0.0003)')
+    parser.add_argument('--epsilon-swap', type=float, default=None,
+                        help='Minimum improvement for swaps (config default: 0.0003)')
     parser.add_argument('--allow-demotions', action='store_true',
                         help='Allow dropping baseline groups during backward elimination')
-    parser.add_argument('--max-groups', type=int, default=20,
-                        help='Maximum total groups to select (default: 20)')
-    parser.add_argument('--max-interactions', type=int, default=5,
-                        help='Maximum interaction groups to add (default: 5)')
+    parser.add_argument('--max-groups', type=int, default=None,
+                        help='Maximum total groups to select (config default: 20)')
+    parser.add_argument('--max-interactions', type=int, default=None,
+                        help='Maximum interaction groups to add (config default: 3)')
 
     # K-of-N feature selection within groups (enabled by default)
     parser.add_argument('--disable-k-of-n', action='store_true',
                         help='Disable K-of-N selection (use all features per group)')
-    parser.add_argument('--group-k', type=int, default=2,
-                        help='Default K for K-of-N selection (default: 2)')
-    parser.add_argument('--epsilon-add-feature', type=float, default=0.0005,
-                        help='Min improvement to add feature within group (default: 0.0005)')
+    parser.add_argument('--group-k', type=int, default=None,
+                        help='Default K for K-of-N selection (config default: 2)')
+    parser.add_argument('--epsilon-add-feature', type=float, default=None,
+                        help='Min improvement to add feature within group (config default: 0.0005)')
 
     # Data options
     parser.add_argument('--max-symbols', type=int, default=5000,
                         help='Maximum number of symbols')
     parser.add_argument('--balanced', action='store_true',
                         help='Use class weights (scale_pos_weight)')
-    parser.add_argument('--use-weights', action='store_true',
-                        help='Use sample weights from overlap inverse weighting (default: disabled)')
     parser.add_argument('--n-folds', type=int, default=5,
-                        help='Number of CV folds')
+                        help='Number of CV folds (inner CV)')
     parser.add_argument('--holdout-pct', type=float, default=0.05,
                         help='Fraction of dates to hold out for unbiased evaluation (default: 0.05 = 5%%)')
+
+    # Outer CV for stability (enabled by default)
+    parser.add_argument('--disable-outer-cv', action='store_true',
+                        help='Disable outer CV stability selection (use single-run selection instead)')
+    parser.add_argument('--n-outer-folds', type=int, default=3,
+                        help='Number of outer CV folds (default: 3)')
+    parser.add_argument('--outer-test-frac', type=float, default=0.10,
+                        help='Fraction of data per outer test fold (default: 0.10)')
 
     # Parallelism
     parser.add_argument('--n-jobs', type=int, default=4,
@@ -534,6 +817,10 @@ def main():
                         help='Output directory for results')
     parser.add_argument('--quiet', action='store_true',
                         help='Reduce output verbosity')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Enable detailed progress logging (shows each group evaluation and accept/reject reasons)')
+    parser.add_argument('--debug-acceptance', action='store_true',
+                        help='Show detailed SNR acceptance diagnostics for each move')
 
     args = parser.parse_args()
 
@@ -550,11 +837,18 @@ def main():
     total_threads = args.n_jobs * args.model_threads
     print(f"\nParallelism: {args.n_jobs} jobs × {args.model_threads} threads/model = {total_threads} total threads")
 
-    # Print holdout config
-    if args.holdout_pct > 0:
-        print(f"Holdout: {args.holdout_pct:.1%} of dates reserved for unbiased evaluation")
+    # Print outer CV config
+    if not args.disable_outer_cv:
+        print(f"\nOuter CV: ENABLED ({args.n_outer_folds} folds, {args.outer_test_frac:.0%} test per fold)")
+        print(f"  - Groups selected in >= {(args.n_outer_folds * 2 + 2) // 3}/{args.n_outer_folds} folds kept (2/3 consensus)")
+        print(f"  - Final holdout: {args.holdout_pct:.1%} of dates for unbiased evaluation")
     else:
-        print("Holdout: DISABLED (CV metrics may be optimistically biased)")
+        print(f"\nOuter CV: DISABLED (single-run selection)")
+        # Print holdout config for non-outer-cv mode
+        if args.holdout_pct > 0:
+            print(f"Holdout: {args.holdout_pct:.1%} of dates reserved for unbiased evaluation")
+        else:
+            print("Holdout: DISABLED (CV metrics may be optimistically biased)")
 
     # Determine models to run
     if args.model.lower() == 'all':
@@ -575,78 +869,133 @@ def main():
     # Run selection for each model
     results = {}
     holdout_results = {}
+    outer_cv_results = {}  # Store outer CV results when enabled
 
     for model_key in model_keys:
         # Load data for this model (each model has different target column)
-        X_full, y_full, sample_weight_full = load_and_prepare_data(
+        X_full, y_full = load_and_prepare_data(
             model_key=model_key,
             max_symbols=args.max_symbols,
-            use_weights=args.use_weights,
         )
 
-        # Split into train/holdout if holdout enabled
-        X_holdout, y_holdout = None, None
-        if args.holdout_pct > 0:
-            X, y, sample_weight, X_holdout, y_holdout, sw_holdout, holdout_dates = split_by_date_holdout(
-                X_full, y_full, sample_weight_full, holdout_pct=args.holdout_pct
-            )
-            print(f"\n  Data split: {len(X)} train rows, {len(X_holdout)} holdout rows")
-            print(f"  Holdout dates: {holdout_dates[0]} to {holdout_dates[-1]} ({len(holdout_dates)} dates)")
+        # Validate all declared features exist in the data
+        print(f"\nValidating feature availability for {model_key.value}...")
+        features_valid = validate_feature_availability(X_full, model_key)
+        if features_valid:
+            print(f"  ✓ All declared features present in data")
         else:
-            X, y, sample_weight = X_full, y_full, sample_weight_full
+            # Ask user if they want to continue
+            print("WARNING: Continuing with missing features may cause errors or silent failures.")
+            if not args.quiet:
+                response = input("Continue anyway? [y/N]: ").strip().lower()
+                if response != 'y':
+                    print("Aborting. Fix feature definitions or regenerate data.")
+                    sys.exit(1)
 
         # Compute class weight if requested
         scale_pos_weight = None
         if args.balanced:
-            scale_pos_weight = compute_scale_pos_weight(y)
+            scale_pos_weight = compute_scale_pos_weight(y_full)
             print(f"Class balancing: scale_pos_weight = {scale_pos_weight:.3f}")
 
-        result = run_selection_for_model(
-            X=X,
-            y=y,
-            model_key=model_key,
-            sample_weight=sample_weight,
-            scale_pos_weight=scale_pos_weight,
-            n_folds=args.n_folds,
-            epsilon_add=args.epsilon_add,
-            epsilon_swap=args.epsilon_swap,
-            allow_baseline_demotions=args.allow_demotions,
-            max_groups=args.max_groups,
-            max_interactions=args.max_interactions,
-            n_jobs=args.n_jobs,
-            model_threads=args.model_threads,
-            verbose=not args.quiet,
-            enable_k_of_n=not args.disable_k_of_n,
-            group_k_default=args.group_k,
-            epsilon_add_feature=args.epsilon_add_feature,
-        )
-        results[model_key.value] = result
-
-        # Evaluate on holdout if enabled
-        if args.holdout_pct > 0 and X_holdout is not None:
-            print(f"\n  Evaluating on holdout set...")
-            holdout_eval = train_and_evaluate_holdout(
-                X_train=X,
-                y_train=y,
-                X_holdout=X_holdout,
-                y_holdout=y_holdout,
-                selected_features=result.selected_features,
-                model_threads=args.model_threads,
+        if not args.disable_outer_cv:
+            # OUTER CV MODE (default): Run 3-fold outer CV with stability aggregation
+            # Outer CV handles holdout internally
+            result, outer_cv_result, stability_result = run_outer_cv_for_model(
+                X=X_full,
+                y=y_full,
+                model_key=model_key,
                 scale_pos_weight=scale_pos_weight,
+                n_folds=args.n_folds,
+                n_outer_folds=args.n_outer_folds,
+                outer_test_frac=args.outer_test_frac,
+                holdout_frac=args.holdout_pct,
+                epsilon_add=args.epsilon_add,
+                epsilon_swap=args.epsilon_swap,
+                allow_baseline_demotions=args.allow_demotions,
+                max_groups=args.max_groups,
+                max_interactions=args.max_interactions,
+                n_jobs=args.n_jobs,
+                model_threads=args.model_threads,
+                verbose=not args.quiet,
+                inner_verbose=args.verbose,
+                debug_acceptance=args.debug_acceptance,
+                enable_k_of_n=not args.disable_k_of_n,
+                group_k_default=args.group_k,
+                epsilon_add_feature=args.epsilon_add_feature,
             )
-            holdout_results[model_key.value] = holdout_eval
-            print(f"  Holdout AUC: {holdout_eval['holdout_auc']:.4f} (vs CV: {result.final_metric:.4f})")
-            print(f"  Holdout samples: {holdout_eval['holdout_n_samples']}, positive rate: {holdout_eval['holdout_positive_rate']:.1%}")
+            results[model_key.value] = result
+            outer_cv_results[model_key.value] = {
+                'outer_cv': outer_cv_result.to_dict(),
+                'stability': stability_result.to_dict(),
+            }
+
+            # Holdout is already evaluated internally by outer CV
+            holdout_results[model_key.value] = {
+                'holdout_auc': stability_result.holdout_auc,
+                'chosen_set': stability_result.chosen_set_name,
+                'decision_reason': stability_result.decision_reason,
+                'group_frequency': stability_result.group_frequency,
+            }
+
+        else:
+            # SINGLE-RUN MODE: Original behavior with manual holdout
+            X_holdout, y_holdout = None, None
+            if args.holdout_pct > 0:
+                X, y, X_holdout, y_holdout, holdout_dates = split_by_date_holdout(
+                    X_full, y_full, holdout_pct=args.holdout_pct
+                )
+                print(f"\n  Data split: {len(X)} train rows, {len(X_holdout)} holdout rows")
+                print(f"  Holdout dates: {holdout_dates[0]} to {holdout_dates[-1]} ({len(holdout_dates)} dates)")
+            else:
+                X, y = X_full, y_full
+
+            result = run_selection_for_model(
+                X=X,
+                y=y,
+                model_key=model_key,
+                scale_pos_weight=scale_pos_weight,
+                n_folds=args.n_folds,
+                epsilon_add=args.epsilon_add,
+                epsilon_swap=args.epsilon_swap,
+                allow_baseline_demotions=args.allow_demotions,
+                max_groups=args.max_groups,
+                max_interactions=args.max_interactions,
+                n_jobs=args.n_jobs,
+                model_threads=args.model_threads,
+                verbose=not args.quiet,
+                enable_k_of_n=not args.disable_k_of_n,
+                group_k_default=args.group_k,
+                epsilon_add_feature=args.epsilon_add_feature,
+            )
+            results[model_key.value] = result
+
+            # Evaluate on holdout if enabled
+            if args.holdout_pct > 0 and X_holdout is not None:
+                print(f"\n  Evaluating on holdout set...")
+                holdout_eval = train_and_evaluate_holdout(
+                    X_train=X,
+                    y_train=y,
+                    X_holdout=X_holdout,
+                    y_holdout=y_holdout,
+                    selected_features=result.selected_features,
+                    model_threads=args.model_threads,
+                    scale_pos_weight=scale_pos_weight,
+                )
+                holdout_results[model_key.value] = holdout_eval
+                print(f"  Holdout AUC: {holdout_eval['holdout_auc']:.4f} (vs CV: {result.final_metric:.4f})")
+                print(f"  Holdout samples: {holdout_eval['holdout_n_samples']}, positive rate: {holdout_eval['holdout_positive_rate']:.1%}")
+
+            if X_holdout is not None:
+                del X_holdout, y_holdout
 
         # Free memory between models
-        del X, y, sample_weight, X_full, y_full, sample_weight_full
-        if X_holdout is not None:
-            del X_holdout, y_holdout
+        del X_full, y_full
         gc.collect()
 
-    # Save results
+    # Save results (including feature registries)
     output_dir = Path(args.output_dir)
-    save_results(results, output_dir)
+    save_results(results, output_dir, holdout_results=holdout_results)
 
     # Save holdout results if available
     if holdout_results:
@@ -654,6 +1003,13 @@ def main():
         with open(holdout_path, 'w') as f:
             json.dump(holdout_results, f, indent=2, default=str)
         print(f"Saved holdout results: {holdout_path}")
+
+    # Save outer CV results if available
+    if outer_cv_results:
+        outer_cv_path = output_dir / "outer_cv_results.json"
+        with open(outer_cv_path, 'w') as f:
+            json.dump(outer_cv_results, f, indent=2, default=str)
+        print(f"Saved outer CV results: {outer_cv_path}")
 
     # Print summary
     print(f"\n{'='*70}")
@@ -685,22 +1041,37 @@ def main():
     # Print holdout warning/interpretation
     if holdout_results:
         print(f"\n{'='*70}")
-        print("HOLDOUT INTERPRETATION")
+        if outer_cv_results:
+            print("OUTER CV STABILITY RESULTS")
+        else:
+            print("HOLDOUT INTERPRETATION")
         print(f"{'='*70}")
         for model_name, ho in holdout_results.items():
             cv_auc = results[model_name].final_metric
             holdout_auc = ho['holdout_auc']
             gap = cv_auc - holdout_auc
             print(f"\n{model_name}:")
-            print(f"  CV AUC:      {cv_auc:.4f}")
+
+            # Show outer CV specific info
+            if 'chosen_set' in ho:
+                print(f"  Selection: {ho['chosen_set']} set (2/3 consensus)")
+                print(f"  Reason: {ho['decision_reason']}")
+                print(f"  Group frequency across outer folds:")
+                for group, freq in sorted(ho['group_frequency'].items(), key=lambda x: -x[1]):
+                    print(f"    {group}: {freq}/{args.n_outer_folds} folds")
+                print()
+
             print(f"  Holdout AUC: {holdout_auc:.4f}")
-            print(f"  Gap:         {gap:+.4f}")
-            if gap > 0.10:
-                print(f"  WARNING: Large CV-holdout gap suggests significant selection bias")
-            elif gap > 0.05:
-                print(f"  NOTICE: Moderate CV-holdout gap - some selection bias present")
-            else:
-                print(f"  OK: Small gap - feature selection appears robust")
+            if not outer_cv_results:
+                # Only show CV-holdout gap for single-run mode
+                print(f"  CV AUC:      {cv_auc:.4f}")
+                print(f"  Gap:         {gap:+.4f}")
+                if gap > 0.10:
+                    print(f"  WARNING: Large CV-holdout gap suggests significant selection bias")
+                elif gap > 0.05:
+                    print(f"  NOTICE: Moderate CV-holdout gap - some selection bias present")
+                else:
+                    print(f"  OK: Small gap - feature selection appears robust")
 
     print(f"\nResults saved to: {output_dir}/")
 
