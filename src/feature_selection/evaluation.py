@@ -139,7 +139,17 @@ class SubsetEvaluator:
             )
 
         # Get column indices for efficient slicing
-        col_indices = [self._feature_to_idx[f] for f in feature_list if f in self._feature_to_idx]
+        # Filter feature_list and col_indices together to ensure alignment
+        valid_features = [f for f in feature_list if f in self._feature_to_idx]
+        col_indices = [self._feature_to_idx[f] for f in valid_features]
+
+        # Warn if features were filtered out (indicates data/evaluator mismatch)
+        n_missing = len(feature_list) - len(valid_features)
+        if n_missing > 0:
+            missing = [f for f in feature_list if f not in self._feature_to_idx]
+            print(f"[evaluator] WARNING: {n_missing} features not in evaluator: {missing[:5]}{'...' if n_missing > 5 else ''}")
+
+        feature_list = valid_features  # Use filtered list for model training
 
         if not col_indices:
             return SubsetResult(
