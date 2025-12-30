@@ -8,7 +8,8 @@ This script runs a complete backtest using the 4-model sizing system:
 Features:
 - Multi-model prediction loading
 - Configurable combining policy
-- Optional regime gating
+- Direction-aware regime gating
+- Decision log output for dashboard display
 - Detailed diagnostics (longs vs shorts, model contributions, gating effects)
 - Sizing diagnostics with warnings (data integrity, drift, concentration, etc.)
 
@@ -23,6 +24,12 @@ Usage:
         --prediction-path artifacts/predictions/ \\
         --sizing-config artifacts/sizing/best_config_multi_model.json \\
         --regime-gating on
+
+    # Export decision log for dashboard
+    python scripts/run_multi_model_backtest.py \\
+        --prediction-path artifacts/predictions/ \\
+        --sizing-config artifacts/sizing/best_config_multi_model.json \\
+        --decision-log artifacts/backtests/decision_log.parquet
 
     # With diagnostics
     python scripts/run_multi_model_backtest.py \\
@@ -44,6 +51,7 @@ Usage:
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -61,7 +69,9 @@ from src.sizing import (
     load_multi_model_predictions,
 )
 from src.sizing.predictions import merge_predictions_with_targets, get_prob_column
-from src.sizing.regime_gating import get_weekly_gating_diagnostics
+from src.sizing.regime_gating import get_gating_diagnostics
+from src.sizing.regime_data import load_regime_features as load_regime_features_util
+from src.sizing.multi_model import create_decision_log
 
 
 def parse_models(models_str: str) -> List[ModelType]:
@@ -101,22 +111,19 @@ def load_targets(path: str = "artifacts/targets_triple_barrier.parquet") -> pd.D
 def load_regime_features(
     features_path: str = "artifacts/features_complete.parquet",
 ) -> pd.DataFrame:
-    """Load regime-relevant features."""
-    df = pd.read_parquet(features_path)
-    df["date"] = pd.to_datetime(df["date"])
+    """Load regime-relevant features using the regime_data utility.
 
-    # Select regime-relevant columns
-    regime_cols = [
-        "date", "symbol",
-        "vix_percentile_252d", "d_vix_percentile_252d",
-        "vix_zscore_60d", "d_vix_zscore_60d",
-        "fred_bamlh0a0hym2_z60", "d_fred_bamlh0a0hym2_z60",
-        "sector_breadth_pct_above_ma200", "d_sector_breadth_pct_above_ma200",
-        "w_equity_bond_corr_60d",
-    ]
-
-    available = [c for c in regime_cols if c in df.columns]
-    return df[available].copy()
+    This function leverages the new regime_data module which:
+    - Automatically finds the correct column names for regime features
+    - Handles market-level vs stock-level regime data
+    - Groups by date for unique date-level features
+    """
+    try:
+        return load_regime_features_util(features_path)
+    except FileNotFoundError:
+        print(f"Warning: Features file not found at {features_path}")
+        print("Continuing without regime features...")
+        return pd.DataFrame()
 
 
 def compute_weekly_metrics(signals: pd.DataFrame) -> pd.DataFrame:
@@ -343,6 +350,12 @@ def main():
         default="multi_model",
         help="Name prefix for output files",
     )
+    parser.add_argument(
+        "--decision-log",
+        type=str,
+        default=None,
+        help="Path to save decision log parquet (contains justification for each signal)",
+    )
 
     # Diagnostics
     parser.add_argument(
@@ -523,6 +536,30 @@ def main():
     signals_path = output_dir / f"{args.name}_weighted_signals.parquet"
     weighted_signals.to_parquet(signals_path)
     print(f"Weighted signals saved to: {signals_path}")
+
+    # Generate decision log if requested
+    if args.decision_log:
+        print("\nGenerating decision log...")
+
+        # Recompute with justification if not already included
+        if "j_winning_model" not in weighted_signals.columns:
+            weighted_signals = engine.compute_weekly_weights(
+                signals,
+                regime_features=regime_features,
+                include_justification=True,
+            )
+
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        decision_log = create_decision_log(weighted_signals, run_id=run_id)
+
+        decision_log_path = Path(args.decision_log)
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        decision_log.to_parquet(decision_log_path, index=False)
+
+        print(f"  Decision log saved to: {decision_log_path}")
+        print(f"  Rows: {len(decision_log):,}")
+        j_cols = [c for c in decision_log.columns if c.startswith("j_")]
+        print(f"  Justification columns: {len(j_cols)} columns")
 
     # =========================================================================
     # DIAGNOSTICS

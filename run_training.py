@@ -56,15 +56,42 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.config.model_keys import ModelKey, TARGET_CONFIGS
 from src.feature_selection.base_features import get_featureset, CORE_FEATURES, HEAD_FEATURES
+from src.features.registry import load_registry, registry_exists, get_registry_path
 
 
-def load_model_features(model_key: ModelKey) -> List[str]:
+def load_model_features(
+    model_key: ModelKey,
+    use_registry: bool = False
+) -> Tuple[List[str], Optional[str]]:
     """
-    Load features for a specific model from the feature registry.
+    Load features for a specific model.
 
-    Uses the CORE + HEAD feature architecture from base_features.py.
+    Args:
+        model_key: The model to load features for
+        use_registry: If True, load from feature registry (artifacts/<model>/features.json).
+                      If False (default), use CORE + HEAD from base_features.py.
+
+    Returns:
+        Tuple of (feature_list, feature_signature)
+        - feature_signature is None if not using registry
     """
-    return get_featureset(model_key, include_expansion=False, flat=True)
+    if use_registry:
+        if registry_exists(model_key.value):
+            registry_path = get_registry_path(model_key.value)
+            registry = load_registry(registry_path)
+            features = registry["resolved_features"]
+            signature = registry.get("feature_signature")
+            print(f"  Loaded {len(features)} features from registry: {registry_path}")
+            print(f"  Feature signature: {signature[:30]}..." if signature else "  No signature")
+            return features, signature
+        else:
+            print(f"  WARNING: --use-registry specified but no registry found for {model_key.value}")
+            print(f"  Falling back to base_features.py (CORE + HEAD)")
+
+    # Default: use base_features.py
+    features = get_featureset(model_key, include_expansion=False, flat=True)
+    print(f"  Using {len(features)} features from base_features.py (CORE + HEAD)")
+    return features, None
 
 
 def load_selected_features_legacy() -> List[str]:
@@ -401,7 +428,8 @@ def save_model_artifacts(
     params: dict,
     output_dir: Path,
     train_metrics: dict,
-    model_key: Optional[ModelKey] = None
+    model_key: Optional[ModelKey] = None,
+    feature_signature: Optional[str] = None
 ):
     """Save model and associated artifacts.
 
@@ -412,6 +440,7 @@ def save_model_artifacts(
         output_dir: Output directory
         train_metrics: Training metrics
         model_key: Optional ModelKey for additional metadata
+        feature_signature: Optional signature from feature registry for traceability
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -443,6 +472,7 @@ def save_model_artifacts(
         'model_key': model_key.value if model_key else None,
         'n_features': len(feature_names),
         'features': feature_names,
+        'feature_signature': feature_signature,  # Registry signature for reproducibility
         'params': params,
         'n_estimators': model.n_estimators_,
         'train_auc': train_metrics['train_auc'],
@@ -518,6 +548,7 @@ def train_single_model(
     n_jobs: int = 8,
     use_sample_weights: bool = True,
     force_balanced: Optional[bool] = None,
+    use_registry: bool = False,
 ) -> dict:
     """
     Train a single model.
@@ -528,6 +559,7 @@ def train_single_model(
         n_jobs: Number of threads
         use_sample_weights: Whether to use sample weights
         force_balanced: True/False to force, None to use hyperopt setting
+        use_registry: If True, load features from registry instead of base_features.py
 
     Returns:
         Dict with training metrics
@@ -536,8 +568,7 @@ def train_single_model(
     print("-" * 50)
 
     # Load features for this model
-    selected_features = load_model_features(model_key)
-    print(f"  {len(selected_features)} features (CORE: {len(CORE_FEATURES)}, HEAD: {len(HEAD_FEATURES.get(model_key, []))})")
+    selected_features, feature_signature = load_model_features(model_key, use_registry=use_registry)
 
     # Load hyperparameters for this model
     params, hyperopt_balanced, hyperopt_scale_pos_weight = load_best_params(model_key)
@@ -580,6 +611,7 @@ def train_single_model(
         'balanced': scale_pos_weight is not None,
         'scale_pos_weight': scale_pos_weight,
         'sample_weights_used': sample_weight is not None,
+        'feature_signature': feature_signature,  # From registry if available
     }
 
     # Save to model-specific directory
@@ -590,7 +622,8 @@ def train_single_model(
         params=params,
         output_dir=output_dir,
         train_metrics=train_metrics,
-        model_key=model_key
+        model_key=model_key,
+        feature_signature=feature_signature
     )
 
     # Update training registry
@@ -604,9 +637,17 @@ def train_all_models(
     n_jobs: int = 8,
     use_sample_weights: bool = True,
     force_balanced: Optional[bool] = None,
+    use_registry: bool = False,
 ) -> Dict[str, dict]:
     """
     Train all 4 models.
+
+    Args:
+        base_output_dir: Base output directory
+        n_jobs: Number of threads
+        use_sample_weights: Whether to use sample weights
+        force_balanced: True/False to force, None to use hyperopt setting
+        use_registry: If True, load features from registry instead of base_features.py
 
     Returns:
         Dict mapping model_key to training metrics
@@ -614,6 +655,7 @@ def train_all_models(
     print("=" * 70)
     print("MULTI-MODEL PRODUCTION TRAINING")
     print(f"  Models: {', '.join(mk.value for mk in ModelKey.all_keys())}")
+    print(f"  Feature source: {'registry' if use_registry else 'base_features.py'}")
     print("=" * 70)
 
     results = {}
@@ -628,6 +670,7 @@ def train_all_models(
             n_jobs=n_jobs,
             use_sample_weights=use_sample_weights,
             force_balanced=force_balanced,
+            use_registry=use_registry,
         )
         results[model_key.value] = metrics
 
@@ -686,10 +729,13 @@ Examples:
                         help='Force disable balanced training')
     parser.add_argument('--no-sample-weights', action='store_true',
                         help='Disable sample weights from triple barrier overlap inverse')
+    parser.add_argument('--use-registry', action='store_true',
+                        help='Load features from registry (artifacts/<model>/features.json) instead of base_features.py')
 
     args = parser.parse_args()
     base_output_dir = Path(args.output_dir)
     use_sample_weights = not args.no_sample_weights
+    use_registry = args.use_registry
 
     # Determine balanced setting
     force_balanced = None
@@ -704,6 +750,7 @@ Examples:
             n_jobs=args.n_jobs,
             use_sample_weights=use_sample_weights,
             force_balanced=force_balanced,
+            use_registry=use_registry,
         )
     else:
         # Single model training
@@ -720,6 +767,7 @@ Examples:
             n_jobs=args.n_jobs,
             use_sample_weights=use_sample_weights,
             force_balanced=force_balanced,
+            use_registry=use_registry,
         )
 
         print()

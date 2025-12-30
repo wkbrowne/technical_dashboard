@@ -1022,6 +1022,7 @@ def run_pipeline_v2(
     exclude_retired: bool = False,
     target_config_path: Optional[str] = None,
     output_dir: Optional[Path] = None,
+    use_registry: bool = False,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Simplified pipeline using new config system.
@@ -1051,13 +1052,16 @@ def run_pipeline_v2(
             If None, uses hardcoded defaults from model_keys.py.
         output_dir: Optional output directory for saving provenance metadata.
             If provided, saves feature_provenance.json to this directory.
+        use_registry: If True, filter features_filtered.parquet to only include
+            features from the feature registries (artifacts/<model>/features.json).
+            Falls back to base_features.py if no registries exist.
 
     Returns:
         Tuple of (features_df, targets_df, features_complete_df, features_filtered_df) where:
         - features_df: Primary output (filtered if full_output=False, complete if True)
         - targets_df: Triple barrier targets (or None if include_targets=False)
         - features_complete_df: ALL computed features (or retired excluded if exclude_retired=True)
-        - features_filtered_df: Curated ML-ready features (BASE_FEATURES set)
+        - features_filtered_df: Curated ML-ready features (from registry or BASE_FEATURES)
     """
     import gc
     from datetime import datetime as dt
@@ -1336,16 +1340,17 @@ def run_pipeline_v2(
 
     # Step 6c: Create filtered version for ML training
     # ALWAYS create both: complete output (with/without retired) and filtered (curated set)
-    # Column selection for model-specific features happens at training time, not here
+    # If use_registry=True, filter to features from registry; otherwise use base_features.py
     cols_before = len(daily_df_complete.columns)
     daily_df_filtered = filter_output_columns(
-        daily_df_complete, keep_all=False, exclude_retired=False
+        daily_df_complete, keep_all=False, exclude_retired=False, use_registry=use_registry
     )
     cols_after = len(daily_df_filtered.columns)
     filtered_count = cols_before - cols_after
+    filter_source = "registry" if use_registry else "base_features.py"
     if filtered_count > 0:
-        print(f">>> [Output Filtering] Filtered {filtered_count} intermediate columns, keeping {cols_after}", flush=True)
-        logger.info(f"Filtered output to curated features: {cols_before} -> {cols_after} columns")
+        print(f">>> [Output Filtering] Filtered {filtered_count} intermediate columns, keeping {cols_after} ({filter_source})", flush=True)
+        logger.info(f"Filtered output to curated features ({filter_source}): {cols_before} -> {cols_after} columns")
 
     # Step 6d: Compute and validate feature provenance
     with profile_stage("Feature Provenance"):
@@ -1456,7 +1461,8 @@ def run_pipeline(
     weekly_lags: List[int] = None,
     weight_min_clip: float = 0.01,
     weight_max_clip: float = 10.0,
-    feature_config: Optional[FeatureConfig] = None
+    feature_config: Optional[FeatureConfig] = None,
+    use_registry: bool = False,
 ) -> None:
     """
     Run the complete feature computation pipeline and save outputs.
@@ -1490,6 +1496,8 @@ def run_pipeline(
         weight_min_clip: Minimum weight value for target generation (prevents zero weights)
         weight_max_clip: Maximum weight value for target generation (prevents extreme weights)
         feature_config: Optional FeatureConfig for feature selection (None for all features)
+        use_registry: If True, filter features_filtered.parquet to only include
+            features from the feature registries. Falls back to base_features.py if none exist.
     """
     # Set profiling state and clear any previous profiling data
     _set_profiling_enabled(enable_profiling)
@@ -1582,11 +1590,13 @@ def run_pipeline(
             final_features.to_parquet(complete_features_path, index=False)
             logger.info(f"Saved complete feature set ({len(final_features.columns)} cols) to {complete_features_path}")
 
-            # 2. Filtered file with curated ML-ready features (~250)
-            filtered_features = filter_output_columns(final_features, keep_all=False)
+            # 2. Filtered file with curated ML-ready features
+            # If use_registry=True, filter to features from registries; otherwise use base_features.py
+            filtered_features = filter_output_columns(final_features, keep_all=False, use_registry=use_registry)
             filtered_features_path = output_dir / "features_filtered.parquet"
             filtered_features.to_parquet(filtered_features_path, index=False)
-            logger.info(f"Saved filtered feature set ({len(filtered_features.columns)} cols) to {filtered_features_path}")
+            filter_source = "registry" if use_registry else "base_features.py"
+            logger.info(f"Saved filtered feature set ({len(filtered_features.columns)} cols, {filter_source}) to {filtered_features_path}")
 
             # Note: features_long.parquet removed - redundant with features_complete.parquet
         

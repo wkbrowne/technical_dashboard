@@ -95,13 +95,33 @@ from src.alpha.hpo.artifacts import (
 
 @dataclass
 class ObjectiveWeights:
-    """Weights for composite objective function."""
-    auc: float = 0.20
+    """
+    Weights for composite objective function.
+
+    The objective uses a "mean minus SE penalty" formulation:
+        objective = S_mean - lambda_stability * S_se
+
+    Where S_fold[i] is the per-fold composite score (weighted sum of metrics),
+    and S_se = std(S_fold) / sqrt(n_folds) is the standard error.
+
+    This aligns with the SNR-based gating used in feature selection:
+    - Feature selection: AUC-only with mean gate + SNR gate (SE-based)
+    - Hyperopt: composite score with SE penalty for stability
+
+    Component weights (should sum to ~1.0 for interpretability):
+    - auc, aupr: discrimination power
+    - calibration: probability calibration (inverted Brier)
+    - tail: precision in top decile (what we actually trade)
+    - spread: separation between top and bottom decile
+    """
+    auc: float = 0.25
     aupr: float = 0.15
     calibration: float = 0.15
-    tail: float = 0.20
-    spread: float = 0.10
-    stability: float = 0.20
+    tail: float = 0.25
+    spread: float = 0.20
+    # SE penalty coefficient: objective = S_mean - lambda_stability * S_se
+    # Higher values penalize variance more heavily
+    lambda_stability: float = 0.5
 
 
 @dataclass
@@ -348,77 +368,243 @@ def compute_fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     }
 
 
+def compute_fold_composite_score(metrics: dict, weights: ObjectiveWeights) -> float:
+    """
+    Compute composite score for a single fold.
+
+    This is the per-fold score S_fold[i] that gets aggregated across folds.
+    Does NOT include any stability term - stability is handled at the
+    aggregate level via SE penalty.
+
+    Args:
+        metrics: Dict with 'auc', 'aupr', 'brier', 'precision_top_10', 'precision_bottom_10'
+        weights: Objective component weights
+
+    Returns:
+        Per-fold composite score (higher is better)
+    """
+    # Calibration: Brier score in [0, 0.25] for binary classification
+    # Invert and clamp: perfect calibration (brier=0) -> 1.0, random (brier=0.25) -> 0.0
+    calib = 1.0 - np.clip(metrics['brier'] / 0.25, 0.0, 1.0)
+
+    # Spread: difference between top and bottom decile precision
+    spread = metrics['precision_top_10'] - metrics['precision_bottom_10']
+
+    # Weighted sum of components (no stability term here)
+    score = (
+        weights.auc * metrics['auc'] +
+        weights.aupr * metrics['aupr'] +
+        weights.calibration * calib +
+        weights.tail * metrics['precision_top_10'] +
+        weights.spread * spread
+    )
+
+    return score
+
+
+@dataclass
+class CompositeScoreResult:
+    """Result from compute_composite_score with diagnostic info."""
+    objective: float
+    s_mean: float
+    s_std: float
+    s_se: float
+    auc_mean: float
+    auc_std: float
+    auc_se: float
+    aupr_mean: float
+    brier_mean: float
+    prec_top_mean: float
+    prec_bot_mean: float
+    fold_scores: List[float]
+    pruned: bool = False
+    prune_reason: Optional[str] = None
+
+
 def compute_composite_score(
     fold_metrics: list[dict],
     weights: ObjectiveWeights,
     cv_score_method: str = "mean",
     fold_weights: Optional[List[float]] = None,
-) -> float:
+    baseline_auc_mean: Optional[float] = None,
+    auc_floor_delta: float = 0.002,
+) -> CompositeScoreResult:
     """
-    Compute weighted composite objective from fold metrics.
+    Compute composite objective using per-fold scores with SE-based stability penalty.
+
+    Philosophy:
+    -----------
+    This objective follows the "mean minus SE penalty" formulation that aligns with
+    the SNR-based gating in feature selection:
+
+        objective = S_mean - lambda_stability * S_se
+
+    Where:
+    - S_fold[i] = weighted sum of metrics for fold i (computed via compute_fold_composite_score)
+    - S_mean = mean(S_fold) or weighted mean if cv_score_method="weighted"
+    - S_se = std(S_fold, ddof=1) / sqrt(n_folds) is the standard error
+
+    Why per-fold composite first, then aggregate?
+    - Ensures stability penalty reflects true fold-to-fold variance in the
+      objective we care about, not just AUC variance
+    - Aligns with financial intuition: we want stable *overall* performance,
+      not just stable discrimination
+
+    Fold weighting:
+    - In "weighted" mode, later folds get higher weight (recency bias)
+    - SE penalty is SKIPPED in weighted mode because weighted variance estimation
+      requires careful handling of effective sample size. For weighted CV, we
+      assume the weighting itself provides regime-robustness.
+
+    AUC floor constraint:
+    - If baseline_auc_mean is provided, trials that sacrifice too much AUC
+      (auc_mean < baseline - delta) are marked for pruning
+    - This prevents the composite from trading off AUC for other metrics
 
     Args:
         fold_metrics: List of metric dicts from each fold
-        weights: Objective component weights
-        cv_score_method: "mean" or "weighted"
+        weights: Objective component weights (including lambda_stability)
+        cv_score_method: "mean" (with SE penalty) or "weighted" (no SE penalty)
         fold_weights: Weights per fold for weighted mode
+        baseline_auc_mean: Reference AUC for floor constraint (optional)
+        auc_floor_delta: Max allowable AUC drop from baseline (default: 0.002)
+
+    Returns:
+        CompositeScoreResult with objective value and diagnostics
     """
     n_folds = len(fold_metrics)
 
-    # Compute fold weights
-    if cv_score_method == "weighted" and fold_weights is None:
-        # Default weights favoring later folds: [0.5, 0.75, 1.0, 1.25, 1.5] for 5 folds
-        base = 0.5
-        step = 1.0 / (n_folds - 1) if n_folds > 1 else 0
-        fold_weights = [base + i * step for i in range(n_folds)]
+    # Compute per-fold composite scores
+    fold_scores = [compute_fold_composite_score(m, weights) for m in fold_metrics]
 
-    if cv_score_method == "weighted" and fold_weights is not None:
-        # Normalize weights
+    # Extract per-fold AUC for constraint checking
+    fold_aucs = [m['auc'] for m in fold_metrics]
+
+    # Compute per-fold means for diagnostics
+    auc_values = np.array(fold_aucs)
+    aupr_values = np.array([m['aupr'] for m in fold_metrics])
+    brier_values = np.array([m['brier'] for m in fold_metrics])
+    prec_top_values = np.array([m['precision_top_10'] for m in fold_metrics])
+    prec_bot_values = np.array([m['precision_bottom_10'] for m in fold_metrics])
+
+    # Handle fold weighting
+    if cv_score_method == "weighted":
+        # Generate default weights favoring later folds if not provided
+        if fold_weights is None:
+            # [0.5, 0.75, 1.0, 1.25, 1.5] for 5 folds
+            base = 0.5
+            step = 1.0 / (n_folds - 1) if n_folds > 1 else 0
+            fold_weights = [base + i * step for i in range(n_folds)]
+
+        # Normalize weights to sum to 1
         total = sum(fold_weights[:n_folds])
-        norm_weights = [w / total for w in fold_weights[:n_folds]]
+        norm_weights = np.array([w / total for w in fold_weights[:n_folds]])
 
-        # Weighted averages
-        auc_mean = sum(m['auc'] * w for m, w in zip(fold_metrics, norm_weights))
-        aupr_mean = sum(m['aupr'] * w for m, w in zip(fold_metrics, norm_weights))
-        brier_mean = sum(m['brier'] * w for m, w in zip(fold_metrics, norm_weights))
-        prec_top = sum(m['precision_top_10'] * w for m, w in zip(fold_metrics, norm_weights))
-        prec_bot = sum(m['precision_bottom_10'] * w for m, w in zip(fold_metrics, norm_weights))
+        # Weighted means
+        s_mean = float(np.sum(np.array(fold_scores) * norm_weights))
+        auc_mean = float(np.sum(auc_values * norm_weights))
+        aupr_mean = float(np.sum(aupr_values * norm_weights))
+        brier_mean = float(np.sum(brier_values * norm_weights))
+        prec_top_mean = float(np.sum(prec_top_values * norm_weights))
+        prec_bot_mean = float(np.sum(prec_bot_values * norm_weights))
+
+        # In weighted mode, skip SE penalty - the weighting itself provides
+        # recency robustness, and proper weighted variance requires careful
+        # effective-N handling that adds complexity without clear benefit
+        s_std = float(np.std(fold_scores, ddof=1)) if n_folds > 1 else 0.0
+        s_se = 0.0  # Explicitly zero - no SE penalty in weighted mode
+        auc_std = float(np.std(auc_values, ddof=1)) if n_folds > 1 else 0.0
+        auc_se = 0.0
+
+        objective = s_mean
     else:
-        # Simple mean
-        auc_mean = np.mean([m['auc'] for m in fold_metrics])
-        aupr_mean = np.mean([m['aupr'] for m in fold_metrics])
-        brier_mean = np.mean([m['brier'] for m in fold_metrics])
-        prec_top = np.mean([m['precision_top_10'] for m in fold_metrics])
-        prec_bot = np.mean([m['precision_bottom_10'] for m in fold_metrics])
+        # Simple mean with SE penalty
+        s_mean = float(np.mean(fold_scores))
+        s_std = float(np.std(fold_scores, ddof=1)) if n_folds > 1 else 0.0
+        s_se = s_std / np.sqrt(n_folds) if n_folds > 1 else 0.0
 
-    auc_std = np.std([m['auc'] for m in fold_metrics])
+        auc_mean = float(np.mean(auc_values))
+        auc_std = float(np.std(auc_values, ddof=1)) if n_folds > 1 else 0.0
+        auc_se = auc_std / np.sqrt(n_folds) if n_folds > 1 else 0.0
 
-    score = 0.0
+        aupr_mean = float(np.mean(aupr_values))
+        brier_mean = float(np.mean(brier_values))
+        prec_top_mean = float(np.mean(prec_top_values))
+        prec_bot_mean = float(np.mean(prec_bot_values))
 
-    # Discrimination (35%)
-    score += weights.auc * auc_mean
-    score += weights.aupr * aupr_mean
+        # Core objective: mean minus lambda * SE
+        objective = s_mean - weights.lambda_stability * s_se
 
-    # Calibration (15%) - Brier in [0, 0.25], invert
-    score += weights.calibration * (1 - brier_mean / 0.25)
+    # Check AUC floor constraint
+    pruned = False
+    prune_reason = None
+    if baseline_auc_mean is not None:
+        if auc_mean < baseline_auc_mean - auc_floor_delta:
+            pruned = True
+            prune_reason = f"auc_floor_violated: {auc_mean:.4f} < {baseline_auc_mean:.4f} - {auc_floor_delta}"
+            # Return a very low score to ensure this trial is not selected
+            objective = -float('inf')
 
-    # Tail performance (30%)
-    score += weights.tail * prec_top
-    score += weights.spread * (prec_top - prec_bot)
+    return CompositeScoreResult(
+        objective=objective,
+        s_mean=s_mean,
+        s_std=s_std,
+        s_se=s_se,
+        auc_mean=auc_mean,
+        auc_std=auc_std,
+        auc_se=auc_se,
+        aupr_mean=aupr_mean,
+        brier_mean=brier_mean,
+        prec_top_mean=prec_top_mean,
+        prec_bot_mean=prec_bot_mean,
+        fold_scores=fold_scores,
+        pruned=pruned,
+        prune_reason=prune_reason,
+    )
 
-    # Stability (20%)
-    cv_coef = auc_std / (auc_mean + 1e-8)
-    stability = np.clip(1 - cv_coef * 5, 0, 1)
-    score += weights.stability * stability
 
-    return score
+def compute_composite_score_value(
+    fold_metrics: list[dict],
+    weights: ObjectiveWeights,
+    cv_score_method: str = "mean",
+    fold_weights: Optional[List[float]] = None,
+    baseline_auc_mean: Optional[float] = None,
+    auc_floor_delta: float = 0.002,
+) -> float:
+    """
+    Convenience wrapper that returns just the objective value.
+
+    For backwards compatibility with code that expects a float return.
+    """
+    result = compute_composite_score(
+        fold_metrics, weights, cv_score_method, fold_weights,
+        baseline_auc_mean, auc_floor_delta
+    )
+    return result.objective
 
 
 def compute_auc_score(fold_metrics: list[dict], variance_penalty: float) -> float:
-    """Compute AUC-only objective with variance penalty."""
-    auc_mean = np.mean([m['auc'] for m in fold_metrics])
-    auc_std = np.std([m['auc'] for m in fold_metrics])
-    return auc_mean - variance_penalty * auc_std
+    """
+    Compute AUC-only objective with SE-based variance penalty.
+
+    Uses the same "mean minus penalty * SE" formulation as the composite score:
+        objective = auc_mean - variance_penalty * auc_se
+
+    Args:
+        fold_metrics: List of metric dicts from each fold
+        variance_penalty: Coefficient for SE penalty (lambda)
+
+    Returns:
+        AUC objective value (higher is better)
+    """
+    auc_values = np.array([m['auc'] for m in fold_metrics])
+    n_folds = len(auc_values)
+
+    auc_mean = float(np.mean(auc_values))
+    auc_std = float(np.std(auc_values, ddof=1)) if n_folds > 1 else 0.0
+    auc_se = auc_std / np.sqrt(n_folds) if n_folds > 1 else 0.0
+
+    return auc_mean - variance_penalty * auc_se
 
 
 # =============================================================================
@@ -673,20 +859,66 @@ def create_objective(
         # Convert to list ordered by fold index
         fold_metrics_list = [all_fold_metrics[i] for i in sorted(all_fold_metrics.keys())]
 
-        # Store metrics
-        for metric in ['auc', 'aupr', 'brier', 'precision_top_10', 'precision_bottom_10']:
-            values = [m[metric] for m in fold_metrics_list]
-            trial.set_user_attr(f'{metric}_mean', np.mean(values))
-            trial.set_user_attr(f'{metric}_std', np.std(values))
-
         # Compute objective
         if objective_mode == 'composite':
-            return compute_composite_score(
+            # Get baseline AUC from best trial so far (for AUC floor constraint)
+            baseline_auc = None
+            try:
+                study = trial.study
+                if len(study.trials) > 0:
+                    completed = [t for t in study.trials
+                                 if t.state == optuna.trial.TrialState.COMPLETE]
+                    if completed:
+                        best_trial = max(completed, key=lambda t: t.value)
+                        baseline_auc = best_trial.user_attrs.get('auc_mean')
+            except Exception:
+                pass  # No baseline available yet
+
+            result = compute_composite_score(
                 fold_metrics_list, weights,
                 cv_score_method=cv_score_method,
                 fold_weights=fold_weights,
+                baseline_auc_mean=baseline_auc,
+                auc_floor_delta=0.002,
             )
+
+            # Store diagnostics in trial user attributes
+            trial.set_user_attr('auc_mean', result.auc_mean)
+            trial.set_user_attr('auc_std', result.auc_std)
+            trial.set_user_attr('auc_se', result.auc_se)
+            trial.set_user_attr('aupr_mean', result.aupr_mean)
+            trial.set_user_attr('brier_mean', result.brier_mean)
+            trial.set_user_attr('precision_top_10_mean', result.prec_top_mean)
+            trial.set_user_attr('precision_bottom_10_mean', result.prec_bot_mean)
+            trial.set_user_attr('s_mean', result.s_mean)
+            trial.set_user_attr('s_std', result.s_std)
+            trial.set_user_attr('s_se', result.s_se)
+            trial.set_user_attr('fold_scores', result.fold_scores)
+
+            # Handle AUC floor pruning
+            if result.pruned:
+                trial.set_user_attr('prune_reason', result.prune_reason)
+                if pruning_stats:
+                    pruning_stats.record_prune('auc_floor')
+                raise optuna.TrialPruned()
+
+            return result.objective
         else:
+            # AUC-only mode with SE penalty
+            auc_values = [m['auc'] for m in fold_metrics_list]
+            auc_mean = float(np.mean(auc_values))
+            auc_std = float(np.std(auc_values, ddof=1)) if len(auc_values) > 1 else 0.0
+            auc_se = auc_std / np.sqrt(len(auc_values)) if len(auc_values) > 1 else 0.0
+
+            trial.set_user_attr('auc_mean', auc_mean)
+            trial.set_user_attr('auc_std', auc_std)
+            trial.set_user_attr('auc_se', auc_se)
+
+            # Store other metrics for diagnostics
+            for metric in ['aupr', 'brier', 'precision_top_10', 'precision_bottom_10']:
+                values = [m[metric] for m in fold_metrics_list]
+                trial.set_user_attr(f'{metric}_mean', np.mean(values))
+
             return compute_auc_score(fold_metrics_list, variance_penalty)
 
     return objective, fold_evaluator
@@ -697,20 +929,31 @@ def create_objective(
 # =============================================================================
 
 def trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-    """Print trial results."""
+    """Print trial results with SE-based diagnostics."""
     if trial.state == optuna.trial.TrialState.COMPLETE:
         auc_mean = trial.user_attrs.get('auc_mean', 0)
-        auc_std = trial.user_attrs.get('auc_std', 0)
+        auc_se = trial.user_attrs.get('auc_se', 0)
+        s_mean = trial.user_attrs.get('s_mean', 0)
+        s_se = trial.user_attrs.get('s_se', 0)
         brier_mean = trial.user_attrs.get('brier_mean', 0)
         prec_top = trial.user_attrs.get('precision_top_10_mean', 0)
 
         is_best = study.best_trial.number == trial.number
         marker = " ** BEST **" if is_best else ""
 
-        print(f"Trial {trial.number:3d}: Score={trial.value:.4f}  "
-              f"AUC={auc_mean:.4f}±{auc_std:.4f}  "
-              f"Brier={brier_mean:.4f}  "
-              f"Prec@10={prec_top:.4f}{marker}")
+        # Show objective with SE penalty decomposition
+        if s_mean > 0:
+            print(f"Trial {trial.number:3d}: Score={trial.value:.4f} "
+                  f"(S={s_mean:.4f}±SE{s_se:.4f})  "
+                  f"AUC={auc_mean:.4f}±SE{auc_se:.4f}  "
+                  f"Brier={brier_mean:.4f}  "
+                  f"Prec@10={prec_top:.4f}{marker}")
+        else:
+            # AUC-only mode
+            print(f"Trial {trial.number:3d}: Score={trial.value:.4f}  "
+                  f"AUC={auc_mean:.4f}±SE{auc_se:.4f}  "
+                  f"Brier={brier_mean:.4f}  "
+                  f"Prec@10={prec_top:.4f}{marker}")
 
     elif trial.state == optuna.trial.TrialState.PRUNED:
         reason = trial.user_attrs.get('prune_reason', 'optuna_pruner')

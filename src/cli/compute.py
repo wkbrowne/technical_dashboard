@@ -378,6 +378,7 @@ def run_feature_pipeline(
     checkpoint_config: Optional['CheckpointConfig'] = None,
     exclude_retired: bool = False,
     target_config_path: Optional[str] = None,
+    use_registry: bool = False,
 ):
     """Run the feature computation pipeline.
 
@@ -396,6 +397,8 @@ def run_feature_pipeline(
         exclude_retired: If True, exclude retired features from output files
         target_config_path: Path to barrier_calibration.json for custom target
             thresholds. If None, uses hardcoded defaults from model_keys.py.
+        use_registry: If True, filter features_filtered.parquet to features
+            from model registries (artifacts/<model>/features.json).
     """
     from src.config.features import FeatureConfig, Timeframe
     from src.config.parallel import ParallelConfig
@@ -547,6 +550,7 @@ def run_feature_pipeline(
             exclude_retired=exclude_retired,
             target_config_path=target_config_path,
             output_dir=output_dir,  # Save feature_provenance.json
+            use_registry=use_registry,
         )
 
         # Save BOTH complete and filtered feature files
@@ -734,6 +738,11 @@ Examples:
         action="store_true",
         help="Exclude retired features from output files (saves disk space)"
     )
+    parser.add_argument(
+        "--use-registry",
+        action="store_true",
+        help="Filter features_filtered.parquet to features from model registries (artifacts/<model>/features.json)"
+    )
     # Checkpoint arguments
     parser.add_argument(
         "--checkpoint-dir",
@@ -841,6 +850,7 @@ Examples:
         checkpoint_config=checkpoint_config,
         exclude_retired=args.exclude_retired,
         target_config_path=target_config_path,
+        use_registry=args.use_registry,
     )
 
 

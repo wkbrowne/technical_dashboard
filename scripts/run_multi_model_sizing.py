@@ -8,7 +8,7 @@ This script optimizes sizing parameters for the 4-model system:
 - SHORT_NORMAL
 - SHORT_PARABOLIC
 
-Supports optional regime gating optimization.
+Supports optional regime gating and short selectivity optimization.
 
 Usage:
     # Optimize sizing for all 4 models
@@ -16,11 +16,17 @@ Usage:
         --prediction-path artifacts/predictions/cv_predictions_multi.parquet \\
         --n-trials 100
 
-    # With regime gating optimization
+    # With regime gating and short selectivity optimization
     python scripts/run_multi_model_sizing.py \\
         --prediction-path artifacts/predictions/ \\
         --regime-gating on \\
+        --short-selectivity on \\
         --n-trials 200
+
+    # Export decision log for dashboard
+    python scripts/run_multi_model_sizing.py \\
+        --prediction-path artifacts/predictions/ \\
+        --decision-log artifacts/sizing/decision_log.parquet
 
     # Single model backward-compatible mode
     python scripts/run_multi_model_sizing.py \\
@@ -30,6 +36,7 @@ Usage:
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
@@ -49,6 +56,8 @@ from src.sizing.optimizer import (
     save_optimization_result,
 )
 from src.sizing.predictions import merge_predictions_with_targets
+from src.sizing.regime_data import load_regime_features as load_regime_features_util
+from src.sizing.multi_model import create_decision_log
 
 
 def parse_models(models_str: str) -> list:
@@ -88,22 +97,19 @@ def load_targets(path: str = "artifacts/targets_triple_barrier.parquet") -> pd.D
 def load_regime_features(
     features_path: str = "artifacts/features_complete.parquet",
 ) -> pd.DataFrame:
-    """Load regime-relevant features."""
-    df = pd.read_parquet(features_path)
-    df["date"] = pd.to_datetime(df["date"])
+    """Load regime-relevant features using the regime_data utility.
 
-    # Select regime-relevant columns
-    regime_cols = [
-        "date", "symbol",
-        "vix_percentile_252d", "d_vix_percentile_252d",
-        "vix_zscore_60d", "d_vix_zscore_60d",
-        "fred_bamlh0a0hym2_z60", "d_fred_bamlh0a0hym2_z60",
-        "sector_breadth_pct_above_ma200", "d_sector_breadth_pct_above_ma200",
-        "w_equity_bond_corr_60d",
-    ]
-
-    available = [c for c in regime_cols if c in df.columns]
-    return df[available].copy()
+    This function leverages the new regime_data module which:
+    - Automatically finds the correct column names for regime features
+    - Handles market-level vs stock-level regime data
+    - Groups by date for unique date-level features
+    """
+    try:
+        return load_regime_features_util(features_path)
+    except FileNotFoundError:
+        print(f"Warning: Features file not found at {features_path}")
+        print("Continuing without regime features...")
+        return pd.DataFrame()
 
 
 def main():
@@ -165,6 +171,30 @@ def main():
         help="Whether to optimize regime gating parameters",
     )
 
+    # Short selectivity
+    parser.add_argument(
+        "--short-selectivity",
+        type=str,
+        default="off",
+        choices=["on", "off"],
+        help="Whether to optimize short selectivity parameters (threshold offset, max weight mult)",
+    )
+
+    # Decision log output
+    parser.add_argument(
+        "--decision-log",
+        type=str,
+        default=None,
+        help="Path to save decision log parquet (contains justification for each signal)",
+    )
+
+    # Strict mode
+    parser.add_argument(
+        "--strict-features",
+        action="store_true",
+        help="Fail if required regime features are missing (default: warn and continue)",
+    )
+
     # Combining policy
     parser.add_argument(
         "--combine-policy",
@@ -214,6 +244,9 @@ def main():
     print(f"Models: {[m.value for m in models]}")
     print(f"Combine policy: {args.combine_policy}")
     print(f"Regime gating: {args.regime_gating}")
+    print(f"Short selectivity: {args.short_selectivity}")
+    if args.strict_features:
+        print(f"Strict mode: ON (will fail on missing features)")
     print()
 
     # Load predictions
@@ -273,7 +306,9 @@ def main():
         n_trials=args.n_trials,
         metric=args.metric,
         optimize_gating=(args.regime_gating == "on"),
+        optimize_short_selectivity=(args.short_selectivity == "on"),
         base_config=base_config,
+        verbose_logging=True,
     )
 
     # Run optimization
@@ -297,6 +332,32 @@ def main():
     print("\nResults saved:")
     for file_type, path in paths.items():
         print(f"  {file_type}: {path}")
+
+    # Generate decision log if requested
+    if args.decision_log:
+        print("\nGenerating decision log with best parameters...")
+
+        # Create engine with best config
+        best_engine = MultiModelSizingEngine(result.best_config)
+
+        # Compute weights with justification
+        weighted_signals = best_engine.compute_weights(
+            signals,
+            regime_features=regime_features,
+            include_justification=True,
+        )
+
+        # Create and save decision log
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        decision_log = create_decision_log(weighted_signals, run_id=run_id)
+
+        decision_log_path = Path(args.decision_log)
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        decision_log.to_parquet(decision_log_path, index=False)
+
+        print(f"  Decision log saved to: {decision_log_path}")
+        print(f"  Rows: {len(decision_log):,}")
+        print(f"  Justification columns: {[c for c in decision_log.columns if c.startswith('j_')]}")
 
     print("\n" + "=" * 60)
     print("Optimization complete!")
